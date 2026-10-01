@@ -137,6 +137,14 @@ const init = (ctx: ToolkitContext) => {
         editor.hidden = !selected;
         if (!selected) return;
         const state = selected.getState();
+        // dragging a number field moves it one step per 100px, so the step has
+        // to follow the size of the scene (a fixed step of 1 is useless on a
+        // 0.2 unit scan and too fine on a 200 unit one)
+        const hasSplat = scene.getElementsByType(ElementType.splat).length > 0;
+        const dragStep = Math.max(0.001, (hasSplat ? scene.bound.halfExtents.length() : 1) * 0.5);
+        position.input.step = dragStep;
+        size.input.step = dragStep;
+        rotation.input.step = 45;
         uiUpdating = true;
         position.input.value = state.position;
         rotation.input.value = state.rotation;
