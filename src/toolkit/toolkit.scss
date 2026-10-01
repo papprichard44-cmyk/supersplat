@@ -135,3 +135,11 @@
     border-top: 1px solid $bcg-darkest;
     padding-bottom: 4px;
 }
+
+.toolkit-convert.pcui-button {
+    margin: 0;
+    height: 24px;
+    line-height: 22px;
+    padding: 0 8px;
+    flex-shrink: 0;
+}

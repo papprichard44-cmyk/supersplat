@@ -1,5 +1,5 @@
 import { Button, ColorPicker, Container, Label, SliderInput, VectorInput } from '@playcanvas/pcui';
-import { OrientedBox, Ray, Vec3 } from 'playcanvas';
+import { OrientedBox, Quat, Ray, Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
 import { ShapeGizmoMode, ShapeTransformGizmo } from '../tools/shape-transform-gizmo';
@@ -9,6 +9,7 @@ import shownSvg from '../ui/svg/shown.svg';
 import type { ToolkitContext, ToolkitModule } from './index';
 import { MeshPrimitive, PrimitiveData, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
+import { primitiveToSplat } from './primitive-to-splat';
 
 const TOOL = 'toolkitPrimitive';
 
@@ -18,6 +19,8 @@ const tips = {
     addBox: 'Add a solid box at the camera focus. Splats inside and behind it are hidden.',
     addImage: 'Add a picture (PNG / WebP with transparency) as a flat cutout in space. Transparent pixels are cut away, the rest hides the splats behind it with a sharp edge. Its Y size is its thickness.',
     cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
+    density: 'How many splats are generated along the longest side when converting. Higher = sharper picture and edges, but more splats and a bigger file.',
+    convert: 'Turn the selected primitive into a real gaussian splat layer (it then exports to PLY / SOG / SPZ and can be edited like any splat). The primitive itself is hidden, not deleted.',
     row: 'Click to select this primitive and show its transform gizmo (you can also click it in the viewport). Click again to deselect.',
     visible: 'Show or hide this primitive.',
     remove: 'Delete this primitive (undo brings it back).',
@@ -121,6 +124,15 @@ const init = (ctx: ToolkitContext) => {
     cutoffRow.append(cutoff);
     editor.append(cutoffRow);
 
+    const convertRow = new Container({ class: 'toolkit-row' });
+    const densityLabel = new Label({ text: 'Density', class: 'toolkit-label' });
+    const density = new SliderInput({ class: 'toolkit-slider', min: 16, max: 1024, precision: 0, step: 1, value: 200 });
+    const convert = new Button({ text: 'To splat', class: 'toolkit-convert' });
+    convertRow.append(densityLabel);
+    convertRow.append(density);
+    convertRow.append(convert);
+    editor.append(convertRow);
+
     panel.append(header);
     panel.append(addRow);
     panel.append(list);
@@ -133,6 +145,9 @@ const init = (ctx: ToolkitContext) => {
     tooltips.register(addImage, tips.addImage, 'top');
     tooltips.register(cutoffLabel, tips.cutoff, 'right');
     tooltips.register(cutoff, tips.cutoff, 'bottom');
+    tooltips.register(densityLabel, tips.density, 'right');
+    tooltips.register(density, tips.density, 'bottom');
+    tooltips.register(convert, tips.convert, 'bottom');
     tooltips.register(translateButton, tips.translate, 'bottom');
     tooltips.register(rotateButton, tips.rotate, 'bottom');
     tooltips.register(scaleButton, tips.scale, 'bottom');
@@ -333,6 +348,49 @@ const init = (ctx: ToolkitContext) => {
 
     cutoff.on('change', (value: number) => {
         if (!uiUpdating && selected) edit(selected, { alphaCutoff: value });
+    });
+
+    // ---- conversion to a gaussian splat layer
+
+    const convertToSplat = async (primitive: MeshPrimitive, splatsAlongLongestSide: number) => {
+        flushPending();
+        const gaussians = await primitiveToSplat(primitive, splatsAlongLongestSide);
+        if (gaussians.count === 0) {
+            return 0;
+        }
+        const filename = `${primitive.name.replace(/[^\w\- ]+/g, '_')}.ply`;
+
+        // the gaussians are generated in world space: reset whatever transform
+        // the importer gives a new layer so they land exactly on the primitive
+        let created: Element | null = null;
+        const onAdded = (element: Element) => {
+            if (element.type === ElementType.splat) {
+                created = element;
+            }
+        };
+        const handle = events.on('scene.elementAdded', onAdded);
+        try {
+            await events.invoke('import', [{ filename, contents: new File([gaussians.toPly()], filename) }]);
+        } finally {
+            handle.off();
+        }
+        (created as Element | null)?.move(new Vec3(0, 0, 0), new Quat(), new Vec3(1, 1, 1));
+
+        const oldState = primitive.getState();
+        events.fire('edit.add', new PrimitiveStateOp(primitive, oldState, { ...oldState, visible: false }));
+        return gaussians.count;
+    };
+
+    events.function('toolkit.primitiveToSplat', convertToSplat);
+
+    convert.on('click', async () => {
+        if (!selected || !convert.enabled) return;
+        convert.enabled = false;
+        try {
+            await convertToSplat(selected, density.value);
+        } finally {
+            convert.enabled = true;
+        }
     });
 
     // ---- creation

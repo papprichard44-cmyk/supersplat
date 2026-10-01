@@ -158,7 +158,7 @@ class MeshPrimitive extends Element {
     material: ShaderMaterial;
     image: string | null;
     texture: Texture | null = null;
-    private alphaGrid: AlphaGrid | null = null;
+    alphaGrid: AlphaGrid | null = null;
     private mesh: Mesh | null = null;
     private builtCutoff = -1;
     alphaCutoff = 0.5;
@@ -346,4 +346,4 @@ const statesEqual = (a: PrimitiveState, b: PrimitiveState) => {
     return JSON.stringify(a) === JSON.stringify(b);
 };
 
-export { MeshPrimitive, PrimitiveKind, PrimitiveState, PrimitiveData, statesEqual };
+export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, statesEqual };
