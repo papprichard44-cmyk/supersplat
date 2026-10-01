@@ -16,18 +16,18 @@ const tips = {
     addPlane: 'Add a horizontal plane (floor / ceiling) at the camera focus. It hides the splats behind it with a sharp edge.',
     addWall: 'Add a vertical plane (wall) at the camera focus. It hides the splats behind it with a sharp edge.',
     addBox: 'Add a solid box at the camera focus. Splats inside and behind it are hidden.',
-    addImage: 'Add a picture (PNG / WebP with transparency) as a flat cutout in space. Transparent pixels are cut away, the rest hides the splats behind it with a sharp edge.',
+    addImage: 'Add a picture (PNG / WebP with transparency) as a flat cutout in space. Transparent pixels are cut away, the rest hides the splats behind it with a sharp edge. Its Y size is its thickness.',
     cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
     row: 'Click to select this primitive and show its transform gizmo (you can also click it in the viewport). Click again to deselect.',
     visible: 'Show or hide this primitive.',
     remove: 'Delete this primitive (undo brings it back).',
     translate: 'Move the selected primitive with the gizmo (shortcut: 1).',
     rotate: 'Rotate the selected primitive with the gizmo (shortcut: 2).',
-    scale: 'Resize the selected primitive with the gizmo (shortcut: 3).',
+    scale: 'Resize the selected primitive with the gizmo (shortcut: 3). On a picture, drag the Y handle to extrude it.',
     color: 'Surface colour of the selected primitive. On a picture it tints the image (white = unchanged).',
     position: 'Position of the primitive centre in world units (X, Y, Z).',
     rotation: 'Rotation in degrees around the X, Y and Z axes.',
-    size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y.'
+    size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y. On a picture Y is the thickness: raise it to extrude the cutout into a solid.'
 };
 
 const createSvg = (svgString: string) => {
@@ -379,7 +379,7 @@ const init = (ctx: ToolkitContext) => {
             image: dataUrl,
             position: [focus.x, focus.y, focus.z],
             rotation: [90, 0, 0],
-            scale: [height * aspect, 1, height],
+            scale: [height * aspect, height * 0.05, height],
             color: [1, 1, 1],
             visible: true,
             alphaCutoff: 0.5
@@ -415,7 +415,7 @@ const init = (ctx: ToolkitContext) => {
         let bestDistance = Infinity;
         primitives().forEach((primitive) => {
             if (!primitive.entity.enabled) return;
-            const pickBox = new OrientedBox(primitive.entity.getWorldTransform(), primitive.kind === 'box' ? boxHalf : planeHalf);
+            const pickBox = new OrientedBox(primitive.entity.getWorldTransform(), primitive.kind === 'plane' ? planeHalf : boxHalf);
             if (pickBox.intersectsRay(pickRay, pickPoint)) {
                 const distance = pickPoint.distance(pickRay.origin);
                 if (distance < bestDistance) {

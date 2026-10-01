@@ -4,11 +4,14 @@ import {
     FILTER_LINEAR,
     FILTER_LINEAR_MIPMAP_LINEAR,
     PIXELFORMAT_RGBA8,
+    PRIMITIVE_TRIANGLES,
     SEMANTIC_NORMAL,
     SEMANTIC_POSITION,
     SEMANTIC_TEXCOORD0,
     BoundingBox,
     Entity,
+    Mesh,
+    MeshInstance,
     ShaderMaterial,
     Texture,
     Vec3
@@ -16,15 +19,17 @@ import {
 
 import { Element, ElementType } from '../element';
 import { Serializer } from '../serializer';
+import { AlphaGrid, buildExtrudeGeometry, makeAlphaGrid } from './image-extrude';
 
 // Opaque, depth-writing mesh drawn in the world layer. The world pass and the
 // splat passes share one depth buffer and the splat material depth-tests, so a
 // primitive occludes the splats behind it with a hard, pixel-exact edge while
 // splats in front of it still blend over it.
 
-// An 'image' is a plane carrying an alpha-cutout picture: texels below the
-// cutoff are discarded, the rest write depth like any other primitive, so the
-// silhouette of the picture is a hard edge inside the splats.
+// An 'image' is an alpha-cutout picture extruded along its local Y axis (the
+// Y scale is its thickness): texels below the cutoff are discarded on the two
+// faces, side walls follow the alpha contour, and everything writes depth like
+// any other primitive, so the silhouette is a hard edge inside the splats.
 
 type PrimitiveKind = 'plane' | 'box' | 'image';
 
@@ -83,35 +88,53 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
 
 const imageVertexShader = /* wgsl */`
 attribute vertex_position: vec3f;
+attribute vertex_normal: vec3f;
 attribute vertex_texCoord0: vec2f;
 uniform matrix_model: mat4x4f;
 uniform matrix_viewProjection: mat4x4f;
+uniform matrix_normal: mat3x3f;
 varying vUv: vec2f;
+varying vWorldPos: vec3f;
+varying vNormal: vec3f;
+varying vSide: f32;
 
 @vertex
 fn vertexMain(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.position = uniform.matrix_viewProjection * uniform.matrix_model * vec4f(input.vertex_position, 1.0);
+    let world = uniform.matrix_model * vec4f(input.vertex_position, 1.0);
+    output.position = uniform.matrix_viewProjection * world;
     output.vUv = input.vertex_texCoord0;
+    output.vWorldPos = world.xyz;
+    output.vNormal = uniform.matrix_normal * input.vertex_normal;
+    // 0 on the two picture faces, 1 on the extruded side walls
+    output.vSide = 1.0 - abs(input.vertex_normal.y);
     return output;
 }
 `;
 
 const imageFragmentShader = /* wgsl */`
+uniform view_position: vec3f;
 uniform primColor: vec3f;
 uniform primAlphaCutoff: f32;
 var primTex: texture_2d<f32>;
 var primTex_sampler: sampler;
 varying vUv: vec2f;
+varying vWorldPos: vec3f;
+varying vNormal: vec3f;
+varying vSide: f32;
 
 @fragment
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     var output: FragmentOutput;
     let texel = textureSample(primTex, primTex_sampler, input.vUv);
-    if (texel.a < uniform.primAlphaCutoff) {
+    // faces are cut out per pixel; walls are solid geometry
+    if (input.vSide < 0.5 && texel.a < uniform.primAlphaCutoff) {
         discard;
     }
-    output.color = vec4f(texel.rgb * uniform.primColor, 1.0);
+    let n = normalize(input.vNormal);
+    let v = normalize(uniform.view_position - input.vWorldPos);
+    let shade = mix(1.0, 0.55 + 0.45 * abs(dot(n, v)), input.vSide);
+    output.color = vec4f(texel.rgb * uniform.primColor * shade, 1.0);
     return output;
 }
 `;
@@ -135,6 +158,9 @@ class MeshPrimitive extends Element {
     material: ShaderMaterial;
     image: string | null;
     texture: Texture | null = null;
+    private alphaGrid: AlphaGrid | null = null;
+    private mesh: Mesh | null = null;
+    private builtCutoff = -1;
     alphaCutoff = 0.5;
     color: [number, number, number] = [0.8, 0.8, 0.8];
     private bound = new BoundingBox();
@@ -145,7 +171,7 @@ class MeshPrimitive extends Element {
         this.name = data.name;
         this.entity = new Entity(`toolkitPrimitive:${data.name}`);
         this.image = data.image ?? null;
-        this.entity.addComponent('render', { type: data.kind === 'box' ? 'box' : 'plane' });
+        this.entity.addComponent('render', { type: data.kind === 'image' ? 'asset' : data.kind });
         this.setState(data);
     }
 
@@ -161,6 +187,7 @@ class MeshPrimitive extends Element {
             const context = canvas.getContext('2d', { willReadFrequently: true });
             context.drawImage(source, 0, 0);
             const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+            this.alphaGrid = makeAlphaGrid(canvas, canvas.width, canvas.height);
             this.texture = new Texture(this.scene.graphicsDevice, {
                 name: `toolkitImage:${this.name}`,
                 width: canvas.width,
@@ -179,6 +206,7 @@ class MeshPrimitive extends Element {
             uniqueName: 'toolkitImageCutout',
             attributes: {
                 vertex_position: SEMANTIC_POSITION,
+                vertex_normal: SEMANTIC_NORMAL,
                 vertex_texCoord0: SEMANTIC_TEXCOORD0
             },
             vertexWGSL: imageVertexShader,
@@ -198,7 +226,11 @@ class MeshPrimitive extends Element {
         material.update();
         this.material = material;
 
-        this.entity.render.meshInstances[0].material = material;
+        if (isImage) {
+            this.rebuildMesh();
+        } else {
+            this.entity.render.meshInstances[0].material = material;
+        }
         this.entity.render.layers = [this.scene.worldLayer.id];
         this.entity.render.castShadows = false;
         this.scene.contentRoot.addChild(this.entity);
@@ -213,6 +245,12 @@ class MeshPrimitive extends Element {
         this.material = null;
         this.texture?.destroy();
         this.texture = null;
+        if (this.mesh) {
+            this.entity.render.meshInstances = [];
+            this.mesh.destroy();
+            this.mesh = null;
+        }
+        this.builtCutoff = -1;
     }
 
     // packed every frame: any change here triggers a re-render
@@ -222,11 +260,35 @@ class MeshPrimitive extends Element {
         serializer.pack(this.entity.enabled, this.alphaCutoff);
     }
 
+    // (re)build the extruded picture mesh for the current alpha cutoff
+    private rebuildMesh() {
+        if (!this.alphaGrid || !this.material || this.builtCutoff === this.alphaCutoff) {
+            return;
+        }
+        const geometry = buildExtrudeGeometry(this.alphaGrid, this.alphaCutoff);
+        const mesh = new Mesh(this.scene.graphicsDevice);
+        mesh.setPositions(geometry.positions);
+        mesh.setNormals(geometry.normals);
+        mesh.setUvs(0, geometry.uvs);
+        mesh.setIndices(geometry.indices);
+        mesh.update(PRIMITIVE_TRIANGLES);
+
+        const old = this.mesh;
+        const meshInstance = new MeshInstance(mesh, this.material);
+        meshInstance.castShadow = false;
+        this.entity.render.meshInstances = [meshInstance];
+        this.entity.render.layers = [this.scene.worldLayer.id];
+        old?.destroy();
+        this.mesh = mesh;
+        this.builtCutoff = this.alphaCutoff;
+        this.applyColor();
+    }
+
     get worldBound(): BoundingBox | null {
         if (!this.entity.enabled) {
             return null;
         }
-        this.bound.setFromTransformedAabb(this.kind === 'box' ? unitBox : unitPlane, this.entity.getWorldTransform());
+        this.bound.setFromTransformedAabb(this.kind === 'plane' ? unitPlane : unitBox, this.entity.getWorldTransform());
         return this.bound;
     }
 
@@ -261,6 +323,9 @@ class MeshPrimitive extends Element {
         this.color = [state.color[0], state.color[1], state.color[2]];
         this.entity.enabled = state.visible;
         this.alphaCutoff = state.alphaCutoff ?? 0.5;
+        if (this.kind === 'image' && this.scene) {
+            this.rebuildMesh();
+        }
         this.applyColor();
         if (this.scene) {
             this.scene.boundDirty = true;
