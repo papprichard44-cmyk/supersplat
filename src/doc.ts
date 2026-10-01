@@ -202,6 +202,7 @@ const registerDocEvents = (scene: Scene, events: Events) => {
             events.invoke('docDeserialize.timeline', document.timeline);
             events.invoke('docDeserialize.poseSets', document.poseSets, document.camera?.fov);
             events.invoke('docDeserialize.view', document.view);
+            await events.invoke('docDeserialize.toolkit', document.toolkit);
             scene.camera.docDeserialize(document.camera);
 
             // refresh the pivot to reflect the loaded transform
@@ -310,6 +311,7 @@ const registerDocEvents = (scene: Scene, events: Events) => {
                 view: events.invoke('docSerialize.view'),
                 poseSets: events.invoke('docSerialize.poseSets'),
                 timeline: events.invoke('docSerialize.timeline'),
+                toolkit: events.invoke('docSerialize.toolkit'),
                 resources: groups.map((group, i) => ({
                     filename: `resource_${i}.ply`,
                     numRows: group.rows.length

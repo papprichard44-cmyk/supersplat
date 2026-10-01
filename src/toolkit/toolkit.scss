@@ -1,0 +1,132 @@
+@use '../ui/scss/colors.scss' as *;
+
+// sits to the right of the scene panel (top: 102px, left: 24px, width: 320px)
+#toolkit-primitives-panel {
+    top: 102px;
+    left: 356px;
+    width: 300px;
+    max-height: calc(100vh - 126px);
+    overflow-y: auto;
+}
+
+.collapsed #toolkit-primitives-panel {
+    display: none;
+}
+
+.toolkit-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    min-height: 30px;
+    box-sizing: border-box;
+}
+
+.toolkit-button.pcui-button {
+    flex: 1 1 0;
+    margin: 0;
+    height: 24px;
+    line-height: 22px;
+    padding: 0 4px;
+}
+
+.toolkit-mode.pcui-button {
+    margin: 0;
+    width: 28px;
+    height: 24px;
+    padding: 0;
+
+    &.active {
+        background-color: $clr-hilight;
+        color: $clr-active;
+    }
+}
+
+.toolkit-label {
+    margin: 0;
+    width: 58px;
+    flex-shrink: 0;
+}
+
+.toolkit-color.pcui-color-input {
+    margin: 0;
+    flex-grow: 1;
+    height: 22px;
+}
+
+.toolkit-vector.pcui-vector-input {
+    margin: 0;
+    flex-grow: 1;
+    gap: 6px;
+
+    & > .pcui-numeric-input {
+        margin: 0;
+        height: 22px;
+
+        & > input {
+            padding: 0;
+            margin: 0 0 0 4px;
+            height: 22px;
+        }
+    }
+}
+
+.toolkit-list {
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.toolkit-list-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 28px;
+    padding: 0 6px 0 10px;
+    cursor: pointer;
+
+    &:hover {
+        background-color: $bcg-darkest;
+    }
+
+    &.selected {
+        background-color: $bcg-dark;
+
+        & > .toolkit-list-name {
+            color: $clr-hilight;
+        }
+    }
+}
+
+.toolkit-list-name {
+    flex-grow: 1;
+    margin: 0;
+    color: $text-primary;
+}
+
+.toolkit-list-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    flex-shrink: 0;
+
+    svg {
+        color: $text-primary;
+    }
+
+    &:hover {
+        background-color: $bcg-primary;
+
+        svg {
+            color: $clr-hilight;
+        }
+    }
+}
+
+.toolkit-editor {
+    border-top: 1px solid $bcg-darkest;
+    padding-bottom: 4px;
+}

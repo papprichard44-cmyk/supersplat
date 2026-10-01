@@ -18,6 +18,7 @@ import { registerSelectionEvents } from './selection';
 import { registerSequenceEvents } from './sequence';
 import { ShortcutManager } from './shortcut-manager';
 import { registerTimelineEvents } from './timeline';
+import { initToolkit } from './toolkit/index';
 import { BoxSelection } from './tools/box-selection';
 import { BrushSelection } from './tools/brush-selection';
 import { EyedropperSelection } from './tools/eyedropper-selection';
@@ -283,6 +284,15 @@ const main = async () => {
     registerDocEvents(scene, events);
     registerRenderEvents(scene, events);
     initFileHandler(scene, events, editorUI.appContainer.dom);
+
+    // toolkit: everything added on top of upstream SuperSplat
+    initToolkit({
+        events,
+        scene,
+        toolManager,
+        canvasContainer: editorUI.canvasContainer,
+        tooltips: editorUI.tooltips
+    });
 
     // apply stored user preferences and start capturing changes to them.
     // registered after the boot-time initialization events above so they are
