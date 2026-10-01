@@ -4,7 +4,7 @@
 #toolkit-primitives-panel {
     top: 102px;
     left: 356px;
-    width: 300px;
+    width: 340px;
     max-height: calc(100vh - 126px);
     overflow-y: auto;
 }
@@ -53,6 +53,11 @@
     margin: 0;
     flex-grow: 1;
     height: 22px;
+}
+
+.toolkit-slider.pcui-slider {
+    margin: 0;
+    flex-grow: 1;
 }
 
 .toolkit-vector.pcui-vector-input {

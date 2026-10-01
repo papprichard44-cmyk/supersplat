@@ -1,5 +1,5 @@
-import { Button, ColorPicker, Container, Label, VectorInput } from '@playcanvas/pcui';
-import { Vec3 } from 'playcanvas';
+import { Button, ColorPicker, Container, Label, SliderInput, VectorInput } from '@playcanvas/pcui';
+import { OrientedBox, Ray, Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
 import { ShapeGizmoMode, ShapeTransformGizmo } from '../tools/shape-transform-gizmo';
@@ -16,13 +16,15 @@ const tips = {
     addPlane: 'Add a horizontal plane (floor / ceiling) at the camera focus. It hides the splats behind it with a sharp edge.',
     addWall: 'Add a vertical plane (wall) at the camera focus. It hides the splats behind it with a sharp edge.',
     addBox: 'Add a solid box at the camera focus. Splats inside and behind it are hidden.',
-    row: 'Click to select this primitive and show its transform gizmo. Click again to deselect.',
+    addImage: 'Add a picture (PNG / WebP with transparency) as a flat cutout in space. Transparent pixels are cut away, the rest hides the splats behind it with a sharp edge.',
+    cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
+    row: 'Click to select this primitive and show its transform gizmo (you can also click it in the viewport). Click again to deselect.',
     visible: 'Show or hide this primitive.',
     remove: 'Delete this primitive (undo brings it back).',
     translate: 'Move the selected primitive with the gizmo (shortcut: 1).',
     rotate: 'Rotate the selected primitive with the gizmo (shortcut: 2).',
     scale: 'Resize the selected primitive with the gizmo (shortcut: 3).',
-    color: 'Surface colour of the selected primitive.',
+    color: 'Surface colour of the selected primitive. On a picture it tints the image (white = unchanged).',
     position: 'Position of the primitive centre in world units (X, Y, Z).',
     rotation: 'Rotation in degrees around the X, Y and Z axes.',
     size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y.'
@@ -56,7 +58,7 @@ const init = (ctx: ToolkitContext) => {
 
     const header = new Container({ class: 'panel-header' });
     header.append(new Label({ text: '\uE187', class: 'panel-header-icon' }));
-    header.append(new Label({ text: 'Mesh primitives', class: 'panel-header-label' }));
+    header.append(new Label({ text: 'Primitives & images', class: 'panel-header-label' }));
 
     const addRow = new Container({ class: 'toolkit-row' });
     const addPlane = new Button({ text: '+ Plane', class: 'toolkit-button' });
@@ -64,7 +66,15 @@ const init = (ctx: ToolkitContext) => {
     const addBox = new Button({ text: '+ Box', class: 'toolkit-button' });
     addRow.append(addPlane);
     addRow.append(addWall);
+    const addImage = new Button({ text: '+ Image', class: 'toolkit-button' });
     addRow.append(addBox);
+    addRow.append(addImage);
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'image/png,image/webp,image/jpeg';
+    fileInput.style.display = 'none';
+    panel.dom.appendChild(fileInput);
 
     const list = new Container({ class: 'toolkit-list' });
 
@@ -104,6 +114,13 @@ const init = (ctx: ToolkitContext) => {
     const rotation = vectorRow('Rotation', 2);
     const size = vectorRow('Size', 3, 0.001);
 
+    const cutoffRow = new Container({ class: 'toolkit-row', hidden: true });
+    const cutoffLabel = new Label({ text: 'Cutoff', class: 'toolkit-label' });
+    const cutoff = new SliderInput({ class: 'toolkit-slider', min: 0.01, max: 1, precision: 2, value: 0.5 });
+    cutoffRow.append(cutoffLabel);
+    cutoffRow.append(cutoff);
+    editor.append(cutoffRow);
+
     panel.append(header);
     panel.append(addRow);
     panel.append(list);
@@ -113,6 +130,9 @@ const init = (ctx: ToolkitContext) => {
     tooltips.register(addPlane, tips.addPlane, 'top');
     tooltips.register(addWall, tips.addWall, 'top');
     tooltips.register(addBox, tips.addBox, 'top');
+    tooltips.register(addImage, tips.addImage, 'top');
+    tooltips.register(cutoffLabel, tips.cutoff, 'right');
+    tooltips.register(cutoff, tips.cutoff, 'bottom');
     tooltips.register(translateButton, tips.translate, 'bottom');
     tooltips.register(rotateButton, tips.rotate, 'bottom');
     tooltips.register(scaleButton, tips.scale, 'bottom');
@@ -150,6 +170,8 @@ const init = (ctx: ToolkitContext) => {
         rotation.input.value = state.rotation;
         size.input.value = state.scale;
         colorPicker.value = state.color;
+        cutoffRow.hidden = selected.kind !== 'image';
+        cutoff.value = state.alphaCutoff ?? 0.5;
         uiUpdating = false;
     };
 
@@ -309,6 +331,10 @@ const init = (ctx: ToolkitContext) => {
         if (!uiUpdating && selected) edit(selected, { color: [value[0], value[1], value[2]] });
     });
 
+    cutoff.on('change', (value: number) => {
+        if (!uiUpdating && selected) edit(selected, { alphaCutoff: value });
+    });
+
     // ---- creation
 
     let selectOnAdd: MeshPrimitive | null = null;
@@ -326,7 +352,8 @@ const init = (ctx: ToolkitContext) => {
             rotation: [vertical ? 90 : 0, 0, 0],
             scale: [s, kind === 'box' ? s : 1, s],
             color: [0.8, 0.8, 0.8],
-            visible: true
+            visible: true,
+            alphaCutoff: 0.5
         });
         selectOnAdd = primitive;
         events.fire('edit.add', new AddPrimitiveOp(scene, primitive));
@@ -335,6 +362,85 @@ const init = (ctx: ToolkitContext) => {
     addPlane.on('click', () => create('plane', 'Plane', false));
     addWall.on('click', () => create('plane', 'Wall', true));
     addBox.on('click', () => create('box', 'Box', false));
+
+    // a picture stands upright at the camera focus, keeping its aspect ratio
+    const createImage = async (dataUrl: string, label = 'Image') => {
+        flushPending();
+        const image = new Image();
+        image.src = dataUrl;
+        await image.decode();
+        const aspect = image.naturalWidth / Math.max(1, image.naturalHeight);
+        const hasSplat = scene.getElementsByType(ElementType.splat).length > 0;
+        const height = Math.max(0.01, (hasSplat ? scene.bound.halfExtents.length() : 1) * 0.5);
+        const focus = scene.camera.focalPoint;
+        const primitive = new MeshPrimitive({
+            kind: 'image',
+            name: `${label} ${++counter}`,
+            image: dataUrl,
+            position: [focus.x, focus.y, focus.z],
+            rotation: [90, 0, 0],
+            scale: [height * aspect, 1, height],
+            color: [1, 1, 1],
+            visible: true,
+            alphaCutoff: 0.5
+        });
+        selectOnAdd = primitive;
+        events.fire('edit.add', new AddPrimitiveOp(scene, primitive));
+    };
+
+    events.function('toolkit.addImage', createImage);
+
+    addImage.on('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => createImage(reader.result as string, file.name.replace(/\.[^.]+$/, ''));
+        reader.readAsDataURL(file);
+    });
+
+    // ---- viewport picking: a click (not a drag) on a primitive selects it
+
+    const pickRay = new Ray();
+    const pickPoint = new Vec3();
+    const boxHalf = new Vec3(0.5, 0.5, 0.5);
+    const planeHalf = new Vec3(0.5, 0.002, 0.5);
+    const pickTools: (string | null)[] = [null, TOOL, 'move', 'rotate', 'scale'];
+    let down: { x: number, y: number } | null = null;
+
+    const pick = (x: number, y: number) => {
+        scene.camera.getRay(x, y, pickRay);
+        let best: MeshPrimitive | null = null;
+        let bestDistance = Infinity;
+        primitives().forEach((primitive) => {
+            if (!primitive.entity.enabled) return;
+            const pickBox = new OrientedBox(primitive.entity.getWorldTransform(), primitive.kind === 'box' ? boxHalf : planeHalf);
+            if (pickBox.intersectsRay(pickRay, pickPoint)) {
+                const distance = pickPoint.distance(pickRay.origin);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = primitive;
+                }
+            }
+        });
+        return best as MeshPrimitive | null;
+    };
+
+    scene.canvas.addEventListener('pointerdown', (event: PointerEvent) => {
+        down = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
+    }, true);
+
+    scene.canvas.addEventListener('pointerup', (event: PointerEvent) => {
+        const start = down;
+        down = null;
+        if (!start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
+        if (!pickTools.includes(toolManager.active)) return;
+        const hit = pick(event.offsetX, event.offsetY);
+        if (hit && hit !== selected) {
+            select(hit);
+        }
+    }, true);
 
     // ---- scene events
 
