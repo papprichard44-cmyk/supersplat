@@ -4,6 +4,7 @@ import type { Events } from '../events';
 import type { Scene } from '../scene';
 import type { ToolManager } from '../tools/tool-manager';
 import type { Tooltips } from '../ui/tooltips';
+import { generatorsModule } from './generators';
 import { meshPrimitivesModule } from './mesh-primitives';
 
 // Everything the toolkit adds on top of upstream SuperSplat lives in this
@@ -29,7 +30,8 @@ interface ToolkitModule {
 }
 
 const modules: ToolkitModule[] = [
-    meshPrimitivesModule
+    meshPrimitivesModule,
+    generatorsModule
 ];
 
 const initToolkit = (ctx: ToolkitContext) => {

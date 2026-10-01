@@ -143,3 +143,24 @@
     padding: 0 8px;
     flex-shrink: 0;
 }
+
+// to the right of the primitives panel (left: 356px, width: 340px)
+#toolkit-generators-panel {
+    top: 102px;
+    left: 708px;
+    width: 220px;
+}
+
+.collapsed #toolkit-generators-panel {
+    display: none;
+}
+
+.toolkit-status {
+    margin: 0 6px 0 0;
+    font-size: 10px;
+    color: $clr-disabled;
+
+    &.online {
+        color: #6c6;
+    }
+}
