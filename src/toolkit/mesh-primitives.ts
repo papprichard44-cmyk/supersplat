@@ -10,6 +10,8 @@ import type { ToolkitContext, ToolkitModule } from './index';
 import { MeshPrimitive, PrimitiveData, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
 import { primitiveToSplat } from './primitive-to-splat';
+import { modelToSplat } from './model-to-splat';
+import { readGlb } from '../mesh-to-splat';
 
 const TOOL = 'toolkitPrimitive';
 
@@ -18,6 +20,7 @@ const tips = {
     addWall: 'Add a vertical plane (wall) at the camera focus. It hides the splats behind it with a sharp edge.',
     addBox: 'Add a solid box at the camera focus. Splats inside and behind it are hidden.',
     addImage: 'Add a picture (PNG / WebP with transparency) as a flat cutout in space. Transparent pixels are cut away, the rest hides the splats behind it with a sharp edge. Its Y size is its thickness.',
+    addModel: 'Add a 3D model (.glb) as a mesh. Place and size it like any primitive, then turn it into splats with "To splat". You can also drop a .glb onto the viewport.',
     cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
     density: 'How many splats are generated along the longest side when converting. Higher = sharper picture and edges, but more splats and a bigger file.',
     convert: 'Turn the selected primitive into a real gaussian splat layer (it then exports to PLY / SOG / SPZ and can be edited like any splat). The primitive itself is hidden, not deleted.',
@@ -30,7 +33,7 @@ const tips = {
     color: 'Surface colour of the selected primitive. On a picture it tints the image (white = unchanged).',
     position: 'Position of the primitive centre in world units (X, Y, Z).',
     rotation: 'Rotation in degrees around the X, Y and Z axes.',
-    size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y. On a picture Y is the thickness: raise it to extrude the cutout into a solid.'
+    size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y. On a picture Y is the thickness: raise it to extrude the cutout into a solid. On a model the three values scale its longest side.'
 };
 
 const createSvg = (svgString: string) => {
@@ -72,6 +75,15 @@ const init = (ctx: ToolkitContext) => {
     const addImage = new Button({ text: '+ Image', class: 'toolkit-button' });
     addRow.append(addBox);
     addRow.append(addImage);
+
+    const addModel = new Button({ text: '+ GLB', class: 'toolkit-button' });
+    addRow.append(addModel);
+
+    const modelInput = document.createElement('input');
+    modelInput.type = 'file';
+    modelInput.accept = '.glb,model/gltf-binary';
+    modelInput.style.display = 'none';
+    panel.dom.appendChild(modelInput);
 
     const fileInput = document.createElement('input');
     fileInput.type = 'file';
@@ -143,6 +155,7 @@ const init = (ctx: ToolkitContext) => {
     tooltips.register(addWall, tips.addWall, 'top');
     tooltips.register(addBox, tips.addBox, 'top');
     tooltips.register(addImage, tips.addImage, 'top');
+    tooltips.register(addModel, tips.addModel, 'top');
     tooltips.register(cutoffLabel, tips.cutoff, 'right');
     tooltips.register(cutoff, tips.cutoff, 'bottom');
     tooltips.register(densityLabel, tips.density, 'right');
@@ -354,14 +367,25 @@ const init = (ctx: ToolkitContext) => {
 
     const convertToSplat = async (primitive: MeshPrimitive, splatsAlongLongestSide: number) => {
         flushPending();
-        const gaussians = await primitiveToSplat(primitive, splatsAlongLongestSide);
-        if (gaussians.count === 0) {
+        const isModel = primitive.kind === 'model';
+        let ply: Blob;
+        let count: number;
+        if (isModel) {
+            ({ blob: ply, count } = await modelToSplat(primitive, splatsAlongLongestSide));
+        } else {
+            const gaussians = await primitiveToSplat(primitive, splatsAlongLongestSide);
+            count = gaussians.count;
+            ply = new Blob([gaussians.toPly()]);
+        }
+        if (count === 0) {
             return 0;
         }
         const filename = `${primitive.name.replace(/[^\w\- ]+/g, '_')}.ply`;
 
-        // the gaussians are generated in world space: reset whatever transform
-        // the importer gives a new layer so they land exactly on the primitive
+        // primitive gaussians are generated in world space: reset whatever
+        // transform the importer gives a new layer so they land exactly on the
+        // primitive. (model gaussians are written in the importer's own
+        // convention, so that layer keeps its default transform)
         let created: Element | null = null;
         const onAdded = (element: Element) => {
             if (element.type === ElementType.splat) {
@@ -370,15 +394,17 @@ const init = (ctx: ToolkitContext) => {
         };
         const handle = events.on('scene.elementAdded', onAdded);
         try {
-            await events.invoke('import', [{ filename, contents: new File([gaussians.toPly()], filename) }]);
+            await events.invoke('import', [{ filename, contents: new File([ply], filename) }]);
         } finally {
             handle.off();
         }
-        (created as Element | null)?.move(new Vec3(0, 0, 0), new Quat(), new Vec3(1, 1, 1));
+        if (!isModel) {
+            (created as Element | null)?.move(new Vec3(0, 0, 0), new Quat(), new Vec3(1, 1, 1));
+        }
 
         const oldState = primitive.getState();
         events.fire('edit.add', new PrimitiveStateOp(primitive, oldState, { ...oldState, visible: false }));
-        return gaussians.count;
+        return count;
     };
 
     events.function('toolkit.primitiveToSplat', convertToSplat);
@@ -458,12 +484,64 @@ const init = (ctx: ToolkitContext) => {
         reader.readAsDataURL(file);
     });
 
+    // a .glb becomes a mesh primitive: upright at the camera focus, its longest
+    // side half the size of the scene. reading it here first rejects files the
+    // converter cannot handle (e.g. Draco-compressed) before anything is added
+    const createModel = async (file: { filename: string, contents?: Blob, url?: string }) => {
+        flushPending();
+        const displayName = file.filename.split('/').pop();
+        try {
+            const blob: Blob = file.contents ?? await (await fetch(file.url)).blob();
+            const mesh = await readGlb(await blob.arrayBuffer());
+            if (mesh.numTriangles === 0) {
+                throw new Error('The file contains no triangle meshes');
+            }
+            const dataUrl = await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result as string);
+                reader.onerror = () => reject(new Error('The file could not be read'));
+                reader.readAsDataURL(blob);
+            });
+            const hasSplat = scene.getElementsByType(ElementType.splat).length > 0;
+            const size = Math.max(0.01, (hasSplat ? scene.bound.halfExtents.length() : 1) * 0.5);
+            const focus = scene.camera.focalPoint;
+            const primitive = new MeshPrimitive({
+                kind: 'model',
+                name: `${displayName.replace(/\.glb$/i, '')} ${++counter}`,
+                model: dataUrl,
+                position: [focus.x, focus.y, focus.z],
+                rotation: [0, 0, 0],
+                scale: [size, size, size],
+                color: [1, 1, 1],
+                visible: true,
+                alphaCutoff: 0.5
+            });
+            selectOnAdd = primitive;
+            events.fire('edit.add', new AddPrimitiveOp(scene, primitive));
+        } catch (error) {
+            await events.invoke('showPopup', {
+                type: 'error',
+                header: 'GLB import',
+                message: `${(error as Error).message ?? error} while loading '${displayName}'`
+            });
+        }
+    };
+
+    events.function('toolkit.addModel', createModel);
+
+    addModel.on('click', () => modelInput.click());
+    modelInput.addEventListener('change', () => {
+        const file = modelInput.files?.[0];
+        modelInput.value = '';
+        if (file) {
+            createModel({ filename: file.name, contents: file });
+        }
+    });
+
     // ---- viewport picking: a click (not a drag) on a primitive selects it
 
     const pickRay = new Ray();
     const pickPoint = new Vec3();
-    const boxHalf = new Vec3(0.5, 0.5, 0.5);
-    const planeHalf = new Vec3(0.5, 0.002, 0.5);
     const pickTools: (string | null)[] = [null, TOOL, 'move', 'rotate', 'scale'];
     let down: { x: number, y: number } | null = null;
 
@@ -473,7 +551,7 @@ const init = (ctx: ToolkitContext) => {
         let bestDistance = Infinity;
         primitives().forEach((primitive) => {
             if (!primitive.entity.enabled) return;
-            const pickBox = new OrientedBox(primitive.entity.getWorldTransform(), primitive.kind === 'plane' ? planeHalf : boxHalf);
+            const pickBox = new OrientedBox(primitive.entity.getWorldTransform(), primitive.localHalf);
             if (pickBox.intersectsRay(pickRay, pickPoint)) {
                 const distance = pickPoint.distance(pickRay.origin);
                 if (distance < bestDistance) {

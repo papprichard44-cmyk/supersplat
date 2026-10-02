@@ -7,7 +7,6 @@ import { Events } from './events';
 import { buildExportOptions, ExportChoices, ExportDialogResult, ExportType, SceneExportOptions } from './export-options';
 import { ExportSettings, loadExportSettings, saveExportSettings } from './export-settings';
 import { BlobReadSource, BrowserFileSystem, MappedReadFileSystem, pickWriteTarget, sourcesOf, WriteTarget } from './io';
-import { meshToSplatPly, readGlb } from './mesh-to-splat';
 import { recentImports, RecentImport } from './recent-files';
 import { Scene } from './scene';
 import { Splat } from './splat';
@@ -64,7 +63,7 @@ const filePickerTypes: { [key: string]: FilePickerAcceptType } = {
         }
     },
     'glb': {
-        description: 'glTF Binary Mesh (converted to splats)',
+        description: 'glTF Binary Mesh',
         accept: {
             'model/gltf-binary': ['.glb']
         }
@@ -336,70 +335,11 @@ const initFileHandler = (scene: Scene, events: Events, dropTarget: HTMLElement) 
         }
     };
 
-    // splat counts offered when converting a mesh
-    const meshSplatCounts = [100_000, 250_000, 500_000, 1_000_000, 2_000_000, 4_000_000];
-
-    // import a GLB mesh: parse it, let the user pick a splat count, then sample
-    // its surface into a PLY and load that like any other splat file
-    const importMesh = async (file: ImportFile) => {
-        const displayName = file.filename.split('/').pop();
-        try {
-            events.fire('progressStart', `Loading ${displayName}`);
-            events.fire('progressUpdate', { text: 'Reading', progress: 0 });
-            let mesh;
-            try {
-                const contents: Blob = file.contents ?? await (await fetch(file.url)).blob();
-                mesh = await readGlb(await contents.arrayBuffer());
-            } finally {
-                events.fire('progressEnd');
-            }
-
-            if (mesh.numTriangles === 0) {
-                throw new Error('The file contains no triangle meshes');
-            }
-
-            const result = await events.invoke('showPopup', {
-                type: 'okcancel',
-                header: i18n.t('popup.mesh-convert-header'),
-                message: i18n.t('popup.mesh-convert-message', {
-                    filename: displayName,
-                    triangles: mesh.numTriangles.toLocaleString()
-                }),
-                icon: false,
-                okText: i18n.t('popup.mesh-convert-button'),
-                select: {
-                    value: String(500_000),
-                    options: meshSplatCounts.map(count => ({
-                        v: String(count),
-                        t: `${count.toLocaleString()} ${i18n.t('popup.lod-select-splats')}`
-                    }))
-                }
-            });
-            if (result.action !== 'ok') {
-                return null;
-            }
-
-            events.fire('progressStart', `Converting ${displayName}`);
-            events.fire('progressUpdate', { text: 'Sampling', progress: 0 });
-            let ply: Blob;
-            try {
-                // sampling is synchronous, so give the progress dialog a chance to paint
-                await new Promise((resolve) => {
-                    setTimeout(resolve, 50);
-                });
-                ply = meshToSplatPly(mesh, parseInt(result.value, 10)).blob;
-            } finally {
-                events.fire('progressEnd');
-            }
-
-            const plyName = `${displayName.replace(/\.glb$/i, '')}.ply`;
-            return await importSplatModel([{
-                filename: plyName,
-                contents: new File([ply], plyName)
-            }], false);
-        } catch (error) {
-            await showLoadError(error.message ?? error, displayName);
-        }
+    // a GLB mesh is handed to the toolkit, which adds it as a mesh primitive
+    // that can be placed first and turned into splats afterwards
+    const importMesh = async (file: ImportFile): Promise<null> => {
+        await events.invoke('toolkit.addModel', file);
+        return null;
     };
 
     // figure out what the set of files are (ply sequence, document, sog set, ply) and then import them

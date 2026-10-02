@@ -8,6 +8,7 @@ import {
     SEMANTIC_NORMAL,
     SEMANTIC_POSITION,
     SEMANTIC_TEXCOORD0,
+    Asset,
     BoundingBox,
     Entity,
     Mesh,
@@ -31,7 +32,12 @@ import { AlphaGrid, buildExtrudeGeometry, makeAlphaGrid } from './image-extrude'
 // faces, side walls follow the alpha contour, and everything writes depth like
 // any other primitive, so the silhouette is a hard edge inside the splats.
 
-type PrimitiveKind = 'plane' | 'box' | 'image';
+//
+// A 'model' is an imported GLB mesh. It is drawn with the toolkit's own unlit
+// shaders (base colour x texture) instead of the engine's lit materials, since
+// the editor scene has no lights.
+
+type PrimitiveKind = 'plane' | 'box' | 'image' | 'model';
 
 type PrimitiveState = {
     position: [number, number, number];
@@ -46,6 +52,7 @@ type PrimitiveData = PrimitiveState & {
     kind: PrimitiveKind;
     name: string;
     image?: string;                         // images only: data url of the picture
+    model?: string;                         // models only: data url of the .glb file
 };
 
 const vertexShader = /* wgsl */`
@@ -139,6 +146,35 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
 }
 `;
 
+const modelFragmentShader = /* wgsl */`
+uniform view_position: vec3f;
+uniform primColor: vec3f;
+uniform primAlphaCutoff: f32;
+uniform primGamma: f32;
+var primTex: texture_2d<f32>;
+var primTex_sampler: sampler;
+varying vUv: vec2f;
+varying vWorldPos: vec3f;
+varying vNormal: vec3f;
+varying vSide: f32;
+
+@fragment
+fn fragmentMain(input: FragmentInput) -> FragmentOutput {
+    var output: FragmentOutput;
+    let texel = textureSample(primTex, primTex_sampler, input.vUv);
+    if (texel.a < uniform.primAlphaCutoff) {
+        discard;
+    }
+    // sRGB textures sample as linear: bring them back to display space
+    let rgb = pow(max(texel.rgb, vec3f(0.0)), vec3f(uniform.primGamma));
+    let n = normalize(input.vNormal);
+    let v = normalize(uniform.view_position - input.vWorldPos);
+    let shade = 0.6 + 0.4 * abs(dot(n, v));
+    output.color = vec4f(rgb * uniform.primColor * shade, 1.0);
+    return output;
+}
+`;
+
 const loadImage = (url: string) => {
     return new Promise<HTMLImageElement>((resolve, reject) => {
         const image = new Image();
@@ -148,8 +184,25 @@ const loadImage = (url: string) => {
     });
 };
 
-const unitBox = new BoundingBox(new Vec3(0, 0, 0), new Vec3(0.5, 0.5, 0.5));
-const unitPlane = new BoundingBox(new Vec3(0, 0, 0), new Vec3(0.5, 0.001, 0.5));
+type ModelPart = { meshInstance: MeshInstance, baseColor: [number, number, number] };
+
+const makeMaterial = (uniqueName: string, vertexWGSL: string, fragmentWGSL: string, textured: boolean) => {
+    const material = new ShaderMaterial({
+        uniqueName,
+        attributes: {
+            vertex_position: SEMANTIC_POSITION,
+            vertex_normal: SEMANTIC_NORMAL,
+            ...(textured ? { vertex_texCoord0: SEMANTIC_TEXCOORD0 } : {})
+        },
+        vertexWGSL,
+        fragmentWGSL
+    });
+    material.cull = CULLFACE_NONE;
+    material.depthWrite = true;
+    material.depthTest = true;
+    material.update();
+    return material;
+};
 
 class MeshPrimitive extends Element {
     kind: PrimitiveKind;
@@ -157,6 +210,13 @@ class MeshPrimitive extends Element {
     entity: Entity;
     material: ShaderMaterial;
     image: string | null;
+    model: string | null;
+    // half size of the primitive in its own space (before the entity's scale)
+    localHalf = new Vec3(0.5, 0.5, 0.5);
+    private modelRoot: Entity | null = null;
+    private modelAsset: Asset | null = null;
+    private modelParts: ModelPart[] = [];
+    private modelMaterials: ShaderMaterial[] = [];
     texture: Texture | null = null;
     alphaGrid: AlphaGrid | null = null;
     private mesh: Mesh | null = null;
@@ -164,6 +224,7 @@ class MeshPrimitive extends Element {
     alphaCutoff = 0.5;
     color: [number, number, number] = [0.8, 0.8, 0.8];
     private bound = new BoundingBox();
+    private localBound = new BoundingBox();
 
     constructor(data: PrimitiveData) {
         super(ElementType.model);
@@ -171,11 +232,98 @@ class MeshPrimitive extends Element {
         this.name = data.name;
         this.entity = new Entity(`toolkitPrimitive:${data.name}`);
         this.image = data.image ?? null;
-        this.entity.addComponent('render', { type: data.kind === 'image' ? 'asset' : data.kind });
+        this.model = data.model ?? null;
+        if (data.kind === 'plane') {
+            this.localHalf.set(0.5, 0.002, 0.5);
+        }
+        if (data.kind !== 'model') {
+            this.entity.addComponent('render', { type: data.kind === 'image' ? 'asset' : data.kind });
+        }
         this.setState(data);
     }
 
+    // load the GLB with the engine's own loader and put it under this.entity,
+    // normalised so that its longest side is 1 unit and its centre is the origin
+    // (the entity's scale is then the model's real size, like for a box)
+    private async addModel() {
+        const app = this.scene.app;
+        const blob = await (await fetch(this.model)).blob();
+        const url = URL.createObjectURL(blob);
+        try {
+            this.modelAsset = await new Promise<Asset>((resolve, reject) => {
+                app.assets.loadFromUrlAndFilename(url, `${this.name}.glb`, 'container', (error: string | null, asset?: Asset) => {
+                    if (error || !asset) {
+                        reject(new Error(`toolkit: could not load the model (${error})`));
+                    } else {
+                        resolve(asset);
+                    }
+                });
+            });
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+
+        const root = new Entity(`toolkitModel:${this.name}`);
+        root.addChild((this.modelAsset.resource as any).instantiateRenderEntity({ castShadows: false }));
+
+        const flat = makeMaterial('toolkitMeshPrimitive', vertexShader, fragmentShader, false);
+        const textured = makeMaterial('toolkitModelTextured', imageVertexShader, modelFragmentShader, true);
+        this.modelMaterials = [flat, textured];
+
+        const bound = new BoundingBox();
+        const partBound = new BoundingBox();
+        let first = true;
+        this.modelParts = [];
+        (root.findComponents('render') as any[]).forEach((render) => {
+            render.layers = [this.scene.worldLayer.id];
+            render.meshInstances.forEach((meshInstance: MeshInstance) => {
+                const source = meshInstance.material as any;
+                const diffuse = source?.diffuse;
+                const map: Texture | null = source?.diffuseMap ?? null;
+                const useMap = !!map && meshInstance.mesh.vertexBuffer.format.hasUv0;
+                meshInstance.material = useMap ? textured : flat;
+                if (useMap) {
+                    meshInstance.setParameter('primTex', map);
+                    meshInstance.setParameter('primGamma', (map as any).srgb ? 1 / 2.2 : 1);
+                    meshInstance.setParameter('primAlphaCutoff', source.alphaTest ?? 0);
+                }
+                this.modelParts.push({
+                    meshInstance,
+                    baseColor: diffuse ? [diffuse.r, diffuse.g, diffuse.b] : [1, 1, 1]
+                });
+                partBound.setFromTransformedAabb(meshInstance.mesh.aabb, meshInstance.node.getWorldTransform());
+                if (first) {
+                    bound.copy(partBound);
+                    first = false;
+                } else {
+                    bound.add(partBound);
+                }
+            });
+        });
+
+        const half = bound.halfExtents;
+        const longest = Math.max(half.x, half.y, half.z) * 2 || 1;
+        root.setLocalScale(1 / longest, 1 / longest, 1 / longest);
+        root.setLocalPosition(-bound.center.x / longest, -bound.center.y / longest, -bound.center.z / longest);
+        this.localHalf.set(half.x / longest, half.y / longest, half.z / longest);
+
+        this.modelRoot = root;
+        this.entity.addChild(root);
+        this.scene.contentRoot.addChild(this.entity);
+        this.applyColor();
+        this.scene.boundDirty = true;
+    }
+
+    // transform from the GLB's own space to world space
+    get modelTransform() {
+        return this.modelRoot?.getWorldTransform() ?? null;
+    }
+
     async add() {
+        if (this.kind === 'model') {
+            await this.addModel();
+            return;
+        }
         const isImage = this.kind === 'image';
         if (isImage) {
             // upload raw, straight-alpha pixels: handing the image element
@@ -250,6 +398,18 @@ class MeshPrimitive extends Element {
             this.mesh.destroy();
             this.mesh = null;
         }
+        if (this.modelRoot) {
+            this.modelRoot.destroy();
+            this.modelRoot = null;
+            this.modelParts = [];
+            this.modelMaterials.forEach(material => material.destroy());
+            this.modelMaterials = [];
+        }
+        if (this.modelAsset) {
+            this.scene.app.assets.remove(this.modelAsset);
+            this.modelAsset.unload();
+            this.modelAsset = null;
+        }
         this.builtCutoff = -1;
     }
 
@@ -288,11 +448,19 @@ class MeshPrimitive extends Element {
         if (!this.entity.enabled) {
             return null;
         }
-        this.bound.setFromTransformedAabb(this.kind === 'plane' ? unitPlane : unitBox, this.entity.getWorldTransform());
+        this.localBound.halfExtents.copy(this.localHalf);
+        this.bound.setFromTransformedAabb(this.localBound, this.entity.getWorldTransform());
         return this.bound;
     }
 
     private applyColor() {
+        if (this.kind === 'model') {
+            // the picked colour tints the model's own base colours
+            this.modelParts.forEach(({ meshInstance, baseColor }) => {
+                meshInstance.setParameter('primColor', [baseColor[0] * this.color[0], baseColor[1] * this.color[1], baseColor[2] * this.color[2]]);
+            });
+            return;
+        }
         const meshInstance = this.entity.render?.meshInstances[0];
         if (!meshInstance) return;
         meshInstance.setParameter('primColor', this.color);
@@ -337,7 +505,8 @@ class MeshPrimitive extends Element {
             kind: this.kind,
             name: this.name,
             ...this.getState(),
-            ...(this.image ? { image: this.image } : {})
+            ...(this.image ? { image: this.image } : {}),
+            ...(this.model ? { model: this.model } : {})
         };
     }
 }
