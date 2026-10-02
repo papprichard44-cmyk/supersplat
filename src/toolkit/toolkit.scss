@@ -223,11 +223,74 @@
     flex-shrink: 0;
 }
 
-// to the right of the export compare panel
+// left of the right toolbar, like the studio lighting and vegetation panels
 #toolkit-stamp-panel {
-    top: 102px;
-    left: 1080px;
-    width: 280px;
+    top: 72px;
+    right: 138px;
+    width: 300px;
+    max-height: calc(100vh - 126px);
+    display: flex;
+    flex-direction: column;
+
+    & > .panel-header {
+        flex-shrink: 0;
+    }
+}
+
+.toolkit-stamp-body {
+    overflow-y: auto;
+    padding-bottom: 6px;
+
+    .toolkit-label {
+        width: 72px;
+    }
+}
+
+.toolkit-stamp-list {
+    max-height: 188px;
+}
+
+.toolkit-check-row.toolkit-stamp-row {
+    height: 34px;
+
+    &.selected {
+        background-color: $bcg-darker;
+
+        & > .toolkit-check-name {
+            color: $clr-hilight;
+        }
+    }
+}
+
+.toolkit-stamp-thumb {
+    width: 28px;
+    height: 28px;
+    margin-right: 6px;
+    flex-shrink: 0;
+    border-radius: 3px;
+    background-color: $bcg-darkest;
+}
+
+.toolkit-stamp-remove {
+    margin: 0 0 0 8px;
+    width: 14px;
+    text-align: center;
+    color: $text-secondary;
+    cursor: pointer;
+    flex-shrink: 0;
+
+    &:hover {
+        color: $clr-hilight;
+    }
+}
+
+.toolkit-stamp-layer {
+    cursor: default;
+
+    &.dimmed {
+        color: $text-secondary;
+        font-style: italic;
+    }
 }
 
 .collapsed #toolkit-stamp-panel {
@@ -249,9 +312,26 @@
 
 #toolkit-stamp-svg {
     > circle {
-        fill: rgba(255, 102, 0, 0.2);
+        fill: #f60;
+        stroke: none;
+    }
+
+    > polygon {
+        fill: rgba(255, 102, 0, 0.12);
         stroke: #f60;
-        stroke-width: 1;
+        stroke-width: 1.5;
+        stroke-linejoin: round;
+    }
+
+    &.erase > circle {
+        fill: rgba(255, 60, 60, 0.25);
+        stroke: #f33;
+        stroke-width: 1.5;
+        r: 10px;
+    }
+
+    &.erase > polyline {
+        stroke: #f33;
     }
 
     > polyline {
