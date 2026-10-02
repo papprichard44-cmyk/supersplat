@@ -9,6 +9,7 @@ interface ShowOptions {
     header?: string;
     link?: string;
     icon?: boolean;     // show the type icon before the message (default true)
+    okText?: string;    // label for the ok button (default 'OK')
     select?: {
         options: { v: string, t: string }[];
         value: string;
@@ -167,6 +168,7 @@ class Popup extends Container {
 
             // configure based on message type
             okButton.hidden = type === 'yesno';
+            okButton.text = options.okText ?? i18n.t('popup.ok');
             cancelButton.hidden = type !== 'okcancel';
             yesButton.hidden = type !== 'yesno';
             noButton.hidden = type !== 'yesno';
