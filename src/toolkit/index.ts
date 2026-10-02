@@ -8,6 +8,7 @@ import { generatorsModule } from './generators';
 import { inspectorModule } from './inspector';
 import { studioModule } from './lighting/studio';
 import { meshPrimitivesModule } from './mesh-primitives';
+import { splatInspectorModule } from './splat-inspector';
 import { stampBrushModule } from './stamp-brush';
 import { vegetationModule } from './vegetation/vegetation';
 import type { ToolManager } from '../tools/tool-manager';
@@ -40,6 +41,7 @@ interface ToolkitModule {
 const modules: ToolkitModule[] = [
     inspectorModule,
     meshPrimitivesModule,
+    splatInspectorModule,
     studioModule,
     vegetationModule,
     generatorsModule,

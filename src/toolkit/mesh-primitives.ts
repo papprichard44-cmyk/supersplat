@@ -5,6 +5,7 @@ import { MultiOp } from '../edit-ops';
 import { Element, ElementType } from '../element';
 import primitivesSvg from './icons/primitives.svg';
 import { collapsible } from './inspector';
+import { renderQuickLighting } from './lighting-quick';
 import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveGenerator, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
 import { headerIcon, registerPanel } from './panels';
 import { primitiveIcon } from './primitive-icons';
@@ -584,91 +585,9 @@ const init = (ctx: ToolkitContext) => {
     };
 
     // the selected mesh's lighting at a glance, with quick actions
-    let lightPreset = '';
     const refreshLighting = () => {
-        if (!selected) return;
-        const info = events.invoke('toolkit.studio.meshLighting', selected) as {
-            lights: { index: number, name: string, visible: boolean, reaches: boolean }[],
-            casts: boolean,
-            subject: boolean,
-            presets: { v: string, t: string }[]
-        } | null;
-        lightBox.clear();
-        if (!info) return;
-        const target = selected;
-        const on = info.lights.filter(l => l.visible && l.reaches).length;
-        lightSummary.text = info.lights.length ? `${on} of ${info.lights.length} lights` : 'no lights';
-
-        lightBox.append(new Label({
-            text: info.lights.length ?
-                `Lit by ${on} of ${info.lights.length} light${info.lights.length === 1 ? '' : 's'}${info.subject ? '. The lights aim at it.' : '.'}` :
-                'No studio lights yet. Light it with a setup:',
-            class: 'toolkit-hint'
-        }));
-
-        // a setup around this object
-        const setupRow = new Container({ class: 'toolkit-row' });
-        const setupSelect = new SelectInput({ class: 'toolkit-select', type: 'string', options: info.presets, value: lightPreset || info.presets[0]?.v });
-        const setupButton = new Button({ text: info.lights.length ? 'Relight' : 'Light it', class: 'toolkit-convert' });
-        setupRow.append(setupSelect);
-        setupRow.append(setupButton);
-        lightBox.append(setupRow);
-        tooltips.register(setupSelect, tips.lightWith, 'bottom');
-        tooltips.register(setupButton, tips.lightWith, 'bottom');
-        setupSelect.on('change', (v: string) => {
-            lightPreset = v;
-        });
-        setupButton.on('click', () => {
-            lightPreset = setupSelect.value;
-            events.invoke('toolkit.studio.lightWith', target, setupSelect.value);
-        });
-
-        if (info.lights.length) {
-            const checklist = new Container({ class: 'toolkit-checklist' });
-            tooltips.register(checklist, tips.reach, 'left');
-            info.lights.forEach((light) => {
-                const r = new Container({ class: 'toolkit-check-row' });
-                if (!light.visible) r.class.add('dimmed');
-                const box = new BooleanInput({ type: 'checkbox', value: light.reaches });
-                const name = new Label({ text: light.name, class: 'toolkit-check-name' });
-                const state = new Label({ text: light.visible ? '' : 'off', class: 'toolkit-check-kind' });
-                r.append(box);
-                r.append(name);
-                r.append(state);
-                box.on('change', (value: boolean) => events.invoke('toolkit.studio.setReach', target, light.index, value));
-                name.dom.addEventListener('click', () => {
-                    box.value = !box.value;
-                });
-                checklist.append(r);
-            });
-            lightBox.append(checklist);
-
-            const castsRow = new Container({ class: 'toolkit-row' });
-            const castsLabel = new Label({ text: 'Shadows', class: 'toolkit-label' });
-            const castsToggle = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: info.casts });
-            castsRow.append(castsLabel);
-            castsRow.append(castsToggle);
-            lightBox.append(castsRow);
-            tooltips.register(castsLabel, tips.casts, 'right');
-            tooltips.register(castsToggle, tips.casts, 'bottom');
-            castsToggle.on('change', (value: boolean) => events.invoke('toolkit.studio.setCasts', target, value));
-        }
-
-        const actionRow = new Container({ class: 'toolkit-row' });
-        if (info.lights.length) {
-            const aimHere = new Button({ text: info.subject ? 'Lights aim here' : 'Aim lights here', class: 'toolkit-button' });
-            aimHere.enabled = !info.subject;
-            aimHere.on('click', () => events.invoke('toolkit.studio.aimHere', target));
-            tooltips.register(aimHere, tips.aimHere, 'bottom');
-            actionRow.append(aimHere);
-        }
-        const openLighting = new Button({ text: 'Lighting panel…', class: 'toolkit-button' });
-        openLighting.on('click', () => events.invoke('toolkit.studio.openPanel'));
-        tooltips.register(openLighting, 'Open the studio lighting panel: add single lights, the environment and the bake quality.', 'bottom');
-        actionRow.append(openLighting);
-        lightBox.append(actionRow);
+        if (selected) renderQuickLighting(events, tooltips, lightBox, lightSummary, selected, 'mesh');
     };
-
 
     let uiUpdating = false;
     const updateEditor = () => {
@@ -1445,6 +1364,11 @@ const init = (ctx: ToolkitContext) => {
             updateEditor();
         }
         scene.forceRender = true;
+    });
+
+    // picking a splat layer in the scene manager makes it the active object
+    events.on('selection', (splat: unknown) => {
+        if (splat && selected) select(null);
     });
 
     // new document / document load: primitives go with the rest of the scene

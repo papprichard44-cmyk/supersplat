@@ -1470,10 +1470,10 @@ const init = (ctx: ToolkitContext) => {
     // Convert primitives into one splat layer and, when the lights reach
     // splat layers, relight those into lit copies. `cell` is the spacing
     // between splats; by default it follows the panel's detail setting.
-    const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean, relightSplats?: boolean, backing?: boolean } = {}) => {
+    const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean, relightSplats?: boolean, backing?: boolean, splats?: Splat[] } = {}) => {
         const targets = prims.filter(p => p.entity.enabled);
         const lit = bakeLights();
-        const relit = options.relightSplats ? splatTargets(lit) : [];
+        const relit = options.relightSplats ? splatTargets(lit).filter(sp => !options.splats || options.splats.includes(sp)) : [];
         if (targets.length === 0 && relit.length === 0) return 0;
         flushPending();
         flushSettings();
@@ -1701,14 +1701,23 @@ const init = (ctx: ToolkitContext) => {
 
     // ---- quick lighting of one mesh, for the inspector
 
-    events.function('toolkit.studio.meshLighting', (p: MeshPrimitive) => ({
+    // (a mesh or a splat layer)
+    events.function('toolkit.studio.meshLighting', (p: MeshPrimitive | Splat) => ({
         lights: lights().map((light, index) => ({ index, name: light.state.name, visible: light.state.visible, reaches: reaches(light, p) })),
         casts: !settings.noShadow.includes(targetKey(p)),
         subject: settings.subject === targetKey(p),
-        presets: presets.map(preset => ({ v: preset.id, t: preset.label }))
+        presets: presets.map(preset => ({ v: preset.id, t: preset.label })),
+        lightSplats: settings.lightSplats
     }));
+    events.function('toolkit.studio.setLightSplats', (value: boolean) => {
+        editSettings({ lightSplats: value });
+        flushSettings();
+        updateEditor();
+    });
+    // bake the lights into a lit copy of one splat layer
+    events.function('toolkit.studio.relightSplat', (splat: Splat) => convertPrimitives([], { relightSplats: true, splats: [splat] }));
     // let one light reach the mesh, or not (switching the light to chosen objects)
-    events.function('toolkit.studio.setReach', (p: MeshPrimitive, index: number, value: boolean) => {
+    events.function('toolkit.studio.setReach', (p: MeshPrimitive | Splat, index: number, value: boolean) => {
         const light = lights()[index];
         if (!light) return;
         const key = targetKey(p);
@@ -1725,7 +1734,7 @@ const init = (ctx: ToolkitContext) => {
         flushPending();
         events.fire('edit.add', new LightStateOp(light, old, next));
     });
-    events.function('toolkit.studio.setCasts', (p: MeshPrimitive, value: boolean) => {
+    events.function('toolkit.studio.setCasts', (p: MeshPrimitive | Splat, value: boolean) => {
         const key = targetKey(p);
         const next = new Set(settings.noShadow);
         if (value) next.delete(key); else next.add(key);
@@ -1733,7 +1742,7 @@ const init = (ctx: ToolkitContext) => {
         flushSettings();
     });
     // light the mesh with a setup: it becomes the subject, the setup is applied around it
-    events.function('toolkit.studio.lightWith', (p: MeshPrimitive, presetId: string) => {
+    events.function('toolkit.studio.lightWith', (p: MeshPrimitive | Splat, presetId: string) => {
         const preset = presets.find(pr => pr.id === presetId);
         if (!preset) return;
         if (settings.subject !== targetKey(p)) {
@@ -1743,7 +1752,7 @@ const init = (ctx: ToolkitContext) => {
         // the mesh stays selected: its inspector shows the result
         applySetup(preset, false);
     });
-    events.function('toolkit.studio.aimHere', (p: MeshPrimitive) => pickSubject(targetKey(p)));
+    events.function('toolkit.studio.aimHere', (p: MeshPrimitive | Splat) => pickSubject(targetKey(p)));
     events.function('toolkit.studio.openPanel', () => setPanelVisible(true));
     events.function('toolkit.studio.hideAfter', () => settings.hideAfter);
     events.function('toolkit.studio.setHideAfter', (value: boolean) => {

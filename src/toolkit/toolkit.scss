@@ -271,6 +271,26 @@
     flex-grow: 1;
 }
 
+.toolkit-value.pcui-label {
+    margin: 0;
+    flex-grow: 1;
+    min-width: 0;
+    color: $text-primary;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.toolkit-numeric.pcui-numeric-input {
+    margin: 0;
+    flex-grow: 1;
+    height: 22px;
+
+    & > input {
+        height: 22px;
+    }
+}
+
 .toolkit-vector.pcui-vector-input {
     margin: 0;
     flex-grow: 1;
