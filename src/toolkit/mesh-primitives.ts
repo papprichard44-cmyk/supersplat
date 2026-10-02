@@ -28,6 +28,7 @@ const tips = {
     addModel: 'Add a 3D model (.glb) as a mesh. Place and size it like any primitive, then turn it into splats with "To splat". You can also drop a .glb onto the viewport.',
     cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
     density: 'How many splats are generated along the longest side when converting. Higher = sharper picture and edges, but more splats and a bigger file.',
+    farView: 'Keep the converted object visible from far away. Splat viewers (the editor, published and exported scenes alike) skip gaussians smaller than about half a pixel, and a converted mesh is made of equally tiny ones, so it would vanish all at once as you move away. On: solids and extruded pictures get hidden layers of larger gaussians inside that take over from a distance (about a third more splats).',
     convert: 'Turn the selected primitive into a real gaussian splat layer (it then exports to PLY / SOG / SPZ and can be edited like any splat). With studio lights in the scene, their light is baked in. The primitive itself is hidden, not deleted.',
     addShape: (label: string) => `Add a ${label.toLowerCase()} at the camera focus. Curved shapes show light and highlights best; light them in the Studio lighting panel.`,
     addBackdrop: 'Add a photo backdrop (cyclorama): a floor that sweeps up into a wall without a corner, as used in photo studios. Put your subject on it.',
@@ -352,6 +353,19 @@ const init = (ctx: ToolkitContext) => {
     convertRow.append(convert);
     editor.append(convertRow);
 
+    // far view: renderers skip gaussians below about half a pixel, so a
+    // converted object made of equally tiny ones vanishes at one distance
+    const farRow = new Container({ class: 'toolkit-row' });
+    const farLabel = new Label({ text: 'Far view', class: 'toolkit-label' });
+    const farToggle = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: true });
+    farRow.append(farLabel);
+    farRow.append(farToggle);
+    editor.append(farRow);
+    const farHint = new Label({ text: '', class: 'toolkit-hint' });
+    editor.append(farHint);
+    tooltips.register(farLabel, tips.farView, 'right');
+    tooltips.register(farToggle, tips.farView, 'bottom');
+
     panel.append(header);
     panel.append(addRow);
     panel.append(shapeRow);
@@ -403,6 +417,22 @@ const init = (ctx: ToolkitContext) => {
         translateButton.class[mode === 'translate' ? 'add' : 'remove']('active');
         rotateButton.class[mode === 'rotate' ? 'add' : 'remove']('active');
         scaleButton.class[mode === 'scale' ? 'add' : 'remove']('active');
+    };
+
+    // what the far view does for the selected primitive at this density
+    const updateFarHint = () => {
+        if (!selected) return;
+        const backed = ['box', 'sphere', 'cylinder', 'cone', 'torus', 'image'].includes(selected.kind);
+        const on = events.invoke('toolkit.backing') ?? true;
+        // the surface gaussians are ~0.7 cells wide; they drop out at ~0.6 px
+        const vanish = Math.round(density.value * 0.85);
+        if (backed && on) {
+            farHint.text = `Stays visible from far: larger hidden gaussians take over once the surface ones get too small (below ~${vanish} px on screen).`;
+        } else if (backed) {
+            farHint.text = `Vanishes once it is smaller than ~${vanish} px on screen. Turn Far view on, or lower Density.`;
+        } else {
+            farHint.text = `Flat sheets and models vanish once smaller than ~${vanish} px on screen. A lower Density keeps them visible from further; publishing with LODs also helps.`;
+        }
     };
 
     let uiUpdating = false;
@@ -467,6 +497,8 @@ const init = (ctx: ToolkitContext) => {
             turn.value = pic.rotation;
             wrap.value = pic.wrap;
         }
+        farToggle.value = events.invoke('toolkit.backing') ?? true;
+        updateFarHint();
         uiUpdating = false;
     };
 
@@ -755,6 +787,13 @@ const init = (ctx: ToolkitContext) => {
     };
 
     events.function('toolkit.primitiveToSplat', convertToSplat);
+
+    density.on('change', () => updateFarHint());
+    farToggle.on('change', (value: boolean) => {
+        if (uiUpdating) return;
+        events.invoke('toolkit.setBacking', value);
+        updateFarHint();
+    });
 
     convert.on('click', async () => {
         if (!selected || !convert.enabled) return;

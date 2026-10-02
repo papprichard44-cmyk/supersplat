@@ -3,6 +3,7 @@ import { BoundingBox, Ray, Vec3 } from 'playcanvas';
 
 import { bakeSamples, BakeCancelled, BakeSettings, LightParams, packLight } from './bake';
 import { kelvinPresets, kelvinToLinear } from './color';
+import { addFarViewBacking, BackingTarget } from './far-backing';
 import { FixtureKind, fixtureKinds, fixtures } from './fixtures';
 import { AddLightOp, LightStateOp, RemoveLightOp, SplatVisibleOp, StudioSettingsOp } from './light-ops';
 import { Preset, presets } from './presets';
@@ -50,6 +51,7 @@ type StudioSettings = {
     shadows: number;                        // 0 off, 1 hard, 2 soft, 3 very soft
     density: number;                        // splats along the longest side of everything converted
     hideAfter: boolean;                     // hide the converted meshes and the lights afterwards
+    backing: boolean;                       // far-view backing inside converted solids (far-backing.ts)
     showBeams: boolean;
     lightSplats: boolean;                   // the lights also reach the splat layers
     noShadow: string[];                     // objects that cast no shadows in the bake
@@ -68,6 +70,7 @@ const defaultSettings = (): StudioSettings => ({
     shadows: 2,
     density: 400,
     hideAfter: true,
+    backing: true,
     showBeams: true,
     lightSplats: false,
     noShadow: [],
@@ -109,6 +112,7 @@ const tips = {
     degree: 'How highlights and reflections are stored. Off: lighting is baked as plain colour (smallest file). Higher levels keep highlights moving with the viewing angle like on the real material, but make the file bigger. Very sharp, mirror-like highlights are always softened.',
     shadowQuality: 'Shadow quality of the bake. Soft and very soft trace more rays for smooth shadow edges from big lights, and take longer.',
     hideAfter: 'After converting, hide the meshes and the lights (they are kept, not deleted) so you see only the splats.',
+    backing: 'Keep converted objects visible from far away. Splat viewers skip gaussians smaller than about half a pixel, and a converted mesh is made of equally tiny ones, so without this it vanishes all at once as you move away. On: boxes, spheres, cylinders, cones, tori and extruded pictures get hidden layers of larger gaussians inside them that take over from a distance (about a third more splats). Flat planes, backdrops and models have no inside for it.',
     convert: 'Turn every visible primitive and model into one splat layer, with the studio lighting baked in.',
     estimate: 'Approximate size of the result.',
     lightSplats: 'Let the lights reach the splat layers too: they light up live in the viewport, and "Bake & convert" writes the light into a lit copy of each layer (the original is hidden, not deleted). Off: the lights only reach the meshes.',
@@ -574,6 +578,12 @@ const init = (ctx: ToolkitContext) => {
     hideRow.append(hideToggle);
     body.append(hideRow);
 
+    const backingRow = row('Far view', tips.backing);
+    const backingToggle = new BooleanInput({ type: 'toggle', value: true });
+    backingRow.append(backingToggle);
+    tooltips.register(backingToggle, tips.backing, 'bottom');
+    body.append(backingRow);
+
     const estimate = hint();
     estimate.class.add('toolkit-estimate');
     body.append(estimate);
@@ -664,6 +674,7 @@ const init = (ctx: ToolkitContext) => {
         shadowSelect.value = settings.shadows;
         aoToggle.value = settings.occlusion;
         hideToggle.value = settings.hideAfter;
+        backingToggle.value = settings.backing;
         splatsToggle.value = settings.lightSplats;
         splatBase.slider.value = settings.splatBase;
         splatBase.row.hidden = !settings.lightSplats;
@@ -682,6 +693,9 @@ const init = (ctx: ToolkitContext) => {
     shadowSelect.on('change', (value: number) => editSettings({ shadows: value }));
     aoToggle.on('change', (value: boolean) => editSettings({ occlusion: value }));
     hideToggle.on('change', (value: boolean) => editSettings({ hideAfter: value }));
+    backingToggle.on('change', (value: boolean) => editSettings({ backing: value }));
+    events.function('toolkit.backing', () => settings.backing);
+    events.function('toolkit.setBacking', (value: boolean) => editSettings({ backing: value }));
     splatsToggle.on('change', (value: boolean) => {
         editSettings({ lightSplats: value });
         updateEditor();
@@ -1286,10 +1300,31 @@ const init = (ctx: ToolkitContext) => {
         return created as Splat | null;
     };
 
+    // where a converted primitive can hide its far-view backing (far-backing.ts)
+    const backingTargetOf = (p: MeshPrimitive, start: number, end: number, cell: number): BackingTarget | null => {
+        if (end - start < 16) return null;
+        const transform = p.entity.getWorldTransform();
+        const scale = transform.getScale();
+        const longest = Math.max(scale.x, scale.y, scale.z);
+        if (p.kind === 'image') {
+            const up = transform.transformVector(new Vec3(0, 1, 0), new Vec3());
+            const thickness = up.length();
+            up.normalize();
+            return { start, end, cell, shape: 'slab', depth: thickness / 2, front: [up.x, up.y, up.z], longest };
+        }
+        if (p.kind === 'box' || p.kind === 'sphere' || p.kind === 'cylinder' || p.kind === 'cone' || p.kind === 'torus') {
+            const half = p.geometry.half;
+            const thinnest = Math.min(half[0] * scale.x, half[1] * scale.y, half[2] * scale.z);
+            return { start, end, cell, shape: 'solid', depth: thinnest * 0.5, longest };
+        }
+        // planes, backdrops and models have no inside to hide it in
+        return null;
+    };
+
     // Convert primitives into one splat layer and, when the lights reach
     // splat layers, relight those into lit copies. `cell` is the spacing
     // between splats; by default it follows the panel's detail setting.
-    const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean, relightSplats?: boolean } = {}) => {
+    const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean, relightSplats?: boolean, backing?: boolean } = {}) => {
         const targets = prims.filter(p => p.entity.enabled);
         const lit = bakeLights();
         const relit = options.relightSplats ? splatTargets(lit) : [];
@@ -1395,11 +1430,14 @@ const init = (ctx: ToolkitContext) => {
             // ---- meshes -> one new splat layer
             if (targets.length) {
                 const samples = new SampleBuffer();
+                const backingTargets: BackingTarget[] = [];
                 for (let i = 0; i < targets.length; ++i) {
                     if (control.cancelled) throw new BakeCancelled();
                     const p = targets[i];
                     const start = samples.count;
                     await samplePrimitive(p, cell, samples, meshes);
+                    const backing = (options.backing ?? settings.backing) ? backingTargetOf(p, start, samples.count, cell) : null;
+                    if (backing) backingTargets.push(backing);
                     const id = occluderIds.get(p);
                     if (id !== undefined && occluders[id].convex) samples.setOccluder(start, id);
                     samples.setLightMask(start, maskFor(p, lit));
@@ -1419,6 +1457,12 @@ const init = (ctx: ToolkitContext) => {
                     }, control);
                 } else {
                     colors = unlitColors(samples);
+                }
+
+                // mip levels of larger gaussians inside the objects, so they
+                // don't vanish where renderers cull the tiny surface gaussians
+                if (backingTargets.length) {
+                    colors = addFarViewBacking(samples, colors, backingTargets).colors;
                 }
 
                 events.fire('progressUpdate', { text: 'Loading splats', progress: relit.length ? 55 : 97 });
