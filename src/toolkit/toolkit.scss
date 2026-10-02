@@ -164,3 +164,61 @@
         color: #6c6;
     }
 }
+
+// below the generators panel
+#toolkit-compare-panel {
+    top: 180px;
+    left: 708px;
+    width: 360px;
+}
+
+.collapsed #toolkit-compare-panel {
+    display: none;
+}
+
+.toolkit-compare-table {
+    padding-bottom: 4px;
+}
+
+.toolkit-compare-note {
+    margin: 4px 10px;
+    color: $clr-disabled;
+}
+
+.toolkit-compare-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    min-height: 28px;
+
+    &.previewing {
+        background-color: $bcg-dark;
+
+        & > .toolkit-compare-name {
+            color: $clr-hilight;
+        }
+    }
+}
+
+.toolkit-compare-name {
+    margin: 0;
+    width: 104px;
+    flex-shrink: 0;
+    color: $text-primary;
+}
+
+.toolkit-compare-size {
+    margin: 0;
+    flex-grow: 1;
+    color: $text-primary;
+}
+
+.toolkit-compare-button.pcui-button {
+    margin: 0;
+    height: 22px;
+    line-height: 20px;
+    padding: 0 6px;
+    flex-shrink: 0;
+}
