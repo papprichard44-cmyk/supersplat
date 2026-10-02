@@ -1,12 +1,13 @@
 import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
 import { BoundingBox, Vec3 } from 'playcanvas';
 
-import { bladeCount, defaultGrass, flowerPalettes, GrassParams, grassGlb, MAX_BLADES } from './grass';
+import { bladeCount, bladesPerArea, defaultGrass, flowerPalettes, GrassParams, grassGlb, MAX_BLADES } from './grass';
 import { defaultRocks, RockParams, rocksGlb, speciesNames } from './rocks';
 import { barkTypes, defaultTree, leafTypes, presetInfo, TreeParams, treeGlb, treePresets } from './tree';
 import { ElementType } from '../../element';
 import vegetationSvg from '../icons/vegetation.svg';
 import type { ToolkitContext, ToolkitModule } from '../index';
+import { collapsible } from '../inspector';
 import { MeshPrimitive } from '../mesh-primitive';
 import { MeshRaycaster } from '../mesh-raycast';
 import { headerIcon, registerPanel } from '../panels';
@@ -44,10 +45,13 @@ const tips = {
     addTree: 'Generate the tree and put it on the ground at the camera focus.',
     updateTree: 'Regenerate the selected tree with these settings, keeping its place and height.',
     downloadTree: 'Save the tree as a .glb file.',
-    width: 'Size of the grass patch along X, in scene units.',
-    depth: 'Size of the grass patch along Z, in scene units.',
-    density: 'Blades per square unit. Denser grass looks lusher but makes more splats.',
-    bladeHeight: 'Height of the blades.',
+    brushRadius: 'Radius of the grass brush: a click grows a round patch this big, a drag grows grass along the stroke this wide.',
+    grassSize: 'Size of the blades (their height). With the same density, small blades fill a stroke with many blades, big ones with just a few.',
+    fullness: 'How close the blades stand, relative to their size: low = a few scattered blades, high = a dense lawn.',
+    thickness: 'Blade width, relative to its height: thin grass or broad blades.',
+    live: 'Changes apply right away to the grass being edited: the selected patch, or the one you just brushed (each settled change is one undo step).',
+    toSplats: 'Turn the grass being edited into splats (with the studio lighting if there are lights).',
+    addPatch: 'Grow a round patch (brush radius) at the camera focus.',
     heightVariance: 'How much the blade heights vary: 0 = mown lawn, 1 = wild meadow.',
     bladeWidth: 'Width of a blade at its root.',
     bend: 'How far the blades curve over.',
@@ -57,7 +61,7 @@ const tips = {
     rootColor: 'Colour of the blades near the ground.',
     tipColor: 'Colour of the blade tips.',
     dryness: 'Share of dry, straw coloured blades.',
-    flowers: 'Flowers per square unit, scattered in the grass.',
+    flowers: 'Share of flowers among the blades.',
     palette: 'Colours of the flowers.',
     direct: 'Convert this grass as gaussians laid along each blade (looks better, far fewer splats). Off: the grass mesh is sampled like any model.',
     addGrass: 'Generate a grass patch and put it on the ground at the camera focus.',
@@ -115,6 +119,7 @@ const init = (ctx: ToolkitContext) => {
     let placeSpacing = 1;
     let placeScaleVariation = 0.2;
     let grass: GrassParams = { ...defaultGrass(2), direct: true };
+    let brushRadius = 0.3;
     let uiUpdating = false;
     // declared up front: the ui helpers refer to each other
     let updateGrassCount: () => void = () => {};
@@ -202,6 +207,13 @@ const init = (ctx: ToolkitContext) => {
     // placement brush, for whichever kind is shown
     section('Place');
     const [placeButton] = buttons([['Place by clicking', tips.place]]);
+    const grassBrush = new Container();
+    body.append(grassBrush);
+    target = grassBrush;
+    const brush = slider('Brush radius', tips.brushRadius, 0.001, 100, 3, 0.001);
+    const placeOptions = new Container();
+    body.append(placeOptions);
+    target = placeOptions;
     const spacing = slider('Spacing', tips.spacing, 0.01, 20, 2, 0.01);
     const scaleVariation = slider('Size var.', tips.scaleVariation, 0, 0.8, 2, 0.01);
     const varyRow = row('New shapes', tips.varyShape);
@@ -212,6 +224,7 @@ const init = (ctx: ToolkitContext) => {
     const randomTurn = new BooleanInput({ type: 'toggle', value: true });
     turnRow.append(randomTurn);
     tooltips.register(randomTurn, tips.randomTurn, 'bottom');
+    target = body;
     const placeStatus = hint('Click on the scene to put one, drag to place several.');
     body.append(placeStatus);
 
@@ -242,32 +255,42 @@ const init = (ctx: ToolkitContext) => {
     const treeStatus = hint();
     treePage.append(treeStatus);
 
-    // grass
+    // grass: the main controls, then folding groups for the rest
     target = grassPage;
     section('Grass');
-    const grassSeed = seedRow(tips.seed);
-    const width = slider('Width', tips.width, 0.05, 50, 2, 0.01);
-    const depth = slider('Depth', tips.depth, 0.05, 50, 2, 0.01);
-    const density = slider('Density', tips.density, 1, 20000, 0, 1);
-    const bladeHeight = slider('Blade height', tips.bladeHeight, 0.002, 2, 3, 0.001);
+    const grassSize = slider('Size', tips.grassSize, 0.0005, 100, 3, 0.001);
+    const fullness = slider('Density', tips.fullness, 0, 1, 2, 0.01);
     const heightVariance = slider('Variance', tips.heightVariance, 0, 1, 2, 0.01);
-    const bladeWidth = slider('Blade width', tips.bladeWidth, 0.0005, 0.2, 4, 0.0005);
     const bend = slider('Bend', tips.bend, 0, 1, 2, 0.01);
-    const wind = slider('Wind', tips.wind, 0, 360, 0, 1);
-    const windStrength = slider('Lean', tips.windStrength, 0, 1, 2, 0.01);
+    const thickness = slider('Thickness', tips.thickness, 0.005, 0.2, 3, 0.001);
     const clumping = slider('Tufts', tips.clumping, 0, 1, 2, 0.01);
+    const grassSeed = seedRow(tips.seed);
+    const grassGroup = (title: string, id: string, open: boolean) => {
+        const g = collapsible(title, `vegetation.grass.${id}`, open);
+        grassPage.append(g.root);
+        target = g.body;
+        return g;
+    };
+    grassGroup('Colour', 'colour', true);
     const rootColor = color('Root colour', tips.rootColor);
     const tipColor = color('Tip colour', tips.tipColor);
     const dryness = slider('Dry blades', tips.dryness, 0, 1, 2, 0.01);
-    const flowers = slider('Flowers', tips.flowers, 0, 2000, 0, 1);
-    const palette = select('Flower colours', tips.palette, Object.keys(flowerPalettes).map(k => ({ v: k, t: k[0].toUpperCase() + k.slice(1) })));
-    const directRow = row('As blades', tips.direct);
-    const direct = new BooleanInput({ type: 'toggle', value: true });
-    directRow.append(direct);
+    const windGroup = grassGroup('Wind', 'wind', false);
+    const wind = slider('Direction', tips.wind, 0, 360, 0, 1);
+    const windStrength = slider('Lean', tips.windStrength, 0, 1, 2, 0.01);
+    const flowerGroup = grassGroup('Flowers', 'flowers', false);
+    const flowers = slider('Amount', tips.flowers, 0, 1, 2, 0.01);
+    const palette = select('Colours', tips.palette, Object.keys(flowerPalettes).map(k => ({ v: k, t: k[0].toUpperCase() + k.slice(1) })));
+    target = grassPage;
     const grassCount = hint();
     grassPage.append(grassCount);
-    const [addGrass, addGrassSplats] = buttons([['Add grass', tips.addGrass], ['Add as splats', tips.addGrassSplats]]);
-    const [updateGrass, downloadGrass] = buttons([['Update selected', tips.updateGrass], ['Download .glb', tips.downloadGrass]]);
+    const liveRow = row('Live edit', tips.live);
+    const liveGrass = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: true });
+    liveRow.append(liveGrass);
+    tooltips.register(liveGrass, tips.live, 'bottom');
+    const liveStatus = hint();
+    grassPage.append(liveStatus);
+    const [addGrass, addGrassSplats, downloadGrass] = buttons([['Add patch', tips.addPatch], ['To splats', tips.toSplats], ['Download .glb', tips.downloadGrass]]);
 
     // rocks
     target = rockPage;
@@ -326,12 +349,10 @@ const init = (ctx: ToolkitContext) => {
         barkTint.value = tree.barkTint;
 
         grassSeed.s.value = grass.seed;
-        width.value = grass.width;
-        depth.value = grass.depth;
-        density.value = grass.density;
-        bladeHeight.value = grass.height;
+        grassSize.value = grass.height;
+        fullness.value = grass.fullness ?? 0.45;
         heightVariance.value = grass.heightVariance;
-        bladeWidth.value = grass.bladeWidth;
+        thickness.value = grass.thickness ?? 0.035;
         bend.value = grass.bend;
         wind.value = grass.windAngle;
         windStrength.value = grass.windStrength;
@@ -339,9 +360,11 @@ const init = (ctx: ToolkitContext) => {
         rootColor.value = grass.rootColor;
         tipColor.value = grass.tipColor;
         dryness.value = grass.dryness;
-        flowers.value = grass.flowers;
+        flowers.value = grass.flowerAmount ?? 0;
         palette.value = grass.flowerPalette;
-        direct.value = grass.direct !== false;
+        brush.value = brushRadius;
+        windGroup.extra.dom.textContent = `${Math.round(grass.windAngle)}°`;
+        flowerGroup.extra.dom.textContent = (grass.flowerAmount ?? 0) > 0 ? `${Math.round((grass.flowerAmount ?? 0) * 100)}%` : 'none';
 
         rockKind.value = rocks.species;
         rockSeed.s.value = rocks.seed;
@@ -362,6 +385,8 @@ const init = (ctx: ToolkitContext) => {
         scaleVariation.value = placeScaleVariation;
         tabButtons.forEach((b, k) => b.class[k === kind ? 'add' : 'remove']('active'));
         treePage.hidden = kind !== 'tree';
+        grassBrush.hidden = kind !== 'grass';
+        placeOptions.hidden = kind === 'grass';
         grassPage.hidden = kind !== 'grass';
         rockPage.hidden = kind !== 'rocks';
         uiUpdating = false;
@@ -370,18 +395,21 @@ const init = (ctx: ToolkitContext) => {
     };
 
     updateGrassCount = () => {
-        const n = bladeCount(grass);
-        const wanted = Math.round(grass.density * grass.width * grass.depth);
-        grassCount.text = `${n.toLocaleString()} blades${wanted > MAX_BLADES ? ` (limited from ${wanted.toLocaleString()}: lower the density or the size)` : ''}, about ${(n * 4).toLocaleString()} splats as blades.`;
+        // per brush dab (a round patch of the brush radius)
+        const perArea = bladesPerArea(grass);
+        const dab = Math.round(perArea * Math.PI * brushRadius * brushRadius);
+        grassCount.text = `≈ ${dab.toLocaleString()} blades per click (${Math.round(perArea).toLocaleString()} per square unit), about 4 splats per blade.${dab > MAX_BLADES ? ` A patch holds at most ${MAX_BLADES.toLocaleString()} blades: bigger blades or a lower density for this brush.` : ''}`;
     };
 
     const onTree = (change: Partial<TreeParams>) => {
         if (!uiUpdating) tree = { ...tree, ...change };
     };
+    let grassChanged: () => void = () => {};
     const onGrass = (change: Partial<GrassParams>) => {
         if (uiUpdating) return;
         grass = { ...grass, ...change };
         updateGrassCount();
+        grassChanged();
     };
     const rgb = (v: number[]) => [v[0], v[1], v[2]] as [number, number, number];
 
@@ -419,23 +447,35 @@ const init = (ctx: ToolkitContext) => {
     grassSeed.dice.on('click', () => {
         grass = { ...grass, seed: 1 + Math.floor(Math.random() * 9998) };
         updateUI();
+        grassChanged();
     });
-    width.on('change', (v: number) => onGrass({ width: v }));
-    depth.on('change', (v: number) => onGrass({ depth: v }));
-    density.on('change', (v: number) => onGrass({ density: v }));
-    bladeHeight.on('change', (v: number) => onGrass({ height: v }));
+    grassSize.on('change', (v: number) => onGrass({ height: v, bladeWidth: v * (grass.thickness ?? 0.035) }));
+    fullness.on('change', (v: number) => onGrass({ fullness: v }));
     heightVariance.on('change', (v: number) => onGrass({ heightVariance: v }));
-    bladeWidth.on('change', (v: number) => onGrass({ bladeWidth: v }));
+    thickness.on('change', (v: number) => onGrass({ thickness: v, bladeWidth: grass.height * v }));
     bend.on('change', (v: number) => onGrass({ bend: v }));
-    wind.on('change', (v: number) => onGrass({ windAngle: v }));
+    wind.on('change', (v: number) => {
+        onGrass({ windAngle: v });
+        windGroup.extra.dom.textContent = `${Math.round(v)}°`;
+    });
     windStrength.on('change', (v: number) => onGrass({ windStrength: v }));
     clumping.on('change', (v: number) => onGrass({ clumping: v }));
     rootColor.on('change', (v: number[]) => onGrass({ rootColor: rgb(v) }));
     tipColor.on('change', (v: number[]) => onGrass({ tipColor: rgb(v) }));
     dryness.on('change', (v: number) => onGrass({ dryness: v }));
-    flowers.on('change', (v: number) => onGrass({ flowers: v }));
+    flowers.on('change', (v: number) => {
+        onGrass({ flowerAmount: v });
+        flowerGroup.extra.dom.textContent = v > 0 ? `${Math.round(v * 100)}%` : 'none';
+    });
     palette.on('change', (v: string) => onGrass({ flowerPalette: v }));
-    direct.on('change', (v: boolean) => onGrass({ direct: v }));
+    brush.on('change', (v: number) => {
+        if (uiUpdating) return;
+        brushRadius = v;
+        updateGrassCount();
+        // the cursor ring follows on the next frame
+        scene.forceRender = true;
+        grassChanged();
+    });
 
     // ---- generation
 
@@ -446,7 +486,6 @@ const init = (ctx: ToolkitContext) => {
 
     updateButtons = () => {
         updateTree.enabled = !!selectedGenerated('tree');
-        updateGrass.enabled = !!selectedGenerated('grass');
         updateRocks.enabled = !!selectedGenerated('rocks');
     };
 
@@ -456,8 +495,10 @@ const init = (ctx: ToolkitContext) => {
             tree = { ...defaultTree(), ...p.generator.params };
             updateUI();
         } else if (p?.generator?.type === 'grass') {
-            grass = { ...grass, ...p.generator.params };
+            grass = normalizeGrass({ ...grass, ...p.generator.params });
+            if (p.generator.params.area) brushRadius = p.generator.params.area.radius;
             updateUI();
+            updateLiveStatus();
         } else if (p?.generator?.type === 'rocks') {
             rocks = { ...defaultRocks(), ...p.generator.params };
             updateUI();
@@ -467,7 +508,7 @@ const init = (ctx: ToolkitContext) => {
 
     const busy = async <T>(text: string, work: () => Promise<T>) => {
         events.fire('startSpinner');
-        [addTree, updateTree, downloadTree, addGrass, addGrassSplats, updateGrass, downloadGrass, addRocks, updateRocks, downloadRocks].forEach((b) => {
+        [addTree, updateTree, downloadTree, addGrass, addGrassSplats, downloadGrass, addRocks, updateRocks, downloadRocks].forEach((b) => {
             b.enabled = false;
         });
         await new Promise((resolve) => {
@@ -525,28 +566,116 @@ const init = (ctx: ToolkitContext) => {
         download(await makeTree(), `${tree.preset.replace(/\s+/g, '_').toLowerCase()}_${tree.seed}.glb`);
     }));
 
-    const addGrassModel = async (replace?: MeshPrimitive | null) => {
-        const { glb } = await grassGlb(grass);
-        return await events.invoke('toolkit.addGeneratedModel', glb, {
-            name: 'Grass',
-            generator: { type: 'grass', params: { ...grass } },
-            longest: Math.max(grass.width, grass.depth),
-            replace
-        }) as MeshPrimitive;
+    // ---- grass: brushed patches, edited live
+
+    // grass made before brushing: its absolute amounts as the relative ones
+    function normalizeGrass(p: GrassParams): GrassParams {
+        const out = { ...p };
+        if (out.fullness === undefined) out.fullness = Math.min(1, Math.sqrt(Math.max(0, (p.density * p.height * p.height - 0.3) / 160)));
+        if (out.thickness === undefined) out.thickness = p.bladeWidth / Math.max(1e-9, p.height);
+        if (out.flowerAmount === undefined) out.flowerAmount = Math.min(1, p.flowers * p.width * p.depth / Math.max(1, bladeCount(p)) / 0.15);
+        return out;
+    }
+
+    // a stroke is one patch; patches of a stroke are found again by its id
+    // (an undo brings back the earlier version of it, with the same id)
+    let lastStroke = '';
+    const grassPatches = () => primitives().filter(p => p.generator?.type === 'grass');
+    const liveTarget = (): MeshPrimitive | null => {
+        const selectedGrass = selectedGenerated('grass');
+        if (selectedGrass) return selectedGrass;
+        return lastStroke ? grassPatches().find(p => p.generator.params.stroke === lastStroke) ?? null : null;
+    };
+    function updateLiveStatus() {
+        const t = liveTarget();
+        liveStatus.text = t ? `Editing ${t.name}${liveGrass.value ? ': changes apply as you go.' : '.'}` : 'Brush some grass (Place by clicking), or select a patch, to edit it here.';
+        addGrassSplats.enabled = !!t;
+    }
+
+    // the params a patch is regenerated with: the panel's, its own area
+    const paramsFor = (patch: MeshPrimitive): GrassParams => {
+        const own = patch.generator.params as GrassParams;
+        const area = own.area ? { ...own.area, radius: brushRadius } : undefined;
+        return { ...grass, area, width: own.width, depth: own.depth, stroke: (own as any).stroke } as GrassParams;
     };
 
-    addGrass.on('click', () => busy('Grass', () => addGrassModel()));
-    addGrassSplats.on('click', () => busy('Grass', async () => {
-        const primitive = await addGrassModel();
-        // convert just this patch: as blades unless switched off
-        await events.invoke('toolkit.convertPrimitives', [primitive], { hideLights: false });
+    let regenerating = false;
+    let regenerateAgain = false;
+    let liveTimer = 0;
+    const regenerate = async () => {
+        const patch = liveTarget();
+        if (!patch) return;
+        if (regenerating) {
+            regenerateAgain = true;
+            return;
+        }
+        regenerating = true;
+        liveStatus.text = `Updating ${patch.name}…`;
+        try {
+            const params = paramsFor(patch);
+            const { glb } = await grassGlb(params);
+            const options = { name: 'Grass', generator: { type: 'grass', params }, unitScale: 1, replace: patch };
+            const wasSelected = events.invoke('toolkit.selectedPrimitive') === patch;
+            if (wasSelected) {
+                await events.invoke('toolkit.addGeneratedModel', glb, options);
+            } else {
+                await events.invoke('toolkit.addGeneratedModels', [{ glb, options }]);
+            }
+        } catch (error) {
+            await events.invoke('showPopup', { type: 'error', header: 'Grass', message: (error as Error).message ?? String(error) });
+        } finally {
+            regenerating = false;
+            updateLiveStatus();
+            if (regenerateAgain) {
+                regenerateAgain = false;
+                regenerate();
+            }
+        }
+    };
+    grassChanged = () => {
+        if (!liveGrass.value || !liveTarget()) return;
+        window.clearTimeout(liveTimer);
+        liveTimer = window.setTimeout(regenerate, 350);
+    };
+    liveGrass.on('change', updateLiveStatus);
+
+    // a new patch: the stroke's points (world) relative to the first one
+    const addGrassPatch = async (points: Vec3[]) => {
+        const origin = points[0];
+        // keep the stroke light: points a third of the radius apart at most
+        const kept: number[] = [];
+        let last: Vec3 | null = null;
+        points.forEach((p, i) => {
+            if (!last || p.distance(last) >= brushRadius * 0.33 || i === points.length - 1) {
+                if (kept.length < 3 * 600) kept.push(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                last = p;
+            }
+        });
+        const stroke = `s${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const params = { ...grass, area: { points: kept, radius: brushRadius }, stroke } as GrassParams;
+        const { glb, blades } = await grassGlb(params);
+        await events.invoke('toolkit.addGeneratedModels', [{
+            glb,
+            options: { name: 'Grass', generator: { type: 'grass', params }, unitScale: 1, anchor: [origin.x, origin.y, origin.z], yaw: 0 }
+        }]);
+        lastStroke = stroke;
+        updateLiveStatus();
+        return blades;
+    };
+
+    addGrass.on('click', () => busy('Grass', async () => {
+        const focus = scene.camera.focalPoint;
+        const floor = primitives().filter(p => p.entity.enabled && p.worldBound && !p.generator);
+        const y = floor.length ? Math.min(...floor.map(p => p.worldBound.getMin().y)) : focus.y;
+        await addGrassPatch([new Vec3(focus.x, y, focus.z)]);
     }));
-    updateGrass.on('click', () => busy('Grass', async () => {
-        const target = selectedGenerated('grass');
-        if (target) await addGrassModel(target);
+    addGrassSplats.on('click', () => busy('Grass', async () => {
+        const patch = liveTarget();
+        if (patch) await events.invoke('toolkit.convertPrimitives', [patch], { hideLights: false });
     }));
     downloadGrass.on('click', () => busy('Grass', async () => {
-        download((await grassGlb(grass)).glb, `grass_${grass.seed}.glb`);
+        const patch = liveTarget();
+        download((await grassGlb(patch ? paramsFor(patch) : { ...grass, area: { points: [0, 0, 0], radius: brushRadius } })).glb, `grass_${grass.seed}.glb`);
     }));
 
     // ---- rocks
@@ -609,7 +738,7 @@ const init = (ctx: ToolkitContext) => {
     // footprint of one placed thing, for the spacing and the cursor ring
     const footprint = () => {
         if (kind === 'tree') return treeHeight * 0.35;
-        if (kind === 'grass') return Math.max(grass.width, grass.depth) * 0.5;
+        if (kind === 'grass') return brushRadius;
         return rocks.count > 1 ? rocks.size * (rocks.spread + 0.5) : rocks.size * 0.5;
     };
     const defaultSpacing = () => Math.max(0.01, footprint() * 2);
@@ -716,10 +845,6 @@ const init = (ctx: ToolkitContext) => {
                 const params = { ...tree, seed: (tree.seed + seedOffset) % 9999 || 1 };
                 const glb = await cached(`tree:${JSON.stringify(params)}`, async () => (await treeGlb(params)).glb);
                 items.push({ glb, options: { name: tree.preset, generator: { type: 'tree', params }, height: treeHeight * factor, anchor, yaw } });
-            } else if (kind === 'grass') {
-                const params = { ...grass, seed: (grass.seed + seedOffset) % 9999 || 1 };
-                const glb = await cached(`grass:${JSON.stringify(params)}`, async () => (await grassGlb(params)).glb);
-                items.push({ glb, options: { name: 'Grass', generator: { type: 'grass', params }, longest: Math.max(grass.width, grass.depth) * factor, anchor, yaw } });
             } else {
                 const params = { ...rocks, seed: (rocks.seed + seedOffset) % 9999 || 1 };
                 const glb = await cached(`rocks:${JSON.stringify(params)}`, () => rocksGlb(params).then(r => r.glb));
@@ -739,6 +864,17 @@ const init = (ctx: ToolkitContext) => {
         try {
             const samples = resample(stroke);
             const hits = await probe(samples, false);
+            if (kind === 'grass') {
+                const along = hits.filter(h => !!h).map(h => h.position.clone());
+                if (!along.length) {
+                    placeStatus.text = 'Nothing under the cursor to grow grass on.';
+                    return 0;
+                }
+                placeStatus.text = 'Growing grass…';
+                const blades = await addGrassPatch(along);
+                placeStatus.text = `Grew ${blades.toLocaleString()} blades. Change the settings to edit them live; Ctrl+Z takes the stroke back.`;
+                return 1;
+            }
             // points along the stroke, `spacing` apart on the surface
             const points: Vec3[] = [];
             let last: Vec3 | null = null;
@@ -754,8 +890,8 @@ const init = (ctx: ToolkitContext) => {
                 return 0;
             }
             const n = await placeAt(points);
-            const what = kind === 'tree' ? 'tree' : kind === 'grass' ? 'grass patch' : (rocks.count > 1 ? 'rock group' : 'rock');
-            placeStatus.text = `Placed ${n} ${what}${n === 1 ? '' : (what.endsWith('ch') ? 'es' : 's')}. Ctrl+Z takes the stroke back.`;
+            const what = kind === 'tree' ? 'tree' : (rocks.count > 1 ? 'rock group' : 'rock');
+            placeStatus.text = `Placed ${n} ${what}${n === 1 ? '' : 's'}. Ctrl+Z takes the stroke back.`;
             return n;
         } catch (error) {
             placeStatus.text = '';
@@ -874,6 +1010,9 @@ const init = (ctx: ToolkitContext) => {
             sizedFor = size;
             treeHeight = size * 0.9;
             grass = { ...defaultGrass(size), seed: grass.seed, direct: grass.direct };
+            brushRadius = Math.max(0.001, size * 0.08);
+            grassSize.sliderMax = Math.max(0.01, size * 0.25);
+            brush.sliderMax = Math.max(0.05, size);
             rocks = { ...rocks, size: Math.max(0.01, size * 0.12) };
             placeSpacing = defaultSpacing();
         }

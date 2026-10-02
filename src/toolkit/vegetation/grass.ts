@@ -12,6 +12,13 @@ import { SampleBuffer, srgbToLinear } from '../lighting/samples';
 
 type Rgb = [number, number, number];
 
+// where a brushed patch grows: within `radius` of the stroke (a polyline of
+// x y z points, relative to the patch's origin). One point = a round patch.
+type GrassArea = {
+    points: number[];
+    radius: number;
+};
+
 type GrassParams = {
     seed: number;
     width: number;              // patch size along x, world units
@@ -30,9 +37,18 @@ type GrassParams = {
     flowers: number;            // flowers per square unit
     flowerPalette: string;
     direct?: boolean;           // convert as blade-shaped splats (else by sampling the mesh)
+    // brushed patches (newer): the stroke's area instead of width x depth, and
+    // amounts relative to the blade size, so small blades fill a big stroke
+    // and big blades leave just a few in it
+    area?: GrassArea;
+    fullness?: number;          // 0..1: how close the blades stand, relative to their size
+    thickness?: number;         // blade width as a share of its height
+    flowerAmount?: number;      // 0..1: share of flowers among the blades (up to 15%)
 };
 
-const MAX_BLADES = 80000;
+const MAX_BLADES = 100000;
+// random positions tried when filling a stroke's area
+const MAX_TRIALS = 4000000;
 const SEGMENTS = 4;
 
 const flowerPalettes: Record<string, Rgb[]> = {
@@ -48,9 +64,12 @@ const defaultGrass = (size: number): GrassParams => ({
     width: size,
     depth: size,
     density: 30000 / (size * size),
-    height: size * 0.06,
+    height: size * 0.04,
     heightVariance: 0.4,
-    bladeWidth: size * 0.004,
+    bladeWidth: size * 0.04 * 0.035,
+    fullness: 0.45,
+    thickness: 0.035,
+    flowerAmount: 0,
     bend: 0.45,
     windAngle: 30,
     windStrength: 0.4,
@@ -74,7 +93,7 @@ const rng = (seed: number) => {
 };
 
 type Blade = {
-    x: number; z: number;
+    x: number; y: number; z: number;
     height: number;
     width: number;
     facing: number;             // angle of the blade's flat side
@@ -84,46 +103,187 @@ type Blade = {
     flower: number;             // -1 = grass, else the flower colour index
 };
 
-const bladeCount = (p: GrassParams) => Math.min(MAX_BLADES, Math.round(p.density * p.width * p.depth));
+// blade width and blades per square unit, from either way of setting them
+const bladeWidthOf = (p: GrassParams) => (p.thickness !== undefined ? p.height * p.thickness : p.bladeWidth);
+const bladesPerArea = (p: GrassParams) => {
+    if (p.fullness === undefined) return p.density;
+    const f = Math.min(1, Math.max(0, p.fullness));
+    // from a few blades a blade-height apart to a dense lawn
+    return (0.3 + 160 * f * f) / Math.max(1e-6, p.height * p.height);
+};
+
+// ---- the area of a brushed patch: within `radius` of the stroke
+
+type AreaTest = {
+    min: [number, number];
+    max: [number, number];
+    // square units covered (estimated)
+    size: number;
+    // the ground height at x z when it is inside the area, else null
+    inside: (x: number, z: number) => number | null;
+};
+
+const areaTest = (area: GrassArea): AreaTest => {
+    const pts = area.points;
+    const n = Math.max(1, Math.floor(pts.length / 3));
+    const r = Math.max(1e-6, area.radius);
+    const min: [number, number] = [Infinity, Infinity];
+    const max: [number, number] = [-Infinity, -Infinity];
+    let length = 0;
+    for (let i = 0; i < n; ++i) {
+        min[0] = Math.min(min[0], pts[i * 3] - r);
+        min[1] = Math.min(min[1], pts[i * 3 + 2] - r);
+        max[0] = Math.max(max[0], pts[i * 3] + r);
+        max[1] = Math.max(max[1], pts[i * 3 + 2] + r);
+        if (i > 0) length += Math.hypot(pts[i * 3] - pts[i * 3 - 3], pts[i * 3 + 2] - pts[i * 3 - 1]);
+    }
+    const boxArea = (max[0] - min[0]) * (max[1] - min[1]);
+    const size = Math.min(boxArea, Math.PI * r * r + 2 * r * length);
+
+    // segments (a lone point is a segment of length 0) bucketed in a grid of
+    // radius-sized cells, so a test only looks at the few nearby ones
+    const segments = Math.max(1, n - 1);
+    const cols = Math.max(1, Math.ceil((max[0] - min[0]) / r));
+    const rows = Math.max(1, Math.ceil((max[1] - min[1]) / r));
+    const cells = new Map<number, number[]>();
+    for (let k = 0; k < segments; ++k) {
+        const i0 = k;
+        const i1 = Math.min(n - 1, k + 1);
+        const x0 = Math.min(pts[i0 * 3], pts[i1 * 3]) - r;
+        const x1 = Math.max(pts[i0 * 3], pts[i1 * 3]) + r;
+        const z0 = Math.min(pts[i0 * 3 + 2], pts[i1 * 3 + 2]) - r;
+        const z1 = Math.max(pts[i0 * 3 + 2], pts[i1 * 3 + 2]) + r;
+        const cx0 = Math.max(0, Math.floor((x0 - min[0]) / r));
+        const cx1 = Math.min(cols - 1, Math.floor((x1 - min[0]) / r));
+        const cz0 = Math.max(0, Math.floor((z0 - min[1]) / r));
+        const cz1 = Math.min(rows - 1, Math.floor((z1 - min[1]) / r));
+        for (let cz = cz0; cz <= cz1; ++cz) {
+            for (let cx = cx0; cx <= cx1; ++cx) {
+                const key = cz * cols + cx;
+                let list = cells.get(key);
+                if (!list) cells.set(key, list = []);
+                list.push(k);
+            }
+        }
+    }
+
+    const r2 = r * r;
+    const inside = (x: number, z: number) => {
+        const cx = Math.min(cols - 1, Math.max(0, Math.floor((x - min[0]) / r)));
+        const cz = Math.min(rows - 1, Math.max(0, Math.floor((z - min[1]) / r)));
+        const list = cells.get(cz * cols + cx);
+        if (!list) return null;
+        let best = Infinity;
+        let y = 0;
+        for (let j = 0; j < list.length; ++j) {
+            const k = list[j];
+            const i1 = Math.min(n - 1, k + 1);
+            const ax = pts[k * 3], ay = pts[k * 3 + 1], az = pts[k * 3 + 2];
+            const dx = pts[i1 * 3] - ax, dy = pts[i1 * 3 + 1] - ay, dz = pts[i1 * 3 + 2] - az;
+            const ll = dx * dx + dz * dz;
+            const t = ll > 0 ? Math.min(1, Math.max(0, ((x - ax) * dx + (z - az) * dz) / ll)) : 0;
+            const ex = ax + dx * t - x;
+            const ez = az + dz * t - z;
+            const d2 = ex * ex + ez * ez;
+            if (d2 < best) {
+                best = d2;
+                // the ground follows the stroke
+                y = ay + dy * t;
+            }
+        }
+        return best <= r2 ? y : null;
+    };
+    return { min, max, size, inside };
+};
+
+// square units the patch covers
+const patchArea = (p: GrassParams) => (p.area ? areaTest(p.area).size : p.width * p.depth);
+
+// blades in the patch (an estimate for a brushed one, before generating)
+const bladeCount = (p: GrassParams) => Math.min(MAX_BLADES, Math.round(bladesPerArea(p) * patchArea(p)));
+
+const flowerCountOf = (p: GrassParams, blades: number) => (p.flowerAmount !== undefined ?
+    Math.round(blades * 0.15 * Math.min(1, Math.max(0, p.flowerAmount))) :
+    Math.min(Math.round(p.flowers * p.width * p.depth), Math.round(blades * 0.2)));
+
+// root positions: x y z per blade
+const bladeRoots = (p: GrassParams, random: () => number): { roots: number[], area: number } => {
+    const roots: number[] = [];
+    if (p.area) {
+        const test = areaTest(p.area);
+        const box = (test.max[0] - test.min[0]) * (test.max[1] - test.min[1]);
+        const trials = Math.min(MAX_TRIALS, Math.round(bladesPerArea(p) * box));
+        // uniform random tries in the bounds, kept when inside: the density
+        // comes out right whatever the stroke's shape
+        for (let i = 0; i < trials && roots.length < MAX_BLADES * 3; ++i) {
+            const x = test.min[0] + random() * (test.max[0] - test.min[0]);
+            const z = test.min[1] + random() * (test.max[1] - test.min[1]);
+            const y = test.inside(x, z);
+            if (y !== null) roots.push(x, y, z);
+        }
+        return { roots, area: test.size };
+    }
+    const count = bladeCount(p);
+    for (let i = 0; i < count; ++i) {
+        roots.push((random() - 0.5) * p.width, 0, (random() - 0.5) * p.depth);
+    }
+    return { roots, area: p.width * p.depth };
+};
 
 const generateBlades = (p: GrassParams): Blade[] => {
     const random = rng(p.seed);
-    const blades: Blade[] = [];
-    const count = bladeCount(p);
-    const flowerCount = Math.min(Math.round(p.flowers * p.width * p.depth), Math.round(count * 0.2));
+    const { roots, area } = bladeRoots(p, random);
+    const count = roots.length / 3;
+    const flowerCount = Math.min(count, flowerCountOf(p, count));
+    const bladeWidth = bladeWidthOf(p);
+    const test = p.area ? areaTest(p.area) : null;
+    const halfW = p.width / 2;
+    const halfD = p.depth / 2;
 
-    // tufts: blades gather around random centres
+    // tufts: a share of the blades gathers around random centres (taken from
+    // the roots, so they lie in the patch)
     const tufts = Math.max(1, Math.round(count / 40));
     const centres: number[] = [];
-    for (let i = 0; i < tufts; ++i) {
-        centres.push((random() - 0.5) * p.width, (random() - 0.5) * p.depth);
+    if (count > 0) {
+        for (let i = 0; i < tufts; ++i) {
+            const k = Math.floor(random() * count);
+            centres.push(roots[k * 3], roots[k * 3 + 1], roots[k * 3 + 2]);
+        }
     }
-    const tuftRadius = Math.sqrt(p.width * p.depth / tufts) * 0.6;
+    const tuftRadius = Math.sqrt(area / tufts) * 0.6;
     const windRad = p.windAngle * Math.PI / 180;
+    const blades: Blade[] = [];
 
-    const place = () => {
-        let x = (random() - 0.5) * p.width;
-        let z = (random() - 0.5) * p.depth;
-        if (random() < p.clumping) {
+    for (let i = 0; i < count; ++i) {
+        let x = roots[i * 3];
+        let y = roots[i * 3 + 1];
+        let z = roots[i * 3 + 2];
+        if (centres.length && random() < p.clumping) {
             const c = Math.floor(random() * tufts);
             const a = random() * Math.PI * 2;
             const r = Math.sqrt(random()) * tuftRadius;
-            x = Math.max(-p.width / 2, Math.min(p.width / 2, centres[c * 2] + Math.cos(a) * r));
-            z = Math.max(-p.depth / 2, Math.min(p.depth / 2, centres[c * 2 + 1] + Math.sin(a) * r));
+            const tx = centres[c * 3] + Math.cos(a) * r;
+            const tz = centres[c * 3 + 2] + Math.sin(a) * r;
+            if (test) {
+                const ty = test.inside(tx, tz);
+                if (ty !== null) {
+                    x = tx; y = ty; z = tz;
+                }
+            } else {
+                x = Math.max(-halfW, Math.min(halfW, tx));
+                z = Math.max(-halfD, Math.min(halfD, tz));
+            }
         }
-        return [x, z];
-    };
-
-    for (let i = 0; i < count + flowerCount; ++i) {
-        const flower = i >= count;
-        const [x, z] = place();
+        // the last ones are the flowers
+        const flower = i >= count - flowerCount;
         const lean = windRad + (random() - 0.5) * Math.PI * 2 * (1 - p.windStrength);
         const h = p.height * (1 - p.heightVariance * random()) * (flower ? 1.15 : 1);
         blades.push({
             x,
+            y,
             z,
             height: h,
-            width: p.bladeWidth * (0.7 + 0.6 * random()) * (flower ? 0.45 : 1),
+            width: bladeWidth * (0.7 + 0.6 * random()) * (flower ? 0.45 : 1),
             facing: random() * Math.PI * 2,
             leanX: Math.cos(lean),
             leanZ: Math.sin(lean),
@@ -133,6 +293,12 @@ const generateBlades = (p: GrassParams): Blade[] => {
         });
     }
     return blades;
+};
+
+// splats the patch becomes as blades (an estimate)
+const grassSplatCount = (p: GrassParams) => {
+    const blades = bladeCount(p);
+    return blades * SEGMENTS + flowerCountOf(p, blades);
 };
 
 // colour of a blade at height t (0 root .. 1 tip), sRGB
@@ -157,7 +323,7 @@ const bladeCurve = (b: Blade, t: number, out: number[]) => {
     const p2y = h * (1 - 0.45 * b.bend);
     const u = 1 - t;
     out[0] = b.x + t * t * p2x;
-    out[1] = 2 * u * t * p1y + t * t * p2y;
+    out[1] = b.y + 2 * u * t * p1y + t * t * p2y;
     out[2] = b.z + t * t * p2z;
     // derivative
     out[3] = 2 * t * p2x;
@@ -388,4 +554,4 @@ const grassSamples = (p: GrassParams, transform: Mat4, out: SampleBuffer, tint: 
     return out.count - start;
 };
 
-export { GrassParams, defaultGrass, grassGlb, grassSamples, bladeCount, flowerPalettes, MAX_BLADES };
+export { GrassParams, GrassArea, defaultGrass, grassGlb, grassSamples, bladeCount, grassSplatCount, bladesPerArea, flowerPalettes, MAX_BLADES };

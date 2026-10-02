@@ -27,7 +27,7 @@ import { MeshPrimitive, PrimitiveState } from '../mesh-primitive';
 import { headerIcon, registerPanel } from '../panels';
 import { PrimitiveStateOp } from '../primitive-ops';
 import { cellForDensity, Occluder, primitiveOccluder, samplePrimitive } from '../primitive-to-splat';
-import { bladeCount } from '../vegetation/grass';
+import { grassSplatCount } from '../vegetation/grass';
 
 
 // Studio lighting: place film lights around primitives and models, see them
@@ -170,7 +170,7 @@ const conversionMemoryFor = (count: number, degree: number, backing: boolean) =>
 const approxSplats = (primitive: MeshPrimitive, cell: number) => {
     const g = primitive.generator;
     if (primitive.kind === 'model' && g?.type === 'grass' && g.params?.direct !== false) {
-        return bladeCount(g.params) * 4 + (g.params.flowers ?? 0) * g.params.width * g.params.depth;
+        return grassSplatCount(g.params);
     }
     return approxArea(primitive) / (cell * cell);
 };

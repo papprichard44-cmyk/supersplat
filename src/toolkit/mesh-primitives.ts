@@ -1214,6 +1214,25 @@ const init = (ctx: ToolkitContext) => {
                 handle.off();
                 const half = primitive.localHalf;
                 let scale = 1;
+                if (old && options.unitScale) {
+                    // in the .glb's own units, like the one it replaces (times
+                    // that one's extra scale): the .glb's origin stays put
+                    const s = old.getState();
+                    const k = s.scale[0] / Math.max(1e-9, old.modelUnits);
+                    scale = primitive.modelUnits * k;
+                    const rotation = new Quat().setFromEulerAngles(s.rotation[0], s.rotation[1], s.rotation[2]);
+                    const anchor = rotation.transformVector(old.modelOrigin.clone().mulScalar(s.scale[0]), new Vec3())
+                    .add(new Vec3(s.position[0], s.position[1], s.position[2]));
+                    const offset = rotation.transformVector(primitive.modelOrigin.clone().mulScalar(scale), new Vec3());
+                    primitive.setState({
+                        ...primitive.getState(),
+                        position: [anchor.x - offset.x, anchor.y - offset.y, anchor.z - offset.z],
+                        rotation: s.rotation,
+                        scale: [scale, scale, scale]
+                    });
+                    resolve();
+                    return;
+                }
                 if (old) {
                     // keep the replaced model's height
                     scale = old.localHalf.y * old.getState().scale[1] / Math.max(half.y, 1e-6);
