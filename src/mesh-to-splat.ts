@@ -546,12 +546,15 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
     const spacing = Math.sqrt(surfaceArea / targetCount);
     // in-plane extent: wide enough that neighbouring discs overlap into a
     // closed surface. the normal axis is kept thin so the discs stay flat.
-    const logScaleT = Math.log(spacing * 0.7);
+    const logScaleT = Math.log(spacing * 0.85);
     const logScaleN = Math.log(spacing * 0.05);
 
-    // first pass: decide how many samples each triangle receives. the expected
-    // count is rounded stochastically, which keeps the total close to the
-    // target while spreading samples evenly across the surface.
+    // first pass: decide how many samples each triangle receives. the fractional
+    // part of each triangle's expected count is carried over to the next one
+    // (error diffusion) instead of being rounded at random: neighbouring
+    // triangles are usually neighbours in the index buffer, so this keeps the
+    // density even where random rounding left thin patches and clumps.
+    let carry = 0.5;
     const counts = batches.map(b => new Uint32Array(b.indices.length / 3));
     let total = 0;
     batches.forEach((batch, bi) => {
@@ -559,7 +562,9 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
         const batchCounts = counts[bi];
         for (let t = 0; t < batchCounts.length; ++t) {
             const area = triangleArea(positions, indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2]);
-            const n = Math.floor(area * density + Math.random());
+            carry += area * density;
+            const n = Math.floor(carry);
+            carry -= n;
             batchCounts[t] = n;
             total += n;
         }
@@ -596,10 +601,17 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
             const tx = e1x / tl, ty = e1y / tl, tz = e1z / tl;
             const bx = ny * tz - nz * ty, by = nz * tx - nx * tz, bz = nx * ty - ny * tx;
 
+            // samples follow a low-discrepancy (R2) sequence with a random start
+            // per triangle. plain random points clump and leave holes of every
+            // size, which showed up as a sieve-like surface that no amount of
+            // extra splats could close; this sequence fills the triangle evenly.
+            const o1 = Math.random();
+            const o2 = Math.random();
+
             for (let s = 0; s < n; ++s) {
-                // uniform barycentric sample
-                let r1 = Math.random();
-                let r2 = Math.random();
+                // evenly spread barycentric sample
+                let r1 = (o1 + (s + 1) * 0.7548776662466927) % 1;
+                let r2 = (o2 + (s + 1) * 0.5698402909980532) % 1;
                 if (r1 + r2 > 1) {
                     r1 = 1 - r1;
                     r2 = 1 - r2;
