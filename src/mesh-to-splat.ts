@@ -558,6 +558,108 @@ const sampleTexture = (texture: Texture, u: number, v: number, out: Float32Array
     out[3] = texture.data[i + 3] / 255;
 };
 
+// ---- mip-mapped colour lookups
+//
+// A splat stands for a patch of surface, often many texels wide. Reading one
+// texel for it (nearest) makes a noisy, shimmering result that only a lot of
+// splats hide; reading the patch's average (a mip level of the texture, the
+// way a GPU and Mip-Splatting filter) gives a clean picture at any density.
+
+type MipLevel = { width: number, height: number, data: Float32Array };   // linear rgb premultiplied by alpha, alpha
+
+const mipChains = new WeakMap<Texture, MipLevel[]>();
+
+const mipChain = (texture: Texture) => {
+    let chain = mipChains.get(texture);
+    if (chain) return chain;
+    const { width, height, data } = texture;
+    const base = new Float32Array(width * height * 4);
+    for (let i = 0; i < width * height; ++i) {
+        const a = data[i * 4 + 3] / 255;
+        base[i * 4] = srgbTable[data[i * 4]] * a;
+        base[i * 4 + 1] = srgbTable[data[i * 4 + 1]] * a;
+        base[i * 4 + 2] = srgbTable[data[i * 4 + 2]] * a;
+        base[i * 4 + 3] = a;
+    }
+    chain = [{ width, height, data: base }];
+    let level = chain[0];
+    while (level.width > 1 || level.height > 1) {
+        const w = Math.max(1, level.width >> 1);
+        const h = Math.max(1, level.height >> 1);
+        const next = new Float32Array(w * h * 4);
+        for (let y = 0; y < h; ++y) {
+            for (let x = 0; x < w; ++x) {
+                for (let c = 0; c < 4; ++c) {
+                    let sum = 0;
+                    for (let dy = 0; dy < 2; ++dy) {
+                        for (let dx = 0; dx < 2; ++dx) {
+                            const sx = Math.min(level.width - 1, x * 2 + dx);
+                            const sy = Math.min(level.height - 1, y * 2 + dy);
+                            sum += level.data[(sy * level.width + sx) * 4 + c];
+                        }
+                    }
+                    next[(y * w + x) * 4 + c] = sum / 4;
+                }
+            }
+        }
+        level = { width: w, height: h, data: next };
+        chain.push(level);
+    }
+    mipChains.set(texture, chain);
+    return chain;
+};
+
+// bilinear lookup in one level, wrapping like the texture does
+const bilinear = (level: MipLevel, texture: Texture, u: number, v: number, out: number[]) => {
+    const { width: w, height: h, data } = level;
+    const x = wrap(u, texture.wrapS) * w - 0.5;
+    const y = wrap(v, texture.wrapT) * h - 0.5;
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+    const cx = (i: number) => (texture.wrapS === CLAMP_TO_EDGE ? Math.min(w - 1, Math.max(0, i)) : ((i % w) + w) % w);
+    const cy = (i: number) => (texture.wrapT === CLAMP_TO_EDGE ? Math.min(h - 1, Math.max(0, i)) : ((i % h) + h) % h);
+    const a = (cy(y0) * w + cx(x0)) * 4;
+    const b = (cy(y0) * w + cx(x0 + 1)) * 4;
+    const c = (cy(y0 + 1) * w + cx(x0)) * 4;
+    const d = (cy(y0 + 1) * w + cx(x0 + 1)) * 4;
+    for (let k = 0; k < 4; ++k) {
+        out[k] = (data[a + k] * (1 - fx) + data[b + k] * fx) * (1 - fy) + (data[c + k] * (1 - fx) + data[d + k] * fx) * fy;
+    }
+};
+
+const mipA = [0, 0, 0, 0];
+const mipB = [0, 0, 0, 0];
+
+// the texture's average over a footprint of 2^lod texels (trilinear), as
+// linear rgb and alpha into `out`
+const sampleTextureMip = (texture: Texture, u: number, v: number, lod: number, out: Float32Array) => {
+    if (texture.uvTransform) {
+        const m = texture.uvTransform;
+        const tu = m[0] * u + m[1] * v + m[2];
+        const tv = m[3] * u + m[4] * v + m[5];
+        u = tu;
+        v = tv;
+    }
+    const chain = mipChain(texture);
+    const l = Math.min(chain.length - 1, Math.max(0, lod));
+    const l0 = Math.floor(l);
+    const l1 = Math.min(chain.length - 1, l0 + 1);
+    const t = l - l0;
+    bilinear(chain[l0], texture, u, v, mipA);
+    if (t > 0 && l1 !== l0) {
+        bilinear(chain[l1], texture, u, v, mipB);
+        for (let k = 0; k < 4; ++k) mipA[k] += (mipB[k] - mipA[k]) * t;
+    }
+    // un-premultiply
+    const a = mipA[3];
+    out[0] = a > 1e-6 ? mipA[0] / a : 0;
+    out[1] = a > 1e-6 ? mipA[1] / a : 0;
+    out[2] = a > 1e-6 ? mipA[2] / a : 0;
+    out[3] = a;
+};
+
 /**
  * Parse a GLB file into world-space triangle batches.
  *
@@ -642,6 +744,20 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
             const e1x = p[ib * 3] - ax, e1y = p[ib * 3 + 1] - ay, e1z = p[ib * 3 + 2] - az;
             const e2x = p[ic * 3] - ax, e2y = p[ic * 3 + 1] - ay, e2z = p[ic * 3 + 2] - az;
 
+            // texture detail level: how many texels one splat covers here
+            let lod = 0;
+            if (texture && uvs) {
+                const du1 = uvs[ib * 2] - uvs[ia * 2], dv1 = uvs[ib * 2 + 1] - uvs[ia * 2 + 1];
+                const du2 = uvs[ic * 2] - uvs[ia * 2], dv2 = uvs[ic * 2 + 1] - uvs[ia * 2 + 1];
+                const uvArea = Math.abs(du1 * dv2 - du2 * dv1) * 0.5 * texture.width * texture.height;
+                const worldArea = 0.5 * Math.hypot(
+                    e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x);
+                if (worldArea > 0 && uvArea > 0) {
+                    const texelsPerSplat = uvArea / worldArea * spacing * spacing;
+                    lod = Math.max(0, 0.5 * Math.log2(texelsPerSplat));
+                }
+            }
+
             // triangle frame: normal and an in-plane tangent
             let nx = e1y * e2z - e1z * e2y;
             let ny = e1z * e2x - e1x * e2z;
@@ -681,7 +797,7 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                 if (texture) {
                     const u = uvs[ia * 2] * w0 + uvs[ib * 2] * r1 + uvs[ic * 2] * r2;
                     const v = uvs[ia * 2 + 1] * w0 + uvs[ib * 2 + 1] * r1 + uvs[ic * 2 + 1] * r2;
-                    sampleTexture(texture, u, v, texel);
+                    sampleTextureMip(texture, u, v, lod, texel);
                     r *= texel[0];
                     g *= texel[1];
                     b *= texel[2];

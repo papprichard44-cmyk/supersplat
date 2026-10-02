@@ -72,6 +72,9 @@ const tips = {
     wrap: 'Beyond its edges the picture repeats, repeats mirrored, stretches its edge pixels, or (decal) is laid once over the colour - with its transparent parts showing the colour underneath.',
     position: 'Position of the primitive centre in world units (X, Y, Z).',
     rotation: 'Rotation in degrees around the X, Y and Z axes.',
+    solver: 'How the mesh becomes splats. Adaptive: sampled finer, then even areas merged into large flat splats; small ones stay only at edges, shadows and detail. Sharper, and usually far fewer splats. Classic: an even grid of equal splats (softer; can suit busy natural surfaces). For every conversion.',
+    sharpness: 'Adaptive: how much finer than the Detail the surface is sampled before merging. Edges get this much sharper; even areas cost nothing extra.',
+    simplify: 'Adaptive: how different the colours one merged splat may cover. Low: most faithful. High: fewer splats.',
     size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y. On a picture Y is the thickness: raise it to extrude the cutout into a solid. On a model the three values scale its longest side.'
 };
 
@@ -463,6 +466,33 @@ const init = (ctx: ToolkitContext) => {
     detailRow.append(densityLabel);
     detailRow.append(density);
     splatGroup.body.append(detailRow);
+    // the solver (scene-wide, kept with the studio settings)
+    const solverRow = new Container({ class: 'toolkit-row' });
+    const solverLabel = new Label({ text: 'Solver', class: 'toolkit-label' });
+    const solverSelect = new SelectInput({
+        class: 'toolkit-select',
+        type: 'string',
+        options: [{ v: 'adaptive', t: 'Adaptive (sharp, fewer splats)' }, { v: 'classic', t: 'Classic (even grid)' }],
+        value: 'adaptive'
+    });
+    solverRow.append(solverLabel);
+    solverRow.append(solverSelect);
+    splatGroup.body.append(solverRow);
+    const solverSlider = (text: string, min: number, max: number, precision: number) => {
+        const r = new Container({ class: 'toolkit-row' });
+        const label = new Label({ text, class: 'toolkit-label' });
+        const slider = new SliderInput({ class: 'toolkit-slider', min, max, precision, step: Math.pow(10, -precision), value: min });
+        r.append(label);
+        r.append(slider);
+        splatGroup.body.append(r);
+        return { row: r, label, slider };
+    };
+    const sharpnessRow = solverSlider('Sharpness', 1, 3, 1);
+    const simplifyRow = solverSlider('Simplify', 0, 1, 2);
+    tooltips.register(solverLabel, tips.solver, 'right');
+    tooltips.register(solverSelect, tips.solver, 'bottom');
+    tooltips.register(sharpnessRow.label, tips.sharpness, 'right');
+    tooltips.register(simplifyRow.label, tips.simplify, 'right');
     const splatEstimate = new Label({ text: '', class: ['toolkit-hint', 'toolkit-estimate'] });
     splatGroup.body.append(splatEstimate);
     splatGroup.body.append(farRow);
@@ -567,11 +597,23 @@ const init = (ctx: ToolkitContext) => {
     const formatCount = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} M` : `${Math.max(1, Math.round(n / 1000))} k`);
 
     // what converting the selected mesh makes, and the button to do it
+    let uiUpdating = false;
     const updateSplatInfo = () => {
         if (!selected) return;
-        const info = events.invoke('toolkit.studio.estimatePrimitive', selected, density.value) as { count: number, lit: boolean, memory: number, max: number } | null;
+        const info = events.invoke('toolkit.studio.estimatePrimitive', selected, density.value) as { count: number, lit: boolean, memory: number, max: number, adaptive: boolean } | null;
         if (!info) return;
-        const parts = [`About ${formatCount(info.count)} splats`];
+        const solver = events.invoke('toolkit.studio.solver') as { solver: string, sharpness: number, simplify: number, last: { before: number, after: number } | null } | null;
+        if (solver) {
+            uiUpdating = true;
+            solverSelect.value = solver.solver;
+            sharpnessRow.slider.value = solver.sharpness;
+            simplifyRow.slider.value = solver.simplify;
+            uiUpdating = false;
+            sharpnessRow.row.hidden = simplifyRow.row.hidden = solver.solver !== 'adaptive';
+        }
+        const adaptive = solver?.solver === 'adaptive';
+        const parts = [adaptive ? `Sampled at ${formatCount(info.count)}, then even areas merged (usually far fewer)` : `About ${formatCount(info.count)} splats`];
+        if (adaptive && solver.last) parts.push(`last conversion: ${formatCount(solver.last.before)} → ${formatCount(solver.last.after)}`);
         parts.push(info.lit ? 'the studio lights that reach it are baked in' : 'its own colours (no studio light reaches it)');
         if (info.memory > 3 * 1024 ** 3) parts.push(`needs ~${(info.memory / 1024 ** 3).toFixed(1)} GB of memory`);
         splatEstimate.text = `${parts.join(', ')}.`;
@@ -589,7 +631,6 @@ const init = (ctx: ToolkitContext) => {
         if (selected) renderQuickLighting(events, tooltips, lightBox, lightSummary, selected, 'mesh');
     };
 
-    let uiUpdating = false;
     const updateEditor = () => {
         if (!selected) {
             events.invoke('toolkit.inspector.hide', 'mesh');
@@ -1014,6 +1055,16 @@ const init = (ctx: ToolkitContext) => {
         showLock();
         gizmo.setUniformScale(scaleLocked);
     });
+    solverSelect.on('change', (value: string) => {
+        if (!uiUpdating) events.invoke('toolkit.studio.setSolver', { solver: value });
+    });
+    sharpnessRow.slider.on('change', (value: number) => {
+        if (!uiUpdating) events.invoke('toolkit.studio.setSolver', { sharpness: value });
+    });
+    simplifyRow.slider.on('change', (value: number) => {
+        if (!uiUpdating) events.invoke('toolkit.studio.setSolver', { simplify: value });
+    });
+    events.on('toolkit.studio.solverChanged', () => updateSplatInfo());
     farToggle.on('change', (value: boolean) => {
         if (uiUpdating) return;
         events.invoke('toolkit.setBacking', value);

@@ -87,8 +87,9 @@ class SampleBuffer {
         material: SurfaceMaterial,
         shade = 1
     ) {
-        const d = this.data;
+        // alloc first: it may grow (replace) the array
         const o = this.alloc();
+        const d = this.data;
         d[o + S_POS] = px; d[o + S_POS + 1] = py; d[o + S_POS + 2] = pz;
         d[o + S_ROT] = qw; d[o + S_ROT + 1] = qx; d[o + S_ROT + 2] = qy; d[o + S_ROT + 3] = qz;
         d[o + S_SCALE] = sx; d[o + S_SCALE + 1] = sy; d[o + S_SCALE + 2] = sz;

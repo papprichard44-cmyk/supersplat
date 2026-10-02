@@ -1,6 +1,7 @@
 import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
 import { BoundingBox, Ray, Vec3 } from 'playcanvas';
 
+import { adaptiveSimplify } from './adaptive';
 import { bakeSamples, BakeCancelled, BakeSettings, LightParams, packLight } from './bake';
 import { kelvinPresets, kelvinToLinear } from './color';
 import { addFarViewBacking, BackingTarget } from './far-backing';
@@ -60,6 +61,13 @@ type StudioSettings = {
     noShadow: string[];                     // objects that cast no shadows in the bake
     splatBase: number;                      // share of the splats' own light that is kept
     subject: string;                        // what the lights aim at: 'auto' or a mesh / splat layer key
+    // how meshes become splats: 'classic' = an even grid of equal splats,
+    // 'adaptive' = a finer grid (sharpness x the detail), then even areas
+    // merged into large flat splats (adaptive.ts); simplify 0..1 = how
+    // different the colours a merged splat may cover
+    solver: 'classic' | 'adaptive';
+    sharpness: number;
+    simplify: number;
 };
 
 const defaultSettings = (): StudioSettings => ({
@@ -79,10 +87,16 @@ const defaultSettings = (): StudioSettings => ({
     lightSplats: false,
     noShadow: [],
     splatBase: 1,
-    subject: 'auto'
+    subject: 'auto',
+    solver: 'adaptive',
+    sharpness: 1.5,
+    simplify: 0.5
 });
 
 const shadowRays = [0, 1, 16, 36];
+
+// colour range a merged splat may span, from the Simplify setting
+const toleranceOf = (simplify: number) => 0.01 + 0.07 * Math.min(1, Math.max(0, simplify));
 
 const tips = {
     toggle: 'Studio lighting: place film lights around your meshes, then bake the light into the splats.',
@@ -118,6 +132,9 @@ const tips = {
     degree: 'How highlights and reflections are stored. Off: lighting is baked as plain colour (smallest file). Higher levels keep highlights moving with the viewing angle like on the real material, but make the file bigger. Very sharp, mirror-like highlights are always softened.',
     shadowQuality: 'Shadow quality of the bake. Soft and very soft trace more rays for smooth shadow edges from big lights, and take longer.',
     hideAfter: 'After converting, hide the meshes and the lights (they are kept, not deleted) so you see only the splats.',
+    solver: 'How meshes become splats. Adaptive: samples finer, then merges even areas into large flat splats and keeps the small ones only at edges, shadows and detail, like a trained splat scene: sharper and usually far fewer splats. Classic: an even grid of equal splats (softer, but can suit busy natural surfaces).',
+    sharpness: 'Adaptive: how much finer than the Detail the surfaces are sampled before merging. Edges get this much sharper; even areas cost nothing extra.',
+    simplify: 'Adaptive: how different the colours one merged splat may cover. Low: only truly even areas merge (most faithful). High: more merging, fewer splats.',
     backing: 'Keep converted objects visible from far away. Splat viewers skip gaussians smaller than about half a pixel, and a converted mesh is made of equally tiny ones, so without this it vanishes all at once as you move away. On: boxes, spheres, cylinders, cones, tori and extruded pictures get hidden layers of larger gaussians inside them that take over from a distance (about a third more splats). Flat planes, backdrops and models have no inside for it.',
     convert: 'Turn every visible primitive and model into one splat layer, with the studio lighting baked in.',
     estimate: 'Approximate size of the result.',
@@ -623,6 +640,22 @@ const init = (ctx: ToolkitContext) => {
     hideRow.append(hideToggle);
     body.append(hideRow);
 
+    // the solver: how meshes become splats
+    const solverRow = row('Solver', tips.solver);
+    const solverSelect = new SelectInput({
+        class: 'toolkit-select',
+        type: 'string',
+        options: [{ v: 'adaptive', t: 'Adaptive (sharp, fewer splats)' }, { v: 'classic', t: 'Classic (even grid)' }],
+        value: 'adaptive'
+    });
+    solverRow.append(solverSelect);
+    tooltips.register(solverSelect, tips.solver, 'bottom');
+    body.append(solverRow);
+    const sharpness = sliderRow('Sharpness', tips.sharpness, 1, 3, 1, 0.1);
+    body.append(sharpness.row);
+    const simplify = sliderRow('Simplify', tips.simplify, 0, 1, 2, 0.01);
+    body.append(simplify.row);
+
     const backingRow = row('Far view', tips.backing);
     const backingToggle = new BooleanInput({ type: 'toggle', value: true });
     backingRow.append(backingToggle);
@@ -759,6 +792,10 @@ const init = (ctx: ToolkitContext) => {
 
     updateSettingsUI = () => {
         uiUpdating = true;
+        solverSelect.value = settings.solver;
+        sharpness.slider.value = settings.sharpness;
+        simplify.slider.value = settings.simplify;
+        sharpness.row.hidden = simplify.row.hidden = settings.solver !== 'adaptive';
         ambient.slider.value = settings.ambient;
         ambientPicker.value = settings.ambientColor;
         ground.slider.value = settings.ground;
@@ -791,6 +828,18 @@ const init = (ctx: ToolkitContext) => {
     aoToggle.on('change', (value: boolean) => editSettings({ occlusion: value }));
     hideToggle.on('change', (value: boolean) => editSettings({ hideAfter: value }));
     backingToggle.on('change', (value: boolean) => editSettings({ backing: value }));
+    solverSelect.on('change', (value: 'classic' | 'adaptive') => {
+        editSettings({ solver: value });
+        events.fire('toolkit.studio.solverChanged');
+    });
+    sharpness.slider.on('change', (value: number) => {
+        editSettings({ sharpness: value });
+        events.fire('toolkit.studio.solverChanged');
+    });
+    simplify.slider.on('change', (value: number) => {
+        editSettings({ simplify: value });
+        events.fire('toolkit.studio.solverChanged');
+    });
     events.function('toolkit.backing', () => settings.backing);
     events.function('toolkit.setBacking', (value: boolean) => editSettings({ backing: value }));
     splatsToggle.on('change', (value: boolean) => {
@@ -1377,6 +1426,11 @@ const init = (ctx: ToolkitContext) => {
     // ---- conversion
 
     // the bake gives masks of up to 24 lights (they ride in a float)
+    // the adaptive solver samples finer first (grass blades are laid along
+    // the blades whatever the solver)
+    const bladeGrass = (p: MeshPrimitive) => p.generator?.type === 'grass' && p.generator.params?.direct !== false;
+    const refineOf = (p: MeshPrimitive) => (settings.solver === 'adaptive' && !bladeGrass(p) ? Math.max(1, settings.sharpness) : 1);
+
     const MAX_BAKE_LIGHTS = 24;
     const bakeLights = () => activeLights().slice(0, MAX_BAKE_LIGHTS);
 
@@ -1386,7 +1440,7 @@ const init = (ctx: ToolkitContext) => {
 
     const estimateFor = (prims: MeshPrimitive[]) => {
         if (prims.length === 0) return null;
-        const count = prims.reduce((sum, p) => sum + approxSplats(p, cellForDensity(p, p.detail)), 0) * (settings.backing ? 1.2 : 1);
+        const count = prims.reduce((sum, p) => sum + approxSplats(p, cellForDensity(p, p.detail) / refineOf(p)), 0) * (settings.backing ? 1.2 : 1);
         const lit = prims.some(p => bakeLights().some(l => reaches(l, p)));
         const floats = 14 + (lit ? [0, 3, 8, 15][settings.degree] * 3 : 0);
         return { count, bytes: count * floats * 4, lit };
@@ -1410,7 +1464,9 @@ const init = (ctx: ToolkitContext) => {
         const lightsText = n ? `${n} light${n === 1 ? '' : 's'}` : 'no lights (unlit colours)';
         const parts: string[] = [];
         if (e) {
-            parts.push(`${prims.length} mesh${prims.length === 1 ? '' : 'es'} → about ${formatCount(e.count)} splats, ${Math.max(1, Math.round(e.bytes / 1048576))} MB as PLY`);
+            parts.push(settings.solver === 'adaptive' ?
+                `${prims.length} mesh${prims.length === 1 ? '' : 'es'} → sampled at ${formatCount(e.count)} splats, then even areas merged (usually far fewer)` :
+                `${prims.length} mesh${prims.length === 1 ? '' : 'es'} → about ${formatCount(e.count)} splats, ${Math.max(1, Math.round(e.bytes / 1048576))} MB as PLY`);
         }
         if (relit.length) {
             parts.push(`${relit.length} splat layer${relit.length === 1 ? '' : 's'} relit (${formatCount(relit.reduce((sum, sp) => sum + sp.numSplats, 0))} splats)`);
@@ -1471,6 +1527,9 @@ const init = (ctx: ToolkitContext) => {
     // Convert primitives into one splat layer and, when the lights reach
     // splat layers, relight those into lit copies. `cell` is the spacing
     // between splats; by default it follows the panel's detail setting.
+    // the last adaptive conversion: splats before and after merging
+    let lastSimplify: { before: number, after: number, reasons?: Record<string, number>, edgeCells?: number, cells?: number } | null = null;
+
     const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean, relightSplats?: boolean, backing?: boolean, splats?: Splat[] } = {}) => {
         const targets = prims.filter(p => p.entity.enabled);
         const lit = bakeLights();
@@ -1482,7 +1541,7 @@ const init = (ctx: ToolkitContext) => {
         const bound = subjectBound(targets.length ? targets : undefined);
         const longest = Math.max(bound.halfExtents.x, bound.halfExtents.y, bound.halfExtents.z) * 2;
         // every object at its own detail (splats along its longest side)
-        const cellOf = (p: MeshPrimitive) => options.cell ?? cellForDensity(p, p.detail);
+        const cellOf = (p: MeshPrimitive) => (options.cell ?? cellForDensity(p, p.detail)) / refineOf(p);
         const cell = targets.length ? Math.min(...targets.map(cellOf)) : longest / 300;
         const estimated = targets.reduce((sum, p) => sum + approxSplats(p, cellOf(p)), 0);
         if (estimated > MAX_SPLATS) {
@@ -1588,9 +1647,11 @@ const init = (ctx: ToolkitContext) => {
 
             // ---- meshes -> one new splat layer
             if (targets.length) {
-                const samples = new SampleBuffer();
+                let samples = new SampleBuffer();
                 samples.reserveTotal(Math.ceil(estimated * 1.1) + 1024);
                 const backingTargets: BackingTarget[] = [];
+                // which object every sample belongs to, for the adaptive solver
+                const ranges: { start: number, end: number, backing: BackingTarget | null, locked: boolean }[] = [];
                 for (let i = 0; i < targets.length; ++i) {
                     if (control.cancelled) throw new BakeCancelled();
                     const p = targets[i];
@@ -1598,6 +1659,7 @@ const init = (ctx: ToolkitContext) => {
                     await samplePrimitive(p, cellOf(p), samples, meshes);
                     const backing = (options.backing ?? settings.backing) ? backingTargetOf(p, start, samples.count, cellOf(p)) : null;
                     if (backing) backingTargets.push(backing);
+                    ranges.push({ start, end: samples.count, backing, locked: bladeGrass(p) });
                     const id = occluderIds.get(p);
                     if (id !== undefined && occluders[id].convex) samples.setOccluder(start, id);
                     samples.setLightMask(start, maskFor(p, lit));
@@ -1617,6 +1679,40 @@ const init = (ctx: ToolkitContext) => {
                     }, control);
                 } else {
                     colors = unlitColors(samples);
+                }
+
+                // adaptive: merge even areas of the final colours into large
+                // flat splats, keep the fine ones at every edge
+                if (settings.solver === 'adaptive') {
+                    const groups = new Int32Array(samples.count);
+                    const locked = new Uint8Array(samples.count);
+                    ranges.forEach((r, k) => {
+                        groups.fill(k, r.start, r.end);
+                        if (r.locked) locked.fill(1, r.start, r.end);
+                    });
+                    const before = samples.count;
+                    const result = await adaptiveSimplify(samples, colors, groups, locked, { tolerance: toleranceOf(settings.simplify), maxLevel: 6 }, (fraction) => {
+                        events.fire('progressUpdate', { text: `Simplifying ${formatCount(before)} splats`, progress: (lit.length ? 55 : 90) + 5 * fraction });
+                    });
+                    samples = result.samples;
+                    colors = result.colors;
+                    // the objects' new ranges (the result is ordered by object)
+                    ranges.forEach((r) => {
+                        r.start = -1;
+                        r.end = -1;
+                    });
+                    for (let i = 0; i < result.groups.length; ++i) {
+                        const r = ranges[result.groups[i]];
+                        if (r.start < 0) r.start = i;
+                        r.end = i + 1;
+                    }
+                    ranges.forEach((r) => {
+                        if (r.backing) {
+                            r.backing.start = Math.max(0, r.start);
+                            r.backing.end = Math.max(0, r.end);
+                        }
+                    });
+                    lastSimplify = { before, after: samples.count, reasons: result.reasons, edgeCells: result.edgeCells, cells: result.cells };
                 }
 
                 // mip levels of larger gaussians inside the objects, so they
@@ -1762,9 +1858,15 @@ const init = (ctx: ToolkitContext) => {
     });
     // what converting one mesh makes: splats, whether lights are baked in, memory
     events.function('toolkit.studio.estimatePrimitive', (p: MeshPrimitive, detail?: number) => {
-        const count = approxSplats(p, cellForDensity(p, detail ?? p.detail)) * (settings.backing ? 1.2 : 1);
+        const count = approxSplats(p, cellForDensity(p, detail ?? p.detail) / refineOf(p)) * (settings.backing ? 1.2 : 1);
         const lit = bakeLights().some(l => reaches(l, p));
-        return { count, lit, memory: conversionMemory(count, lit), max: MAX_SPLATS };
+        return { count, lit, memory: conversionMemory(count, lit), max: MAX_SPLATS, adaptive: refineOf(p) > 1 || settings.solver === 'adaptive' };
+    });
+    // the solver, for the inspector
+    events.function('toolkit.studio.solver', () => ({ solver: settings.solver, sharpness: settings.sharpness, simplify: settings.simplify, last: lastSimplify }));
+    events.function('toolkit.studio.setSolver', (change: Partial<Pick<StudioSettings, 'solver' | 'sharpness' | 'simplify'>>) => {
+        editSettings(change);
+        events.fire('toolkit.studio.solverChanged');
     });
     events.function('toolkit.studio.active', () => activeLights().length > 0);
 
