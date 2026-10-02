@@ -25,6 +25,7 @@ import { MeshPrimitive, PrimitiveState } from '../mesh-primitive';
 import { headerIcon, registerPanel } from '../panels';
 import { PrimitiveStateOp } from '../primitive-ops';
 import { Occluder, primitiveOccluder, samplePrimitive } from '../primitive-to-splat';
+import { bladeCount } from '../vegetation/grass';
 
 
 // Studio lighting: place film lights around primitives and models, see them
@@ -145,6 +146,15 @@ const approxArea = (primitive: MeshPrimitive) => {
             return 2 * (half.x * half.y * x * y + half.y * half.z * y * z + half.z * half.x * z * x) * 4 * 0.5;
         }
     }
+};
+
+// approximate number of splats a primitive converts to at a sample spacing
+const approxSplats = (primitive: MeshPrimitive, cell: number) => {
+    const g = primitive.generator;
+    if (primitive.kind === 'model' && g?.type === 'grass' && g.params?.direct !== false) {
+        return bladeCount(g.params) * 4 + (g.params.flowers ?? 0) * g.params.width * g.params.depth;
+    }
+    return approxArea(primitive) / (cell * cell);
 };
 
 let getLights: () => StudioLight[] = () => [];
@@ -1217,8 +1227,7 @@ const init = (ctx: ToolkitContext) => {
         const bound = subjectBound(prims);
         const longest = Math.max(bound.halfExtents.x, bound.halfExtents.y, bound.halfExtents.z) * 2;
         const cell = longest / Math.max(1, settings.density);
-        const area = prims.reduce((sum, p) => sum + approxArea(p), 0);
-        const count = area / (cell * cell);
+        const count = prims.reduce((sum, p) => sum + approxSplats(p, cell), 0);
         const lit = activeLights().length > 0;
         const floats = 14 + (lit ? [0, 3, 8, 15][settings.degree] * 3 : 0);
         return { count, bytes: count * floats * 4, cell, lit };
@@ -1291,7 +1300,7 @@ const init = (ctx: ToolkitContext) => {
         const bound = subjectBound(targets.length ? targets : undefined);
         const longest = Math.max(bound.halfExtents.x, bound.halfExtents.y, bound.halfExtents.z) * 2;
         const cell = options.cell ?? longest / Math.max(1, settings.density);
-        const estimated = targets.reduce((sum, p) => sum + approxArea(p), 0) / (cell * cell);
+        const estimated = targets.reduce((sum, p) => sum + approxSplats(p, cell), 0);
         if (estimated > MAX_SPLATS) {
             await events.invoke('showPopup', {
                 type: 'error',

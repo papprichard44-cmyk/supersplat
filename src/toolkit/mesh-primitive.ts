@@ -64,11 +64,16 @@ type PrimitiveState = {
     metalness?: number;
 };
 
+// what generated a model (vegetation panel), kept so it can be regenerated or
+// converted in its own way (grass becomes blade-shaped splats)
+type PrimitiveGenerator = { type: 'grass' | 'tree', params: any };
+
 type PrimitiveData = PrimitiveState & {
     kind: PrimitiveKind;
     name: string;
     image?: string;                         // images only: data url of the picture
     model?: string;                         // models only: data url of the .glb file
+    generator?: PrimitiveGenerator;         // models only: how it was generated
 };
 
 const vertexShader = /* wgsl */`
@@ -239,6 +244,7 @@ class MeshPrimitive extends Element {
     material: ShaderMaterial;
     image: string | null;
     model: string | null;
+    generator: PrimitiveGenerator | null;
     // half size of the primitive in its own space (before the entity's scale)
     localHalf = new Vec3(0.5, 0.5, 0.5);
     private modelRoot: Entity | null = null;
@@ -266,6 +272,7 @@ class MeshPrimitive extends Element {
         this.entity = new Entity(`toolkitPrimitive:${data.name}`);
         this.image = data.image ?? null;
         this.model = data.model ?? null;
+        this.generator = data.generator ?? null;
         if (data.kind === 'plane') {
             this.localHalf.set(0.5, 0.002, 0.5);
         }
@@ -576,7 +583,8 @@ class MeshPrimitive extends Element {
             name: this.name,
             ...this.getState(),
             ...(this.image ? { image: this.image } : {}),
-            ...(this.model ? { model: this.model } : {})
+            ...(this.model ? { model: this.model } : {}),
+            ...(this.generator ? { generator: this.generator } : {})
         };
     }
 }
@@ -585,4 +593,4 @@ const statesEqual = (a: PrimitiveState, b: PrimitiveState) => {
     return JSON.stringify(a) === JSON.stringify(b);
 };
 
-export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, statesEqual, DEFAULT_ROUGHNESS, DEFAULT_METALNESS };
+export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, PrimitiveGenerator, statesEqual, DEFAULT_ROUGHNESS, DEFAULT_METALNESS };

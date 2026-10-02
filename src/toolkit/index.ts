@@ -8,6 +8,7 @@ import { generatorsModule } from './generators';
 import { studioModule } from './lighting/studio';
 import { meshPrimitivesModule } from './mesh-primitives';
 import { stampBrushModule } from './stamp-brush';
+import { vegetationModule } from './vegetation/vegetation';
 import type { ToolManager } from '../tools/tool-manager';
 import type { Tooltips } from '../ui/tooltips';
 
@@ -38,6 +39,7 @@ interface ToolkitModule {
 const modules: ToolkitModule[] = [
     meshPrimitivesModule,
     studioModule,
+    vegetationModule,
     generatorsModule,
     generatedLayersModule,
     exportCompareModule,

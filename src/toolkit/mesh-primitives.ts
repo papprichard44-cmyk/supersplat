@@ -1,9 +1,10 @@
 import { Button, ColorPicker, Container, Label, SelectInput, SliderInput, VectorInput } from '@playcanvas/pcui';
 import { OrientedBox, Ray, Vec3 } from 'playcanvas';
 
+import { MultiOp } from '../edit-ops';
 import { Element, ElementType } from '../element';
 import primitivesSvg from './icons/primitives.svg';
-import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
+import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveGenerator, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
 import { headerIcon, registerPanel } from './panels';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
 import { cellForDensity } from './primitive-to-splat';
@@ -640,6 +641,77 @@ const init = (ctx: ToolkitContext) => {
     };
 
     events.function('toolkit.addModel', createModel);
+
+    // a model made by a generator (vegetation panel): stands on the ground at
+    // the camera focus, sized to `height` (its top above the ground) or
+    // `longest` (its longest side), or takes the place of `replace`
+    const addGeneratedModel = async (glb: ArrayBuffer, options: {
+        name: string,
+        generator: PrimitiveGenerator,
+        height?: number,
+        longest?: number,
+        replace?: MeshPrimitive | null
+    }) => {
+        flushPending();
+        const blob = new Blob([glb], { type: 'model/gltf-binary' });
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(new Error('The model could not be read'));
+            reader.readAsDataURL(blob);
+        });
+        const old = options.replace && options.replace.scene ? options.replace : null;
+        const focus = scene.camera.focalPoint;
+        const oldState = old?.getState();
+        const primitive = new MeshPrimitive({
+            kind: 'model',
+            name: old ? old.name : `${options.name} ${++counter}`,
+            model: dataUrl,
+            generator: options.generator,
+            position: oldState ? oldState.position : [focus.x, focus.y, focus.z],
+            rotation: oldState ? oldState.rotation : [0, 0, 0],
+            scale: [1, 1, 1],
+            color: oldState ? oldState.color : [1, 1, 1],
+            visible: true,
+            alphaCutoff: 0.5
+        });
+
+        // size and ground it once its geometry is known
+        const added = new Promise<void>((resolve) => {
+            const handle = events.on('scene.elementAdded', (element: Element) => {
+                if (element !== primitive) return;
+                handle.off();
+                const half = primitive.localHalf;
+                let scale = 1;
+                if (old) {
+                    // keep the replaced model's height
+                    scale = old.localHalf.y * old.getState().scale[1] / Math.max(half.y, 1e-6);
+                } else if (options.height) {
+                    scale = options.height / Math.max(2 * half.y, 1e-6);
+                } else if (options.longest) {
+                    scale = options.longest;
+                }
+                const state = primitive.getState();
+                let y = state.position[1];
+                if (!old) {
+                    // on the floor: the lowest visible primitive, else the focus
+                    const others = primitives().filter(p => p !== primitive && p.entity.enabled && p.worldBound);
+                    const ground = others.length ? Math.min(...others.map(p => p.worldBound.getMin().y)) : focus.y;
+                    y = ground + half.y * scale;
+                }
+                primitive.setState({ ...state, position: [state.position[0], y, state.position[2]], scale: [scale, scale, scale] });
+                resolve();
+            });
+        });
+
+        selectOnAdd = primitive;
+        events.fire('edit.add', old ? new MultiOp([new RemovePrimitiveOp(scene, old), new AddPrimitiveOp(scene, primitive)]) : new AddPrimitiveOp(scene, primitive));
+        await added;
+        return primitive;
+    };
+
+    events.function('toolkit.addGeneratedModel', addGeneratedModel);
+    events.function('toolkit.selectedPrimitive', () => selected);
 
     addModel.on('click', () => modelInput.click());
     modelInput.addEventListener('change', () => {

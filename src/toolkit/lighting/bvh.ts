@@ -39,17 +39,15 @@ const buildShadowScene = (occluders: Occluder[]): ShadowScene => {
     occluders.forEach((occluder, id) => {
         const count = occluder.positions.length / 9;
         srcTris.set(occluder.positions, t * 9);
-        let maskIndex = -1;
-        if (occluder.mask && occluder.masked) {
-            maskIndex = masks.length;
-            masks.push(occluder.mask);
-        }
+        const maskBase = masks.length;
+        masks.push(...occluder.masks);
         for (let i = 0; i < count; ++i) {
             // only convex occluders identify themselves: anything else may cast
             // shadows onto itself
             srcOccluder[t + i] = occluder.convex ? id : -1;
-            if (maskIndex >= 0 && occluder.masked[i]) {
-                srcMask[t + i] = maskIndex;
+            const local = occluder.maskIndex ? occluder.maskIndex[i] : -1;
+            if (local >= 0) {
+                srcMask[t + i] = maskBase + local;
                 srcUv.set(occluder.uvs.subarray(i * 6, i * 6 + 6), (t + i) * 6);
             }
         }

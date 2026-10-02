@@ -27,6 +27,7 @@
         "node": ">=20.19.0"
     },
     "devDependencies": {
+        "@dgreenheck/ez-tree": "^1.1.0",
         "@playcanvas/eslint-config": "2.1.0",
         "@playcanvas/pcui": "6.1.4",
         "@playcanvas/splat-transform": "3.7.0",
@@ -37,6 +38,7 @@
         "@rollup/plugin-terser": "1.0.0",
         "@rollup/plugin-typescript": "12.3.0",
         "@types/d3-contour": "3.0.6",
+        "@types/three": "^0.180.0",
         "@types/wicg-file-system-access": "2023.10.7",
         "@typescript-eslint/eslint-plugin": "8.71.0",
         "@typescript-eslint/parser": "8.71.0",
@@ -58,6 +60,7 @@
         "rollup-plugin-scss": "4.0.1",
         "sass": "1.105.0",
         "serve": "14.2.6",
+        "three": "^0.180.0",
         "tslib": "2.8.1",
         "typescript": "6.0.3"
     }

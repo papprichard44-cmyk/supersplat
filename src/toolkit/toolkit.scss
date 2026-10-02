@@ -486,3 +486,21 @@
     margin-top: 6px;
     color: $text-primary;
 }
+
+// ---- vegetation: same column as the studio lighting, a little lower
+#toolkit-vegetation-panel {
+    top: 48px;
+    right: 120px;
+    width: 340px;
+    max-height: calc(100vh - 160px);
+    display: flex;
+    flex-direction: column;
+
+    & > .panel-header {
+        flex-shrink: 0;
+    }
+
+    .toolkit-label {
+        width: 88px;
+    }
+}

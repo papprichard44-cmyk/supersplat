@@ -6,6 +6,7 @@ import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, loadImage } from '
 import { modelWorldMesh } from './model-to-splat';
 import { isShapeKind, shapeGeometry } from './shapes';
 import { MeshData, sampleMeshSurface, triangleArea } from '../mesh-to-splat';
+import { grassSamples } from './vegetation/grass';
 
 // Mesh -> 3D gaussian splat conversion for toolkit primitives.
 //
@@ -178,6 +179,12 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
     const scale = transform.getScale();
     const tint = primitive.color;
 
+    // generated grass: gaussians straight along its blades
+    if (primitive.kind === 'model' && primitive.generator?.type === 'grass' && primitive.generator.params?.direct !== false && primitive.modelTransform) {
+        grassSamples(primitive.generator.params, primitive.modelTransform, out, [srgbToLinear(tint[0]), srgbToLinear(tint[1]), srgbToLinear(tint[2])]);
+        return out.count - start;
+    }
+
     if (primitive.kind === 'model' || isShapeKind(primitive.kind)) {
         let mesh = meshes?.get(primitive);
         if (!mesh) {
@@ -289,12 +296,32 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
 
 // ---- shadow casters
 
+type OccluderMask = { width: number, height: number, alpha: Float32Array, cutoff: number };
+
 type Occluder = {
     positions: Float32Array;        // 9 floats per triangle, world space
     uvs: Float32Array | null;       // 6 floats per triangle, for alpha-masked triangles
-    masked: Uint8Array | null;      // 1 = alpha-test this triangle against `mask`
-    mask: { width: number, height: number, alpha: Float32Array, cutoff: number } | null;
+    maskIndex: Int32Array | null;   // per triangle: which of `masks` cuts it, -1 = opaque
+    masks: OccluderMask[];
     convex: boolean;
+};
+
+const MASK_MAX = 256;
+
+// a texture's alpha as a shadow mask, at most MASK_MAX on a side
+const textureMask = (texture: { width: number, height: number, data: Uint8ClampedArray }, cutoff: number): OccluderMask => {
+    const scale = Math.min(1, MASK_MAX / Math.max(texture.width, texture.height));
+    const width = Math.max(1, Math.round(texture.width * scale));
+    const height = Math.max(1, Math.round(texture.height * scale));
+    const alpha = new Float32Array(width * height);
+    for (let y = 0; y < height; ++y) {
+        const sy = Math.min(texture.height - 1, Math.floor((y + 0.5) / scale));
+        for (let x = 0; x < width; ++x) {
+            const sx = Math.min(texture.width - 1, Math.floor((x + 0.5) / scale));
+            alpha[y * width + x] = texture.data[(sy * texture.width + sx) * 4 + 3] / 255;
+        }
+    }
+    return { width, height, alpha, cutoff };
 };
 
 const trianglesOf = (positions: ArrayLike<number>, indices: ArrayLike<number>, transform: Mat4 | null) => {
@@ -325,7 +352,7 @@ const boxIndices = [
 // the triangles a primitive casts shadows with
 const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrimitive, MeshData>): Promise<Occluder | null> => {
     const transform = primitive.entity.getWorldTransform();
-    const base = { uvs: null as Float32Array | null, masked: null as Uint8Array | null, mask: null as Occluder['mask'] };
+    const base = { uvs: null as Float32Array | null, maskIndex: null as Int32Array | null, masks: [] as OccluderMask[] };
 
     if (primitive.kind === 'plane') {
         return { ...base, positions: trianglesOf(quadPositions, quadIndices, transform), convex: true };
@@ -338,7 +365,7 @@ const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrim
         const geometry = buildExtrudeGeometry(primitive.alphaGrid, primitive.alphaCutoff);
         const triangles = geometry.indices.length / 3;
         const uvs = new Float32Array(triangles * 6);
-        const masked = new Uint8Array(triangles);
+        const maskIndex = new Int32Array(triangles);
         for (let t = 0; t < triangles; ++t) {
             let cap = true;
             for (let k = 0; k < 3; ++k) {
@@ -348,13 +375,13 @@ const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrim
                 // the two picture faces have normals along y, the walls don't
                 if (Math.abs(geometry.normals[vi * 3 + 1]) < 0.5) cap = false;
             }
-            masked[t] = cap ? 1 : 0;
+            maskIndex[t] = cap ? 0 : -1;
         }
         return {
             positions: trianglesOf(geometry.positions, geometry.indices, transform),
             uvs,
-            masked,
-            mask: { ...primitive.alphaGrid, cutoff: primitive.alphaCutoff },
+            maskIndex,
+            masks: [{ ...primitive.alphaGrid, cutoff: primitive.alphaCutoff }],
             convex: false
         };
     }
@@ -365,14 +392,34 @@ const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrim
         meshes?.set(primitive, mesh);
     }
     const parts = mesh.batches.map(batch => trianglesOf(batch.positions, batch.indices, null));
-    const positions = new Float32Array(parts.reduce((sum, part) => sum + part.length, 0));
-    let offset = 0;
-    parts.forEach((part) => {
-        positions.set(part, offset);
-        offset += part.length;
+    const triangles = parts.reduce((sum, part) => sum + part.length / 9, 0);
+    const positions = new Float32Array(triangles * 9);
+    // alpha-tested materials (leaves, cut-outs) cut their shadows with their texture
+    const anyMasked = mesh.batches.some(b => b.material.alphaMode !== 'OPAQUE' && b.material.texture && b.uvs);
+    const uvs = anyMasked ? new Float32Array(triangles * 6) : null;
+    const maskIndex = anyMasked ? new Int32Array(triangles).fill(-1) : null;
+    const masks: OccluderMask[] = [];
+    let t = 0;
+    mesh.batches.forEach((batch, bi) => {
+        positions.set(parts[bi], t * 9);
+        const count = parts[bi].length / 9;
+        const m = batch.material;
+        if (anyMasked && m.alphaMode !== 'OPAQUE' && m.texture && batch.uvs) {
+            const index = masks.length;
+            masks.push(textureMask(m.texture, m.alphaMode === 'MASK' ? m.alphaCutoff : 0.5));
+            for (let k = 0; k < count; ++k) {
+                maskIndex[t + k] = index;
+                for (let c = 0; c < 3; ++c) {
+                    const vi = batch.indices[k * 3 + c];
+                    uvs[(t + k) * 6 + c * 2] = batch.uvs[vi * 2];
+                    uvs[(t + k) * 6 + c * 2 + 1] = batch.uvs[vi * 2 + 1];
+                }
+            }
+        }
+        t += count;
     });
     const convex = isShapeKind(primitive.kind) && shapeGeometry(primitive.kind).convex;
-    return { ...base, positions, convex };
+    return { ...base, positions, uvs, maskIndex, masks, convex };
 };
 
 // splats along the longest side -> spacing between samples
@@ -382,4 +429,4 @@ const cellForDensity = (primitive: MeshPrimitive, density: number) => {
     return longest / Math.max(1, density);
 };
 
-export { samplePrimitive, primitiveOccluder, cellForDensity, Occluder };
+export { samplePrimitive, primitiveOccluder, cellForDensity, Occluder, OccluderMask };
