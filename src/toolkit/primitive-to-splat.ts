@@ -85,7 +85,7 @@ const sampleFace = (
     axisV: Vec3,
     cell: number,
     material: SurfaceMaterial,
-    colorAt: (s: number, t: number) => Color | null
+    colorAt: (s: number, t: number, footprint: number) => Color | null
 ) => {
     transform.transformVector(axisU, worldU);
     transform.transformVector(axisV, worldV);
@@ -107,7 +107,8 @@ const sampleFace = (
         for (let i = 0; i < nu; ++i) {
             const s = (i + 0.5) / nu;
             const t = (j + 0.5) / nv;
-            const color = colorAt(s, t);
+            // the face's uv area one sample stands for
+            const color = colorAt(s, t, 1 / (nu * nv));
             if (!color) continue;
             // see-through paint: less opacity per gaussian, as they overlap
             let alpha = color.length > 3 ? color[3] : 1;
@@ -220,12 +221,12 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
         const paint = createPaint(primitive.paint, primitive.geometry.half, await primitive.paintPixels());
         const rgba = new Float32Array(4);
         (plane ? planeFaceVectors : boxFaceVectors).forEach(({ origin, u, v }) => {
-            sampleFace(out, transform, center, origin, u, v, cell, material, (s, t) => {
+            sampleFace(out, transform, center, origin, u, v, cell, material, (s, t, footprint) => {
                 paint(s, t,
                     origin.x + u.x * s + v.x * t,
                     origin.y + u.y * s + v.y * t,
                     origin.z + u.z * s + v.z * t,
-                    rgba);
+                    rgba, footprint);
                 return [rgba[0], rgba[1], rgba[2], rgba[3]];
             });
         });

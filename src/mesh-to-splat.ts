@@ -56,7 +56,7 @@ type Material = {
     doubleSided: boolean;
     // toolkit: procedural surface paint (display-space rgb, straight alpha) of
     // a point given its uv and its position in the object's own space
-    paint?: ((u: number, v: number, lx: number, ly: number, lz: number, out: Float32Array) => void) | null;
+    paint?: ((u: number, v: number, lx: number, ly: number, lz: number, out: Float32Array, footprint?: number) => void) | null;
     // toolkit: maps the paint's coverage to a per-gaussian opacity
     coverage?: ((alpha: number) => number) | null;
 };
@@ -744,8 +744,16 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
             const e1x = p[ib * 3] - ax, e1y = p[ib * 3 + 1] - ay, e1z = p[ib * 3 + 2] - az;
             const e2x = p[ic * 3] - ax, e2y = p[ic * 3 + 1] - ay, e2z = p[ic * 3 + 2] - az;
 
-            // texture detail level: how many texels one splat covers here
+            // texture detail level: how many texels one splat covers here,
+            // and the uv area it stands for (for the paint)
             let lod = 0;
+            let footprint = 0;
+            if (uvs) {
+                const du1 = uvs[ib * 2] - uvs[ia * 2], dv1 = uvs[ib * 2 + 1] - uvs[ia * 2 + 1];
+                const du2 = uvs[ic * 2] - uvs[ia * 2], dv2 = uvs[ic * 2 + 1] - uvs[ia * 2 + 1];
+                const area = 0.5 * Math.hypot(e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x);
+                if (area > 0) footprint = Math.abs(du1 * dv2 - du2 * dv1) * 0.5 / area * spacing * spacing;
+            }
             if (texture && uvs) {
                 const du1 = uvs[ib * 2] - uvs[ia * 2], dv1 = uvs[ib * 2 + 1] - uvs[ia * 2 + 1];
                 const du2 = uvs[ic * 2] - uvs[ia * 2], dv2 = uvs[ic * 2 + 1] - uvs[ia * 2 + 1];
@@ -809,7 +817,7 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                     const lx = local ? local[ia * 3] * w0 + local[ib * 3] * r1 + local[ic * 3] * r2 : 0;
                     const ly = local ? local[ia * 3 + 1] * w0 + local[ib * 3 + 1] * r1 + local[ic * 3 + 1] * r2 : 0;
                     const lz = local ? local[ia * 3 + 2] * w0 + local[ib * 3 + 2] * r1 + local[ic * 3 + 2] * r2 : 0;
-                    paint(u, v, lx, ly, lz, painted);
+                    paint(u, v, lx, ly, lz, painted, footprint);
                     r *= srgbToLinear(Math.max(0, painted[0]));
                     g *= srgbToLinear(Math.max(0, painted[1]));
                     b *= srgbToLinear(Math.max(0, painted[2]));

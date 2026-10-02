@@ -109,6 +109,49 @@ const paintAlphaUsesObjectSpace = (p: PaintState) => !!p.gradient && p.gradient.
 
 const frac = (x: number) => x - Math.floor(x);
 
+const toLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+const toDisplay = (c: number) => (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+
+// a picture's mip chain: each level the 2x2 average of the one before, in
+// linear light and premultiplied by alpha (so see-through pixels don't bleed)
+type MipLevel = { width: number, height: number, data: Float32Array };
+const mipChains = new WeakMap<PaintPixels, MipLevel[]>();
+const mipChainOf = (pixels: PaintPixels) => {
+    let chain = mipChains.get(pixels);
+    if (chain) return chain;
+    const { width, height, data } = pixels;
+    const base = new Float32Array(width * height * 4);
+    for (let i = 0; i < width * height; ++i) {
+        const a = data[i * 4 + 3] / 255;
+        for (let c = 0; c < 3; ++c) base[i * 4 + c] = toLinear(data[i * 4 + c] / 255) * a;
+        base[i * 4 + 3] = a;
+    }
+    chain = [{ width, height, data: base }];
+    let level = chain[0];
+    while (level.width > 1 || level.height > 1) {
+        const w = Math.max(1, level.width >> 1);
+        const h = Math.max(1, level.height >> 1);
+        const next = new Float32Array(w * h * 4);
+        for (let y = 0; y < h; ++y) {
+            for (let x = 0; x < w; ++x) {
+                for (let c = 0; c < 4; ++c) {
+                    let sum = 0;
+                    for (let dy = 0; dy < 2; ++dy) {
+                        for (let dx = 0; dx < 2; ++dx) {
+                            sum += level.data[(Math.min(level.height - 1, y * 2 + dy) * level.width + Math.min(level.width - 1, x * 2 + dx)) * 4 + c];
+                        }
+                    }
+                    next[(y * w + x) * 4 + c] = sum / 4;
+                }
+            }
+        }
+        level = { width: w, height: h, data: next };
+        chain.push(level);
+    }
+    mipChains.set(pixels, chain);
+    return chain;
+};
+
 /**
  * The paint as a function of a surface point: `uv` from the mesh, `local` the
  * point in the primitive's own (unscaled) space. Writes display-space rgb and
@@ -123,8 +166,41 @@ const createPaint = (p: PaintState, half: Rgb, pixels: PaintPixels | null) => {
     const t = p.texture && pixels ? p.texture : null;
     const m = t ? textureMatrix(t) : null;
     const wrap = t ? wrapModes.indexOf(t.wrap) : -1;
+    // texels per unit of the surface's uv area
+    const texelDensity = t ? pixels.width * pixels.height * Math.abs(m[0] * m[4] - m[1] * m[3]) : 0;
 
-    return (u: number, v: number, lx: number, ly: number, lz: number, out: Float32Array) => {
+    // texel index along one axis of a level, wrapping like the picture
+    const index = (i: number, n: number) => {
+        if (wrap === 0) return ((i % n) + n) % n;
+        if (wrap === 1) {
+            const k = ((i % (2 * n)) + 2 * n) % (2 * n);
+            return k < n ? k : 2 * n - 1 - k;
+        }
+        return Math.min(n - 1, Math.max(0, i));
+    };
+    const mipA = [0, 0, 0, 0];
+    const mipB = [0, 0, 0, 0];
+    const bilinear = (level: MipLevel, tu: number, tv: number, o4: number[]) => {
+        const x = tu * level.width - 0.5;
+        const y = tv * level.height - 0.5;
+        const x0 = Math.floor(x);
+        const y0 = Math.floor(y);
+        const fx = x - x0;
+        const fy = y - y0;
+        const ax = index(x0, level.width), bx = index(x0 + 1, level.width);
+        const ay = index(y0, level.height), by = index(y0 + 1, level.height);
+        const d = level.data;
+        const w = level.width;
+        for (let c = 0; c < 4; ++c) {
+            o4[c] = (d[(ay * w + ax) * 4 + c] * (1 - fx) + d[(ay * w + bx) * 4 + c] * fx) * (1 - fy) +
+                (d[(by * w + ax) * 4 + c] * (1 - fx) + d[(by * w + bx) * 4 + c] * fx) * fy;
+        }
+    };
+
+    // `footprint`: the uv area one sample stands for. Given, the picture is
+    // read as its average over that area (a mip level, trilinear), not as one
+    // pixel: clean at any splat density.
+    const paint = (u: number, v: number, lx: number, ly: number, lz: number, out: Float32Array, footprint = 0) => {
         let r = p.color[0], gg = p.color[1], b = p.color[2], a = p.opacity;
         if (g) {
             let k: number;
@@ -164,10 +240,36 @@ const createPaint = (p: PaintState, half: Rgb, pixels: PaintPixels | null) => {
                 wu = Math.min(1, Math.max(0, tu));
                 wv = Math.min(1, Math.max(0, tv));
             }
-            const x = Math.min(pixels.width - 1, Math.floor(wu * pixels.width));
-            const y = Math.min(pixels.height - 1, Math.floor(wv * pixels.height));
-            const o = (y * pixels.width + x) * 4;
-            const tr = pixels.data[o] / 255, tg = pixels.data[o + 1] / 255, tb = pixels.data[o + 2] / 255, ta = pixels.data[o + 3] / 255;
+            let tr: number, tg: number, tb: number, ta: number;
+            const lod = footprint > 0 ? 0.5 * Math.log2(footprint * texelDensity) : 0;
+            if (lod > 0.25) {
+                const chain = mipChainOf(pixels);
+                const l = Math.min(chain.length - 1, lod);
+                const l0 = Math.floor(l);
+                const l1 = Math.min(chain.length - 1, l0 + 1);
+                const k = l - l0;
+                // the unwrapped coordinates: the level's own wrapping applies
+                const cu = wrap === 0 || wrap === 1 ? tu : wu;
+                const cv = wrap === 0 || wrap === 1 ? tv : wv;
+                bilinear(chain[l0], cu, cv, mipA);
+                if (k > 0 && l1 !== l0) {
+                    bilinear(chain[l1], cu, cv, mipB);
+                    for (let c = 0; c < 4; ++c) mipA[c] += (mipB[c] - mipA[c]) * k;
+                }
+                ta = mipA[3];
+                const inv = ta > 1e-6 ? 1 / ta : 0;
+                tr = toDisplay(Math.min(1, mipA[0] * inv));
+                tg = toDisplay(Math.min(1, mipA[1] * inv));
+                tb = toDisplay(Math.min(1, mipA[2] * inv));
+            } else {
+                const x = Math.min(pixels.width - 1, Math.floor(wu * pixels.width));
+                const y = Math.min(pixels.height - 1, Math.floor(wv * pixels.height));
+                const o = (y * pixels.width + x) * 4;
+                tr = pixels.data[o] / 255;
+                tg = pixels.data[o + 1] / 255;
+                tb = pixels.data[o + 2] / 255;
+                ta = pixels.data[o + 3] / 255;
+            }
             if (wrap === 3) {
                 const inside = tu >= 0 && tu <= 1 && tv >= 0 && tv <= 1;
                 const kk = inside ? ta : 0;
@@ -183,6 +285,7 @@ const createPaint = (p: PaintState, half: Rgb, pixels: PaintPixels | null) => {
         out[2] = b;
         out[3] = a;
     };
+    return paint;
 };
 
 type PaintFunction = ReturnType<typeof createPaint>;
