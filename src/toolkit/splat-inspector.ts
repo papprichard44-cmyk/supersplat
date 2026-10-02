@@ -165,7 +165,9 @@ const init = (ctx: ToolkitContext) => {
             events.invoke('toolkit.inspector.hide', 'splat');
             return;
         }
-        events.invoke('toolkit.inspector.show', 'splat', { title: splat.name, kind: 'Splat layer', content });
+        events.invoke('toolkit.inspector.show', 'splat', { title: splat.name, kind: splat.background ? 'Sky' : 'Splat layer', content });
+        // the studio lights never reach a backdrop (edited in the Sky panel)
+        lightGroup.root.hidden = splat.background;
         updateInfo();
         updateTransform();
         updateLighting();
@@ -222,6 +224,9 @@ const init = (ctx: ToolkitContext) => {
             updateInfo();
             updateTransform();
         }
+    });
+    events.on('toolkit.sky.changed', (s: Splat) => {
+        if (s === splat) show();
     });
     events.on('splat.name', (s: Splat) => {
         if (s === splat) show();

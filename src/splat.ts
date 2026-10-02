@@ -47,6 +47,9 @@ class Splat extends Element {
     // toolkit: which studio lights reach this layer (bit per light, 0 = none),
     // set by the studio lighting module every frame
     studioMask = 0;
+    // toolkit: a backdrop (the sky dome) stays out of the scene bound, so
+    // framing and orbiting follow the scene, not the far-away dome
+    background = false;
     numDeleted = 0;
     numLocked = 0;
     numSelected = 0;

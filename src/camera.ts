@@ -728,8 +728,14 @@ class Camera extends Element {
             const far = Math.max(dist + boundRadius, 1e-2);
             const near = Math.max(dist - boundRadius, far / (1024 * 16));
 
-            this.far = far;
-            this.near = Math.min(1.0, near);
+            // toolkit: the far plane also reaches backdrops (a sky dome) that
+            // stay out of the scene bound; the near plane follows the scene
+            const view = this.scene.viewBound;
+            vec.sub2(view.center, cameraPosition);
+            const viewFar = Math.max(far, vec.length() + view.halfExtents.length());
+
+            this.far = viewFar;
+            this.near = Math.min(1.0, Math.max(near, viewFar / (1024 * 1024)));
         }
     }
 

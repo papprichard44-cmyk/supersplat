@@ -280,7 +280,8 @@ const init = (ctx: ToolkitContext) => {
 
     // ---- which lights reach which object
 
-    const splatLayers = () => scene.getElementsByType(ElementType.splat) as Splat[];
+    // backdrops (the sky) are never lit, aimed at or shadowed
+    const splatLayers = () => (scene.getElementsByType(ElementType.splat) as Splat[]).filter(sp => !sp.background);
     const targetKey = (element: MeshPrimitive | Splat) => (isPrimitive(element) ? `mesh:${element.name}` : `splat:${element.name}`);
     // the subject picked in the panel, if it is still in the scene and shown
     const subjectElement = (): MeshPrimitive | Splat | null => {

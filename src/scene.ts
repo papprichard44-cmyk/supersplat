@@ -88,6 +88,8 @@ class Scene {
     sceneState = [new SceneState(), new SceneState()];
     elements: Element[] = [];
     boundStorage = new BoundingBox();
+    // toolkit: everything including backdrops (see Splat.background)
+    viewBoundStorage = new BoundingBox();
     boundDirty = true;
     forceRender = false;
 
@@ -486,9 +488,20 @@ class Scene {
     get bound() {
         if (this.boundDirty) {
             let valid = false;
+            let viewValid = false;
             this.forEachElement((e) => {
                 const bound = e.worldBound;
                 if (bound) {
+                    if (!viewValid) {
+                        viewValid = true;
+                        this.viewBoundStorage.copy(bound);
+                    } else {
+                        this.viewBoundStorage.add(bound);
+                    }
+                    // toolkit: backdrops don't count for the scene's extent
+                    if ((e as { background?: boolean }).background) {
+                        return;
+                    }
                     if (!valid) {
                         valid = true;
                         this.boundStorage.copy(bound);
@@ -498,11 +511,24 @@ class Scene {
                 }
             });
 
+            // only backdrops: they are the scene
+            if (!valid && viewValid) {
+                this.boundStorage.copy(this.viewBoundStorage);
+            }
+
             this.boundDirty = false;
             this.events.fire('scene.boundChanged', this.boundStorage);
         }
 
         return this.boundStorage;
+    }
+
+    // toolkit: the bound of everything that is drawn, backdrops included. the
+    // clipping planes must reach it, while framing uses `bound`
+    get viewBound() {
+        // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+        this.bound;
+        return this.viewBoundStorage;
     }
 
     getElementsByType(elementType: ElementType) {

@@ -196,8 +196,10 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
                 // near-plane culling cannot differ across a face boundary
                 const boundRadius = scene.bound.halfExtents.length();
                 const dist = new Vec3().sub2(scene.bound.center, camPos).length();
-                const far = dist + boundRadius;
-                const near = Math.max(1e-6, dist < boundRadius ? far / (1024 * 16) : dist - boundRadius);
+                const sceneFar = dist + boundRadius;
+                const near = Math.max(1e-6, dist < boundRadius ? sceneFar / (1024 * 16) : dist - boundRadius);
+                // toolkit: the far plane also reaches backdrops (the sky dome)
+                const far = Math.max(sceneFar, new Vec3().sub2(scene.viewBound.center, camPos).length() + scene.viewBound.halfExtents.length());
 
                 const splats = (scene.getElementsByType(ElementType.splat) as Splat[]).filter(splat => splat.visible);
                 const qWorld = new Quat();
@@ -581,8 +583,10 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
                     // near-plane culling cannot differ across a face boundary
                     const boundRadius = scene.bound.halfExtents.length();
                     const dist = vec.sub2(scene.bound.center, camPos).length();
-                    const far = dist + boundRadius;
-                    const near = Math.max(1e-6, dist < boundRadius ? far / (1024 * 16) : dist - boundRadius);
+                    const sceneFar = dist + boundRadius;
+                    const near = Math.max(1e-6, dist < boundRadius ? sceneFar / (1024 * 16) : dist - boundRadius);
+                    // toolkit: the far plane also reaches backdrops (the sky dome)
+                    const far = Math.max(sceneFar, vec.sub2(scene.viewBound.center, camPos).length() + scene.viewBound.halfExtents.length());
 
                     const splats = (scene.getElementsByType(ElementType.splat) as Splat[]).filter(splat => splat.visible);
 
