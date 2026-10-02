@@ -2,13 +2,14 @@ import type { Container } from '@playcanvas/pcui';
 
 import type { Events } from '../events';
 import type { Scene } from '../scene';
-import type { ToolManager } from '../tools/tool-manager';
-import type { Tooltips } from '../ui/tooltips';
 import { exportCompareModule } from './export-compare';
 import { generatedLayersModule } from './generated-layers';
 import { generatorsModule } from './generators';
+import { studioModule } from './lighting/studio';
 import { meshPrimitivesModule } from './mesh-primitives';
 import { stampBrushModule } from './stamp-brush';
+import type { ToolManager } from '../tools/tool-manager';
+import type { Tooltips } from '../ui/tooltips';
 
 // Everything the toolkit adds on top of upstream SuperSplat lives in this
 // directory. Upstream files only gain the hooks that call into it (main.ts,
@@ -36,6 +37,7 @@ interface ToolkitModule {
 
 const modules: ToolkitModule[] = [
     meshPrimitivesModule,
+    studioModule,
     generatorsModule,
     generatedLayersModule,
     exportCompareModule,

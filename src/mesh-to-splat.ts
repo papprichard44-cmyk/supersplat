@@ -9,6 +9,8 @@
  * load it like any other file.
  */
 
+import { SampleBuffer, unlitColors, writeSplatPly } from './toolkit/lighting/samples';
+
 // glTF component types
 const BYTE = 5120;
 const UNSIGNED_BYTE = 5121;
@@ -31,9 +33,6 @@ const unsupportedExtensions = ['KHR_draco_mesh_compression', 'EXT_meshopt_compre
 // largest texture side kept in memory for colour lookups
 const MAX_TEXTURE_SIZE = 2048;
 
-// zeroth order spherical harmonic constant
-const SH_C0 = 0.28209479177387814;
-
 type Texture = {
     width: number;
     height: number;
@@ -50,12 +49,19 @@ type Material = {
     texture: Texture | null;
     alphaMode: 'OPAQUE' | 'MASK' | 'BLEND';
     alphaCutoff: number;
+    roughness: number;
+    metalness: number;
+    // metallic-roughness texture: roughness in G, metalness in B (linear)
+    mrTexture: Texture | null;
+    doubleSided: boolean;
 };
 
 // one primitive's triangles, with positions already in world space
 type Batch = {
     positions: Float32Array;        // xyz per vertex
-    uvs: Float32Array | null;       // uv per vertex (the material's texCoord set)
+    normals: Float32Array | null;   // unit shading normal per vertex, world space
+    uvs: Float32Array | null;       // uv per vertex (the base colour texture's texCoord set)
+    mrUvs: Float32Array | null;     // uv per vertex for the metallic-roughness texture
     colors: Float32Array | null;    // linear rgba per vertex
     indices: Uint32Array;           // 3 per triangle
     material: Material;
@@ -68,7 +74,6 @@ type MeshData = {
 };
 
 const srgbToLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
-const linearToSrgb = (c: number) => (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
 
 // lookup table from 8-bit sRGB to linear
 const srgbTable = new Float32Array(256);
@@ -344,11 +349,20 @@ class GlbReader {
                 const specGloss = material.extensions?.KHR_materials_pbrSpecularGlossiness;
                 const baseColor = specGloss?.diffuseFactor ?? pbr.baseColorFactor ?? [1, 1, 1, 1];
                 const textureInfo = specGloss?.diffuseTexture ?? pbr.baseColorTexture;
+                const mrTexture = specGloss ? null : await this.loadTexture(pbr.metallicRoughnessTexture);
+                // glTF defaults: metallic 1, roughness 1. a primitive without any
+                // material gets a plain dielectric, as the engine's default material
+                const metalness = specGloss || index === undefined ? 0 : (pbr.metallicFactor ?? 1);
+                const roughness = specGloss ? 1 - (specGloss.glossinessFactor ?? 1) : (pbr.roughnessFactor ?? 1);
                 return {
                     baseColor: [baseColor[0], baseColor[1], baseColor[2], baseColor[3]],
                     texture: await this.loadTexture(textureInfo),
                     alphaMode: material.alphaMode ?? 'OPAQUE',
-                    alphaCutoff: material.alphaCutoff ?? 0.5
+                    alphaCutoff: material.alphaCutoff ?? 0.5,
+                    roughness,
+                    metalness,
+                    mrTexture,
+                    doubleSided: !!material.doubleSided
                 };
             })());
         }
@@ -412,10 +426,34 @@ class GlbReader {
 
         const material = await this.loadMaterial(primitive.material);
 
-        let uvs: Float32Array = null;
-        const uvAttribute = material.texture ? attributes[`TEXCOORD_${material.texture.texCoord}`] : undefined;
-        if (uvAttribute !== undefined) {
-            uvs = this.readAccessor(uvAttribute).data;
+        const readUvs = (texture: Texture | null) => {
+            const attribute = texture ? attributes[`TEXCOORD_${texture.texCoord}`] : undefined;
+            return attribute !== undefined ? this.readAccessor(attribute).data : null;
+        };
+        const uvs = readUvs(material.texture);
+        const mrUvs = material.mrTexture?.texCoord === material.texture?.texCoord && uvs ? uvs : readUvs(material.mrTexture);
+
+        // normals go through the inverse transpose of the node's matrix
+        let normals: Float32Array = null;
+        if (attributes.NORMAL !== undefined) {
+            const normal = this.readAccessor(attributes.NORMAL);
+            const m = world;
+            // cofactor matrix = inverse transpose up to scale, which normalising removes
+            const c00 = m[5] * m[10] - m[6] * m[9], c01 = m[6] * m[8] - m[4] * m[10], c02 = m[4] * m[9] - m[5] * m[8];
+            const c10 = m[2] * m[9] - m[1] * m[10], c11 = m[0] * m[10] - m[2] * m[8], c12 = m[1] * m[8] - m[0] * m[9];
+            const c20 = m[1] * m[6] - m[2] * m[5], c21 = m[2] * m[4] - m[0] * m[6], c22 = m[0] * m[5] - m[1] * m[4];
+            normals = new Float32Array(normal.count * 3);
+            const n = normal.data;
+            for (let i = 0; i < normal.count; ++i) {
+                const x = n[i * 3], y = n[i * 3 + 1], z = n[i * 3 + 2];
+                const wx = c00 * x + c10 * y + c20 * z;
+                const wy = c01 * x + c11 * y + c21 * z;
+                const wz = c02 * x + c12 * y + c22 * z;
+                const l = Math.sqrt(wx * wx + wy * wy + wz * wz) || 1;
+                normals[i * 3] = wx / l;
+                normals[i * 3 + 1] = wy / l;
+                normals[i * 3 + 2] = wz / l;
+            }
         }
 
         let colors: Float32Array = null;
@@ -430,7 +468,7 @@ class GlbReader {
             }
         }
 
-        return { positions, uvs, colors, indices, material };
+        return { positions, normals, uvs, mrUvs, colors, indices, material };
     }
 
     async read(): Promise<MeshData> {
@@ -488,8 +526,9 @@ const wrap = (v: number, mode: number) => {
     return f;
 };
 
-// nearest-neighbour texture lookup, returning linear rgb and alpha into `out`
-const sampleTexture = (texture: Texture, u: number, v: number, out: Float32Array) => {
+// nearest-neighbour texture lookup, returning linear rgb and alpha into `out`.
+// colour textures are decoded from sRGB, data textures (`raw`) are not
+const sampleTexture = (texture: Texture, u: number, v: number, out: Float32Array, raw = false) => {
     if (texture.uvTransform) {
         const m = texture.uvTransform;
         const tu = m[0] * u + m[1] * v + m[2];
@@ -500,9 +539,15 @@ const sampleTexture = (texture: Texture, u: number, v: number, out: Float32Array
     const x = Math.min(texture.width - 1, Math.floor(wrap(u, texture.wrapS) * texture.width));
     const y = Math.min(texture.height - 1, Math.floor(wrap(v, texture.wrapT) * texture.height));
     const i = (y * texture.width + x) * 4;
-    out[0] = srgbTable[texture.data[i]];
-    out[1] = srgbTable[texture.data[i + 1]];
-    out[2] = srgbTable[texture.data[i + 2]];
+    if (raw) {
+        out[0] = texture.data[i] / 255;
+        out[1] = texture.data[i + 1] / 255;
+        out[2] = texture.data[i + 2] / 255;
+    } else {
+        out[0] = srgbTable[texture.data[i]];
+        out[1] = srgbTable[texture.data[i + 1]];
+        out[2] = srgbTable[texture.data[i + 2]];
+    }
     out[3] = texture.data[i + 3] / 255;
 };
 
@@ -516,38 +561,38 @@ const readGlb = (arrayBuffer: ArrayBuffer): Promise<MeshData> => {
     return new GlbReader(arrayBuffer).read();
 };
 
-// gaussian properties in the order written to the PLY
-const plyProperties = [
-    'x', 'y', 'z',
-    'f_dc_0', 'f_dc_1', 'f_dc_2',
-    'opacity',
-    'scale_0', 'scale_1', 'scale_2',
-    'rot_0', 'rot_1', 'rot_2', 'rot_3'
-];
+type SampleOptions = {
+    // linear rgb multiplied into the base colour
+    tint?: [number, number, number];
+    // replaces the materials' own roughness / metalness
+    surface?: { roughness: number, metalness: number } | null;
+    // overrides the materials' double-sidedness
+    twoSided?: boolean;
+};
 
 /**
- * Sample the surface of a mesh into gaussian splats and encode them as a 3DGS
- * PLY file.
+ * Sample the surface of a mesh uniformly by area into flat gaussian discs.
  *
- * glTF is Y-up while the editor labels PLY data as rotated 180 degrees about Z,
- * so samples are written with x and y negated to appear upright once loaded.
- *
- * @param mesh - The mesh to sample.
- * @param targetCount - The approximate number of splats to generate.
- * @returns The PLY file and the number of splats it holds.
+ * @param mesh - The mesh to sample, in world space.
+ * @param targetCount - The approximate number of samples to take.
+ * @param out - Receives the samples.
+ * @param options - Colour and material overrides.
+ * @returns The number of samples added.
  */
-const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, count: number } => {
+const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffer, options: SampleOptions = {}) => {
     const { batches, surfaceArea } = mesh;
-    if (!(surfaceArea > 0)) {
-        throw new Error('The mesh has no surface to convert');
+    if (!(surfaceArea > 0) || targetCount <= 0) {
+        return 0;
     }
 
+    const start = out.count;
     const density = targetCount / surfaceArea;
     const spacing = Math.sqrt(surfaceArea / targetCount);
     // in-plane extent: wide enough that neighbouring discs overlap into a
     // closed surface. the normal axis is kept thin so the discs stay flat.
-    const logScaleT = Math.log(spacing * 0.85);
-    const logScaleN = Math.log(spacing * 0.05);
+    const scaleT = spacing * 0.85;
+    const scaleN = spacing * 0.05;
+    const [tr, tg, tb] = options.tint ?? [1, 1, 1];
 
     // first pass: decide how many samples each triangle receives. the fractional
     // part of each triangle's expected count is carried over to the next one
@@ -556,7 +601,6 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
     // density even where random rounding left thin patches and clumps.
     let carry = 0.5;
     const counts = batches.map(b => new Uint32Array(b.indices.length / 3));
-    let total = 0;
     batches.forEach((batch, bi) => {
         const { positions, indices } = batch;
         const batchCounts = counts[bi];
@@ -566,20 +610,19 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
             const n = Math.floor(carry);
             carry -= n;
             batchCounts[t] = n;
-            total += n;
         }
     });
 
-    const numProps = plyProperties.length;
-    const data = new Float32Array(total * numProps);
     const texel = new Float32Array(4);
-    let count = 0;
+    const surface = { roughness: 1, metalness: 0, twoSided: false };
 
     batches.forEach((batch, bi) => {
-        const { positions: p, uvs, colors, indices, material } = batch;
+        const { positions: p, normals: vn, uvs, mrUvs, colors, indices, material } = batch;
         const batchCounts = counts[bi];
         const [fr, fg, fb, fa] = material.baseColor;
         const texture = uvs ? material.texture : null;
+        const mrTexture = mrUvs && !options.surface ? material.mrTexture : null;
+        surface.twoSided = options.twoSided ?? material.doubleSided;
 
         for (let t = 0; t < batchCounts.length; ++t) {
             const n = batchCounts[t];
@@ -619,7 +662,7 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
                 const w0 = 1 - r1 - r2;
 
                 // base colour (linear) and alpha
-                let r = fr, g = fg, b = fb, a = fa;
+                let r = fr * tr, g = fg * tg, b = fb * tb, a = fa;
                 if (colors) {
                     r *= colors[ia * 4] * w0 + colors[ib * 4] * r1 + colors[ic * 4] * r2;
                     g *= colors[ia * 4 + 1] * w0 + colors[ib * 4 + 1] * r1 + colors[ic * 4 + 1] * r2;
@@ -645,13 +688,43 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
                     continue;
                 }
 
+                // surface response
+                if (options.surface) {
+                    surface.roughness = options.surface.roughness;
+                    surface.metalness = options.surface.metalness;
+                } else {
+                    surface.roughness = material.roughness;
+                    surface.metalness = material.metalness;
+                    if (mrTexture) {
+                        const u = mrUvs[ia * 2] * w0 + mrUvs[ib * 2] * r1 + mrUvs[ic * 2] * r2;
+                        const v = mrUvs[ia * 2 + 1] * w0 + mrUvs[ib * 2 + 1] * r1 + mrUvs[ic * 2 + 1] * r2;
+                        sampleTexture(mrTexture, u, v, texel, true);
+                        surface.roughness *= texel[1];
+                        surface.metalness *= texel[2];
+                    }
+                }
+
+                // shading normal: interpolated vertex normal, or the face normal
+                let sx = nx, sy = ny, sz = nz;
+                if (vn) {
+                    sx = vn[ia * 3] * w0 + vn[ib * 3] * r1 + vn[ic * 3] * r2;
+                    sy = vn[ia * 3 + 1] * w0 + vn[ib * 3 + 1] * r1 + vn[ic * 3 + 1] * r2;
+                    sz = vn[ia * 3 + 2] * w0 + vn[ib * 3 + 2] * r1 + vn[ic * 3 + 2] * r2;
+                    const sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
+                    if (sl > 1e-8) {
+                        sx /= sl; sy /= sl; sz /= sl;
+                    } else {
+                        sx = nx; sy = ny; sz = nz;
+                    }
+                }
+
                 // random spin about the normal so the discs don't line up in streaks
                 const angle = Math.random() * Math.PI * 2;
                 const ca = Math.cos(angle), sa = Math.sin(angle);
-                // rotation columns in PLY space (x and y negated): tangent, bitangent, normal
-                const m00 = -(tx * ca + bx * sa), m10 = -(ty * ca + by * sa), m20 = tz * ca + bz * sa;
-                const m01 = -(bx * ca - tx * sa), m11 = -(by * ca - ty * sa), m21 = bz * ca - tz * sa;
-                const m02 = -nx, m12 = -ny, m22 = nz;
+                // rotation columns: tangent, bitangent, normal
+                const m00 = tx * ca + bx * sa, m10 = ty * ca + by * sa, m20 = tz * ca + bz * sa;
+                const m01 = bx * ca - tx * sa, m11 = by * ca - ty * sa, m21 = bz * ca - tz * sa;
+                const m02 = nx, m12 = ny, m22 = nz;
 
                 // rotation matrix to quaternion
                 let qw, qx, qy, qz;
@@ -682,47 +755,42 @@ const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, coun
                     qz = 0.25 * k;
                 }
 
-                const opacity = Math.min(0.999, Math.max(0.001, a));
-                const o = count * numProps;
-                data[o] = -(ax + e1x * r1 + e2x * r2);
-                data[o + 1] = -(ay + e1y * r1 + e2y * r2);
-                data[o + 2] = az + e1z * r1 + e2z * r2;
-                data[o + 3] = (linearToSrgb(Math.min(1, Math.max(0, r))) - 0.5) / SH_C0;
-                data[o + 4] = (linearToSrgb(Math.min(1, Math.max(0, g))) - 0.5) / SH_C0;
-                data[o + 5] = (linearToSrgb(Math.min(1, Math.max(0, b))) - 0.5) / SH_C0;
-                data[o + 6] = Math.log(opacity / (1 - opacity));
-                data[o + 7] = logScaleT;
-                data[o + 8] = logScaleT;
-                data[o + 9] = logScaleN;
-                data[o + 10] = qw;
-                data[o + 11] = qx;
-                data[o + 12] = qy;
-                data[o + 13] = qz;
-                count++;
+                out.add(
+                    ax + e1x * r1 + e2x * r2, ay + e1y * r1 + e2y * r2, az + e1z * r1 + e2z * r2,
+                    qw, qx, qy, qz,
+                    scaleT, scaleT, scaleN,
+                    Math.max(0, r), Math.max(0, g), Math.max(0, b), a,
+                    sx, sy, sz,
+                    surface
+                );
             }
         }
     });
 
-    if (count === 0) {
+    return out.count - start;
+};
+
+/**
+ * Sample the surface of a mesh into gaussian splats and encode them, unlit, as
+ * a 3DGS PLY file.
+ *
+ * @param mesh - The mesh to sample.
+ * @param targetCount - The approximate number of splats to generate.
+ * @returns The PLY file and the number of splats it holds.
+ */
+const meshToSplatPly = (mesh: MeshData, targetCount: number): { blob: Blob, count: number } => {
+    if (!(mesh.surfaceArea > 0)) {
+        throw new Error('The mesh has no surface to convert');
+    }
+    const samples = new SampleBuffer();
+    sampleMeshSurface(mesh, targetCount, samples);
+    if (samples.count === 0) {
         throw new Error('The mesh produced no splats (is it fully transparent?)');
     }
-
-    const header = [
-        'ply',
-        'format binary_little_endian 1.0',
-        'comment Generated by SuperSplat from a GLB mesh',
-        `element vertex ${count}`,
-        ...plyProperties.map(name => `property float ${name}`),
-        'end_header',
-        ''
-    ].join('\n');
-
-    // the editor runs on little-endian platforms, so the float array is written as-is
-    const body = data.subarray(0, count * numProps);
     return {
-        blob: new Blob([header, body], { type: 'application/ply' }),
-        count
+        blob: writeSplatPly(samples, unlitColors(samples)),
+        count: samples.count
     };
 };
 
-export { readGlb, meshToSplatPly, type MeshData };
+export { readGlb, meshToSplatPly, sampleMeshSurface, triangleArea, type Batch, type Material, type MeshData, type SampleOptions };

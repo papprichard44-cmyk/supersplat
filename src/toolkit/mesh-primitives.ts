@@ -1,18 +1,18 @@
-import { Button, ColorPicker, Container, Label, SliderInput, VectorInput } from '@playcanvas/pcui';
-import { OrientedBox, Quat, Ray, Vec3 } from 'playcanvas';
+import { Button, ColorPicker, Container, Label, SelectInput, SliderInput, VectorInput } from '@playcanvas/pcui';
+import { OrientedBox, Ray, Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
-import { Splat } from '../splat';
+import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
+import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
+import { cellForDensity } from './primitive-to-splat';
+import { ShapeKind } from './shapes';
+import { readGlb } from '../mesh-to-splat';
 import { ShapeGizmoMode, ShapeTransformGizmo } from '../tools/shape-transform-gizmo';
 import deleteSvg from '../ui/svg/delete.svg';
 import hiddenSvg from '../ui/svg/hidden.svg';
 import shownSvg from '../ui/svg/shown.svg';
+
 import type { ToolkitContext, ToolkitModule } from './index';
-import { MeshPrimitive, PrimitiveData, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
-import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
-import { primitiveToSplat } from './primitive-to-splat';
-import { modelToSplat } from './model-to-splat';
-import { readGlb } from '../mesh-to-splat';
 
 const TOOL = 'toolkitPrimitive';
 
@@ -24,7 +24,12 @@ const tips = {
     addModel: 'Add a 3D model (.glb) as a mesh. Place and size it like any primitive, then turn it into splats with "To splat". You can also drop a .glb onto the viewport.',
     cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
     density: 'How many splats are generated along the longest side when converting. Higher = sharper picture and edges, but more splats and a bigger file.',
-    convert: 'Turn the selected primitive into a real gaussian splat layer (it then exports to PLY / SOG / SPZ and can be edited like any splat). The primitive itself is hidden, not deleted.',
+    convert: 'Turn the selected primitive into a real gaussian splat layer (it then exports to PLY / SOG / SPZ and can be edited like any splat). With studio lights in the scene, their light is baked in. The primitive itself is hidden, not deleted.',
+    addShape: (label: string) => `Add a ${label.toLowerCase()} at the camera focus. Curved shapes show light and highlights best; light them in the Studio lighting panel.`,
+    addBackdrop: 'Add a photo backdrop (cyclorama): a floor that sweeps up into a wall without a corner, as used in photo studios. Put your subject on it.',
+    surface: 'How the surface reacts to the studio lights: matte, satin or glossy, or metallic. Glossy and metal surfaces show highlights and reflections.',
+    shine: 'Glossiness: 0 = completely matte, 1 = mirror-smooth. Higher values give smaller, brighter highlights.',
+    metal: 'Metalness: 0 = paint, plastic, wood, stone; 1 = bare metal, which reflects in its own colour.',
     row: 'Click to select this primitive and show its transform gizmo (you can also click it in the viewport). Click again to deselect.',
     visible: 'Show or hide this primitive.',
     remove: 'Delete this primitive (undo brings it back).',
@@ -79,6 +84,15 @@ const init = (ctx: ToolkitContext) => {
 
     const addModel = new Button({ text: '+ GLB', class: 'toolkit-button' });
     addRow.append(addModel);
+
+    const shapeRow = new Container({ class: 'toolkit-row' });
+    const shapeButtons: [ShapeKind, string, Button][] = ([
+        ['sphere', 'Sphere'], ['cylinder', 'Cylinder'], ['cone', 'Cone'], ['torus', 'Torus'], ['backdrop', 'Backdrop']
+    ] as [ShapeKind, string][]).map(([kind, label]) => {
+        const button = new Button({ text: `+ ${label}`, class: 'toolkit-button' });
+        shapeRow.append(button);
+        return [kind, label, button];
+    });
 
     const modelInput = document.createElement('input');
     modelInput.type = 'file';
@@ -137,6 +151,51 @@ const init = (ctx: ToolkitContext) => {
     cutoffRow.append(cutoff);
     editor.append(cutoffRow);
 
+    // surface response to the studio lights
+    const surfacePresets: Record<string, [number, number] | null> = {
+        model: null,
+        matte: [0.9, 0],
+        satin: [0.55, 0],
+        glossy: [0.25, 0],
+        lacquer: [0.08, 0],
+        metal: [0.35, 1],
+        chrome: [0.06, 1]
+    };
+    const surfaceRow = new Container({ class: 'toolkit-row' });
+    const surfaceLabel = new Label({ text: 'Surface', class: 'toolkit-label' });
+    const surfaceSelect = new SelectInput({
+        class: 'toolkit-select',
+        type: 'string',
+        options: [
+            { v: 'model', t: 'From the model' },
+            { v: 'matte', t: 'Matte' },
+            { v: 'satin', t: 'Satin' },
+            { v: 'glossy', t: 'Glossy' },
+            { v: 'lacquer', t: 'Lacquer (very glossy)' },
+            { v: 'metal', t: 'Brushed metal' },
+            { v: 'chrome', t: 'Chrome' },
+            { v: 'custom', t: 'Custom' }
+        ],
+        value: 'satin'
+    });
+    surfaceRow.append(surfaceLabel);
+    surfaceRow.append(surfaceSelect);
+    editor.append(surfaceRow);
+
+    const shineRow = new Container({ class: 'toolkit-row' });
+    const shineLabel = new Label({ text: 'Shine', class: 'toolkit-label' });
+    const shine = new SliderInput({ class: 'toolkit-slider', min: 0, max: 1, precision: 2, step: 0.01, value: 1 - DEFAULT_ROUGHNESS });
+    shineRow.append(shineLabel);
+    shineRow.append(shine);
+    editor.append(shineRow);
+
+    const metalRow = new Container({ class: 'toolkit-row' });
+    const metalLabel = new Label({ text: 'Metal', class: 'toolkit-label' });
+    const metal = new SliderInput({ class: 'toolkit-slider', min: 0, max: 1, precision: 2, step: 0.01, value: DEFAULT_METALNESS });
+    metalRow.append(metalLabel);
+    metalRow.append(metal);
+    editor.append(metalRow);
+
     const convertRow = new Container({ class: 'toolkit-row' });
     const densityLabel = new Label({ text: 'Density', class: 'toolkit-label' });
     const density = new SliderInput({ class: 'toolkit-slider', min: 16, max: 1024, precision: 0, step: 1, value: 200 });
@@ -148,6 +207,7 @@ const init = (ctx: ToolkitContext) => {
 
     panel.append(header);
     panel.append(addRow);
+    panel.append(shapeRow);
     panel.append(list);
     panel.append(editor);
     canvasContainer.append(panel);
@@ -157,6 +217,13 @@ const init = (ctx: ToolkitContext) => {
     tooltips.register(addBox, tips.addBox, 'top');
     tooltips.register(addImage, tips.addImage, 'top');
     tooltips.register(addModel, tips.addModel, 'top');
+    shapeButtons.forEach(([kind, label, button]) => tooltips.register(button, kind === 'backdrop' ? tips.addBackdrop : tips.addShape(label), 'top'));
+    tooltips.register(surfaceLabel, tips.surface, 'right');
+    tooltips.register(surfaceSelect, tips.surface, 'bottom');
+    tooltips.register(shineLabel, tips.shine, 'right');
+    tooltips.register(shine, tips.shine, 'bottom');
+    tooltips.register(metalLabel, tips.metal, 'right');
+    tooltips.register(metal, tips.metal, 'bottom');
     tooltips.register(cutoffLabel, tips.cutoff, 'right');
     tooltips.register(cutoff, tips.cutoff, 'bottom');
     tooltips.register(densityLabel, tips.density, 'right');
@@ -201,6 +268,17 @@ const init = (ctx: ToolkitContext) => {
         colorPicker.value = state.color;
         cutoffRow.hidden = selected.kind !== 'image';
         cutoff.value = state.alphaCutoff ?? 0.5;
+        const isModel = selected.kind === 'model';
+        const fromModel = isModel && state.roughness === undefined;
+        const r = state.roughness ?? DEFAULT_ROUGHNESS;
+        const m = state.metalness ?? DEFAULT_METALNESS;
+        const match = Object.entries(surfacePresets).find(([, v]) => v && Math.abs(v[0] - r) < 1e-3 && Math.abs(v[1] - m) < 1e-3);
+        surfaceSelect.options = surfaceSelect.options.filter(o => o.v !== 'model').concat(isModel ? [{ v: 'model', t: 'From the model' }] : []);
+        surfaceSelect.value = fromModel ? 'model' : (match ? match[0] : 'custom');
+        shineRow.hidden = fromModel;
+        metalRow.hidden = fromModel;
+        shine.value = 1 - r;
+        metal.value = m;
         uiUpdating = false;
     };
 
@@ -316,6 +394,7 @@ const init = (ctx: ToolkitContext) => {
         }
         refreshList();
         updateEditor();
+        events.fire('toolkit.primitive.selected', selected);
         scene.forceRender = true;
     };
 
@@ -331,6 +410,7 @@ const init = (ctx: ToolkitContext) => {
             selected = null;
             refreshList();
             updateEditor();
+            events.fire('toolkit.primitive.selected', null);
             scene.forceRender = true;
         },
         setTransformMode: (mode) => {
@@ -364,52 +444,41 @@ const init = (ctx: ToolkitContext) => {
         if (!uiUpdating && selected) edit(selected, { alphaCutoff: value });
     });
 
+    surfaceSelect.on('change', (value: string) => {
+        if (uiUpdating || !selected) return;
+        if (value === 'model') {
+            const state = selected.getState();
+            delete state.roughness;
+            delete state.metalness;
+            flushPending();
+            events.fire('edit.add', new PrimitiveStateOp(selected, selected.getState(), state));
+            return;
+        }
+        const preset = surfacePresets[value];
+        if (preset) {
+            edit(selected, { roughness: preset[0], metalness: preset[1] });
+            updateEditor();
+        }
+    });
+    shine.on('change', (value: number) => {
+        if (!uiUpdating && selected) edit(selected, { roughness: 1 - value, metalness: selected.metalness ?? 0 });
+    });
+    metal.on('change', (value: number) => {
+        if (!uiUpdating && selected) edit(selected, { metalness: value, roughness: selected.roughness ?? DEFAULT_ROUGHNESS });
+    });
+
     // ---- conversion to a gaussian splat layer
 
+    // the conversion itself (sampling, studio lighting, import, hiding the
+    // primitive) lives in the studio lighting module
     const convertToSplat = async (primitive: MeshPrimitive, splatsAlongLongestSide: number) => {
         flushPending();
-        const isModel = primitive.kind === 'model';
-        let ply: Blob;
-        let count: number;
-        if (isModel) {
-            ({ blob: ply, count } = await modelToSplat(primitive, splatsAlongLongestSide));
-        } else {
-            const gaussians = await primitiveToSplat(primitive, splatsAlongLongestSide);
-            count = gaussians.count;
-            ply = new Blob([gaussians.toPly()]);
-        }
-        if (count === 0) {
-            return 0;
-        }
-        const filename = `${primitive.name.replace(/[^\w\- ]+/g, '_')}.ply`;
-
-        // primitive gaussians are generated in world space: reset whatever
-        // transform the importer gives a new layer so they land exactly on the
-        // primitive. (model gaussians are written in the importer's own
-        // convention, so that layer keeps its default transform)
-        let created: Element | null = null;
-        const onAdded = (element: Element) => {
-            if (element.type === ElementType.splat) {
-                created = element;
-            }
-        };
-        const handle = events.on('scene.elementAdded', onAdded);
-        try {
-            await events.invoke('import', [{ filename, contents: new File([ply], filename) }]);
-        } finally {
-            handle.off();
-        }
-        if (created) {
-            (created as Splat).noSizeCull = true;
-            scene.forceRender = true;
-        }
-        if (!isModel) {
-            (created as Element | null)?.move(new Vec3(0, 0, 0), new Quat(), new Vec3(1, 1, 1));
-        }
-
-        const oldState = primitive.getState();
-        events.fire('edit.add', new PrimitiveStateOp(primitive, oldState, { ...oldState, visible: false }));
-        return count;
+        // the lights stay on while other meshes still need them
+        const othersVisible = primitives().some(p => p !== primitive && p.entity.enabled);
+        return await events.invoke('toolkit.convertPrimitives', [primitive], {
+            cell: cellForDensity(primitive, splatsAlongLongestSide),
+            hideLights: othersVisible ? false : undefined
+        }) as number;
     };
 
     events.function('toolkit.primitiveToSplat', convertToSplat);
@@ -447,6 +516,32 @@ const init = (ctx: ToolkitContext) => {
         selectOnAdd = primitive;
         events.fire('edit.add', new AddPrimitiveOp(scene, primitive));
     };
+
+    // curved shapes stand on the floor of the scene at the camera focus
+    const createShape = (kind: ShapeKind, label: string) => {
+        flushPending();
+        const hasSplat = scene.getElementsByType(ElementType.splat).length > 0;
+        const extent = hasSplat ? scene.bound.halfExtents.length() : 1;
+        const s = Math.max(0.01, extent * 0.5);
+        const focus = scene.camera.focalPoint;
+        const scale: [number, number, number] = kind === 'backdrop' ? [s * 4, s * 2.5, s * 3] : [s, s, s];
+        const primitive = new MeshPrimitive({
+            kind,
+            name: `${label} ${++counter}`,
+            position: [focus.x, focus.y, focus.z],
+            rotation: [0, 0, 0],
+            scale,
+            color: kind === 'backdrop' ? [0.85, 0.85, 0.85] : [0.8, 0.8, 0.8],
+            visible: true,
+            alphaCutoff: 0.5,
+            roughness: kind === 'backdrop' ? 0.95 : DEFAULT_ROUGHNESS,
+            metalness: 0
+        });
+        selectOnAdd = primitive;
+        events.fire('edit.add', new AddPrimitiveOp(scene, primitive));
+    };
+
+    shapeButtons.forEach(([kind, label, button]) => button.on('click', () => createShape(kind, label)));
 
     addPlane.on('click', () => create('plane', 'Plane', false));
     addWall.on('click', () => create('plane', 'Wall', true));
@@ -550,7 +645,9 @@ const init = (ctx: ToolkitContext) => {
     const pickTools: (string | null)[] = [null, TOOL, 'move', 'rotate', 'scale'];
     let down: { x: number, y: number } | null = null;
 
+    let pickDistance = Infinity;
     const pick = (x: number, y: number) => {
+        pickDistance = Infinity;
         scene.camera.getRay(x, y, pickRay);
         let best: MeshPrimitive | null = null;
         let bestDistance = Infinity;
@@ -565,8 +662,14 @@ const init = (ctx: ToolkitContext) => {
                 }
             }
         });
+        pickDistance = bestDistance;
         return best as MeshPrimitive | null;
     };
+
+    events.function('toolkit.primitivePickDistance', (x: number, y: number) => {
+        pick(x, y);
+        return pickDistance;
+    });
 
     scene.canvas.addEventListener('pointerdown', (event: PointerEvent) => {
         down = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
@@ -578,7 +681,9 @@ const init = (ctx: ToolkitContext) => {
         if (!start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
         if (!pickTools.includes(toolManager.active)) return;
         const hit = pick(event.offsetX, event.offsetY);
-        if (hit && hit !== selected) {
+        // a studio light in front of the primitive takes the click
+        const lightDistance: number = events.invoke('toolkit.lightPickDistance', event.offsetX, event.offsetY) ?? Infinity;
+        if (hit && hit !== selected && pickDistance < lightDistance) {
             select(hit);
         }
     }, true);

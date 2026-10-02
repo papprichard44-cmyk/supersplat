@@ -21,6 +21,8 @@ import {
 import { Element, ElementType } from '../element';
 import { Serializer } from '../serializer';
 import { AlphaGrid, buildExtrudeGeometry, makeAlphaGrid } from './image-extrude';
+import { litChunkWGSL } from './lighting/shading';
+import { isShapeKind, shapeGeometry, ShapeKind } from './shapes';
 
 // Opaque, depth-writing mesh drawn in the world layer. The world pass and the
 // splat passes share one depth buffer and the splat material depth-tests, so a
@@ -33,11 +35,21 @@ import { AlphaGrid, buildExtrudeGeometry, makeAlphaGrid } from './image-extrude'
 // any other primitive, so the silhouette is a hard edge inside the splats.
 
 //
-// A 'model' is an imported GLB mesh. It is drawn with the toolkit's own unlit
-// shaders (base colour x texture) instead of the engine's lit materials, since
-// the editor scene has no lights.
+// A 'model' is an imported GLB mesh. It is drawn with the toolkit's own
+// shaders (base colour x texture) instead of the engine's lit materials.
+//
+// The curved shapes (sphere, cylinder, cone, torus, backdrop) are generated
+// meshes, see shapes.ts.
+//
+// All of them are shaded by the studio lights (lighting/shading.ts) when the
+// studio has any; without lights they keep the plain look with a mild
+// headlight so their form still reads.
 
-type PrimitiveKind = 'plane' | 'box' | 'image' | 'model';
+type PrimitiveKind = 'plane' | 'box' | 'image' | 'model' | ShapeKind;
+
+// default surface response of primitives (models use their own materials)
+const DEFAULT_ROUGHNESS = 0.55;
+const DEFAULT_METALNESS = 0;
 
 type PrimitiveState = {
     position: [number, number, number];
@@ -46,6 +58,10 @@ type PrimitiveState = {
     color: [number, number, number];
     visible: boolean;
     alphaCutoff?: number;                   // images only
+    // surface response for the studio lights. on a model, leaving them out
+    // keeps the model's own materials
+    roughness?: number;
+    metalness?: number;
 };
 
 type PrimitiveData = PrimitiveState & {
@@ -75,12 +91,14 @@ fn vertexMain(input: VertexInput) -> VertexOutput {
 }
 `;
 
-// flat colour with a mild headlight term so the faces of a box read apart
+// flat colour with a mild headlight term so the faces of a box read apart,
+// or lit by the studio lights when there are any
 const fragmentShader = /* wgsl */`
 uniform view_position: vec3f;
 uniform primColor: vec3f;
 varying vWorldPos: vec3f;
 varying vNormal: vec3f;
+${litChunkWGSL}
 
 @fragment
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
@@ -88,7 +106,8 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     let n = normalize(input.vNormal);
     let v = normalize(uniform.view_position - input.vWorldPos);
     let shade = 0.6 + 0.4 * abs(dot(n, v));
-    output.color = vec4f(uniform.primColor * shade, 1.0);
+    let color = studioShade(uniform.primColor, n, input.vWorldPos, uniform.view_position, uniform.primColor * shade);
+    output.color = vec4f(color, 1.0);
     return output;
 }
 `;
@@ -129,6 +148,7 @@ varying vUv: vec2f;
 varying vWorldPos: vec3f;
 varying vNormal: vec3f;
 varying vSide: f32;
+${litChunkWGSL}
 
 @fragment
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
@@ -141,7 +161,8 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     let n = normalize(input.vNormal);
     let v = normalize(uniform.view_position - input.vWorldPos);
     let shade = mix(1.0, 0.55 + 0.45 * abs(dot(n, v)), input.vSide);
-    output.color = vec4f(texel.rgb * uniform.primColor * shade, 1.0);
+    let base = texel.rgb * uniform.primColor;
+    output.color = vec4f(studioShade(base, n, input.vWorldPos, uniform.view_position, base * shade), 1.0);
     return output;
 }
 `;
@@ -157,6 +178,7 @@ varying vUv: vec2f;
 varying vWorldPos: vec3f;
 varying vNormal: vec3f;
 varying vSide: f32;
+${litChunkWGSL}
 
 @fragment
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
@@ -170,7 +192,8 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     let n = normalize(input.vNormal);
     let v = normalize(uniform.view_position - input.vWorldPos);
     let shade = 0.6 + 0.4 * abs(dot(n, v));
-    output.color = vec4f(rgb * uniform.primColor * shade, 1.0);
+    let base = rgb * uniform.primColor;
+    output.color = vec4f(studioShade(base, n, input.vWorldPos, uniform.view_position, base * shade), 1.0);
     return output;
 }
 `;
@@ -184,7 +207,12 @@ const loadImage = (url: string) => {
     });
 };
 
-type ModelPart = { meshInstance: MeshInstance, baseColor: [number, number, number] };
+type ModelPart = {
+    meshInstance: MeshInstance,
+    baseColor: [number, number, number],
+    roughness: number,
+    metalness: number
+};
 
 const makeMaterial = (uniqueName: string, vertexWGSL: string, fragmentWGSL: string, textured: boolean) => {
     const material = new ShaderMaterial({
@@ -223,6 +251,9 @@ class MeshPrimitive extends Element {
     private builtCutoff = -1;
     alphaCutoff = 0.5;
     color: [number, number, number] = [0.8, 0.8, 0.8];
+    // null on a model = the model's own materials
+    roughness: number | null = DEFAULT_ROUGHNESS;
+    metalness: number | null = DEFAULT_METALNESS;
     private bound = new BoundingBox();
     private localBound = new BoundingBox();
 
@@ -236,8 +267,13 @@ class MeshPrimitive extends Element {
         if (data.kind === 'plane') {
             this.localHalf.set(0.5, 0.002, 0.5);
         }
+        if (isShapeKind(data.kind)) {
+            const half = shapeGeometry(data.kind).half;
+            this.localHalf.set(half[0], half[1], half[2]);
+        }
         if (data.kind !== 'model') {
-            this.entity.addComponent('render', { type: data.kind === 'image' ? 'asset' : data.kind });
+            const generated = data.kind === 'image' || isShapeKind(data.kind);
+            this.entity.addComponent('render', { type: generated ? 'asset' : data.kind });
         }
         this.setState(data);
     }
@@ -289,7 +325,10 @@ class MeshPrimitive extends Element {
                 }
                 this.modelParts.push({
                     meshInstance,
-                    baseColor: diffuse ? [diffuse.r, diffuse.g, diffuse.b] : [1, 1, 1]
+                    baseColor: diffuse ? [diffuse.r, diffuse.g, diffuse.b] : [1, 1, 1],
+                    // the glTF loader stores roughness in gloss with glossInvert set
+                    roughness: source?.gloss !== undefined ? (source.glossInvert ? source.gloss : 1 - source.gloss) : 1,
+                    metalness: source?.useMetalness ? (source.metalness ?? 0) : 0
                 });
                 partBound.setFromTransformedAabb(meshInstance.mesh.aabb, meshInstance.node.getWorldTransform());
                 if (first) {
@@ -376,6 +415,18 @@ class MeshPrimitive extends Element {
 
         if (isImage) {
             this.rebuildMesh();
+        } else if (isShapeKind(this.kind)) {
+            const geometry = shapeGeometry(this.kind);
+            const mesh = new Mesh(this.scene.graphicsDevice);
+            mesh.setPositions(geometry.positions);
+            mesh.setNormals(geometry.normals);
+            mesh.setUvs(0, geometry.uvs);
+            mesh.setIndices(geometry.indices);
+            mesh.update(PRIMITIVE_TRIANGLES);
+            const meshInstance = new MeshInstance(mesh, material);
+            meshInstance.castShadow = false;
+            this.entity.render.meshInstances = [meshInstance];
+            this.mesh = mesh;
         } else {
             this.entity.render.meshInstances[0].material = material;
         }
@@ -417,7 +468,7 @@ class MeshPrimitive extends Element {
     serialize(serializer: Serializer) {
         serializer.packa(this.entity.getWorldTransform().data);
         serializer.packa(this.color);
-        serializer.pack(this.entity.enabled, this.alphaCutoff);
+        serializer.pack(this.entity.enabled, this.alphaCutoff, this.roughness ?? -1, this.metalness ?? -1);
     }
 
     // (re)build the extruded picture mesh for the current alpha cutoff
@@ -456,14 +507,18 @@ class MeshPrimitive extends Element {
     private applyColor() {
         if (this.kind === 'model') {
             // the picked colour tints the model's own base colours
-            this.modelParts.forEach(({ meshInstance, baseColor }) => {
+            this.modelParts.forEach(({ meshInstance, baseColor, roughness, metalness }) => {
                 meshInstance.setParameter('primColor', [baseColor[0] * this.color[0], baseColor[1] * this.color[1], baseColor[2] * this.color[2]]);
+                meshInstance.setParameter('primRoughness', this.roughness ?? roughness);
+                meshInstance.setParameter('primMetalness', this.metalness ?? metalness);
             });
             return;
         }
         const meshInstance = this.entity.render?.meshInstances[0];
         if (!meshInstance) return;
         meshInstance.setParameter('primColor', this.color);
+        meshInstance.setParameter('primRoughness', this.roughness ?? DEFAULT_ROUGHNESS);
+        meshInstance.setParameter('primMetalness', this.metalness ?? DEFAULT_METALNESS);
         if (this.texture) {
             meshInstance.setParameter('primTex', this.texture);
             meshInstance.setParameter('primAlphaCutoff', this.alphaCutoff);
@@ -480,7 +535,9 @@ class MeshPrimitive extends Element {
             scale: [s.x, s.y, s.z],
             color: [this.color[0], this.color[1], this.color[2]],
             visible: this.entity.enabled,
-            alphaCutoff: this.alphaCutoff
+            alphaCutoff: this.alphaCutoff,
+            ...(this.roughness !== null ? { roughness: this.roughness } : {}),
+            ...(this.metalness !== null ? { metalness: this.metalness } : {})
         };
     }
 
@@ -491,6 +548,9 @@ class MeshPrimitive extends Element {
         this.color = [state.color[0], state.color[1], state.color[2]];
         this.entity.enabled = state.visible;
         this.alphaCutoff = state.alphaCutoff ?? 0.5;
+        const ownMaterials = this.kind === 'model';
+        this.roughness = state.roughness ?? (ownMaterials ? null : DEFAULT_ROUGHNESS);
+        this.metalness = state.metalness ?? (ownMaterials ? null : DEFAULT_METALNESS);
         if (this.kind === 'image' && this.scene) {
             this.rebuildMesh();
         }
@@ -515,4 +575,4 @@ const statesEqual = (a: PrimitiveState, b: PrimitiveState) => {
     return JSON.stringify(a) === JSON.stringify(b);
 };
 
-export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, statesEqual };
+export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, statesEqual, DEFAULT_ROUGHNESS, DEFAULT_METALNESS };

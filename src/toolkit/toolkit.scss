@@ -263,3 +263,150 @@
         stroke-dasharray: 5, 5;
     }
 }
+
+// ---- studio lighting: left of the right toolbar, where the editor's own
+// option popups open (they close each other)
+#toolkit-lighting-panel {
+    top: 24px;
+    right: 102px;
+    width: 340px;
+    // above the toolkit's left-anchored panels on narrower screens
+    z-index: 2;
+    max-height: calc(100vh - 140px);
+    display: flex;
+    flex-direction: column;
+
+    &.pcui-hidden {
+        display: none;
+    }
+
+    & > .panel-header {
+        flex-shrink: 0;
+
+        .panel-header-icon > svg {
+            display: block;
+            width: 24px;
+            height: 24px;
+            margin: -4px 0;
+            color: $clr-hilight;
+        }
+    }
+}
+
+.toolkit-lighting-body {
+    overflow-y: auto;
+    padding-bottom: 6px;
+
+    .toolkit-list {
+        max-height: 170px;
+    }
+}
+
+.toolkit-section {
+    display: block;
+    margin: 10px 10px 2px 10px;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: $clr-hilight;
+}
+
+.toolkit-hint {
+    display: block;
+    margin: 2px 10px 4px 10px;
+    white-space: normal;
+    line-height: 1.4;
+    font-size: 11px;
+    color: $text-secondary;
+}
+
+.toolkit-intro {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background-color: $bcg-dark;
+}
+
+.toolkit-estimate {
+    color: $text-primary;
+}
+
+.toolkit-select.pcui-select-input {
+    margin: 0;
+    flex-grow: 1;
+    min-width: 0;
+}
+
+.toolkit-select-small.pcui-select-input {
+    margin: 0;
+    width: 92px;
+    flex-shrink: 0;
+}
+
+.toolkit-color-small.pcui-color-input {
+    margin: 0;
+    width: 40px;
+    flex-shrink: 0;
+    height: 22px;
+}
+
+.toolkit-fixture-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+    padding: 4px 10px;
+
+    & > .toolkit-fixture.pcui-button {
+        margin: 0;
+        height: 26px;
+        line-height: 24px;
+        padding: 0 2px;
+        font-size: 11px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+}
+
+.toolkit-swatch {
+    width: 10px;
+    height: 10px;
+    margin: 0 8px 0 0;
+    border-radius: 50%;
+    flex-shrink: 0;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+.toolkit-editor-title {
+    display: block;
+    margin: 6px 10px 0 10px;
+    font-weight: bold;
+    color: $text-primary;
+}
+
+.toolkit-bake.pcui-button {
+    flex-grow: 1;
+    margin: 0;
+    height: 32px;
+    line-height: 30px;
+    font-weight: bold;
+    background-color: $clr-hilight;
+    color: $clr-active;
+
+    &:hover:not(.pcui-disabled) {
+        background-color: #ff9900;
+        color: $clr-active;
+    }
+}
+
+.toolkit-mode.pcui-button.active,
+.toolkit-button.pcui-button.active {
+    background-color: $clr-hilight;
+    color: $clr-active;
+}
+
+// room for four digits (colour temperature) in the slider's number field
+.toolkit-lighting-body .toolkit-slider.pcui-slider > .pcui-numeric-input {
+    flex: 0 0 56px;
+}
