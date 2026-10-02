@@ -40,6 +40,10 @@ class Splat extends Element {
     asset: Asset;
     resource: EditorSplatResource;
     numSplats = 0;
+    // toolkit: layers generated from meshes are made of equally tiny gaussians.
+    // the renderer's size cull would drop all of them at once as the camera
+    // moves away, so such layers opt out of it
+    noSizeCull = false;
     numDeleted = 0;
     numLocked = 0;
     numSelected = 0;

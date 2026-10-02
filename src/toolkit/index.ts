@@ -4,6 +4,7 @@ import type { Events } from '../events';
 import type { Scene } from '../scene';
 import type { ToolManager } from '../tools/tool-manager';
 import type { Tooltips } from '../ui/tooltips';
+import { generatedLayersModule } from './generated-layers';
 import { generatorsModule } from './generators';
 import { meshPrimitivesModule } from './mesh-primitives';
 
@@ -31,7 +32,8 @@ interface ToolkitModule {
 
 const modules: ToolkitModule[] = [
     meshPrimitivesModule,
-    generatorsModule
+    generatorsModule,
+    generatedLayersModule
 ];
 
 const initToolkit = (ctx: ToolkitContext) => {

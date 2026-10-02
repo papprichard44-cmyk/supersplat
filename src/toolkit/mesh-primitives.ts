@@ -2,6 +2,7 @@ import { Button, ColorPicker, Container, Label, SliderInput, VectorInput } from 
 import { OrientedBox, Quat, Ray, Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
+import { Splat } from '../splat';
 import { ShapeGizmoMode, ShapeTransformGizmo } from '../tools/shape-transform-gizmo';
 import deleteSvg from '../ui/svg/delete.svg';
 import hiddenSvg from '../ui/svg/hidden.svg';
@@ -397,6 +398,10 @@ const init = (ctx: ToolkitContext) => {
             await events.invoke('import', [{ filename, contents: new File([ply], filename) }]);
         } finally {
             handle.off();
+        }
+        if (created) {
+            (created as Splat).noSizeCull = true;
+            scene.forceRender = true;
         }
         if (!isModel) {
             (created as Element | null)?.move(new Vec3(0, 0, 0), new Quat(), new Vec3(1, 1, 1));
