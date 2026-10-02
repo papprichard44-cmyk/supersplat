@@ -1093,3 +1093,10 @@
         color: $text-secondary;
     }
 }
+
+// toolkit panels come to the front with a growing z-index. keep that contest
+// inside the editor, so the popups and tooltips (later siblings of the editor)
+// always stay on top of every panel
+#editor-container {
+    isolation: isolate;
+}
