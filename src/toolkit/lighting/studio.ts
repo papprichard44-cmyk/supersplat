@@ -12,7 +12,7 @@ import { LIGHT_FLOATS, MAX_PREVIEW_LIGHTS, minAlphaForDegree, TONEMAP_FILMIC, TO
 import { splatLighting } from './splat-lighting';
 import { buildShadowGrid, PlyLayout, readPlyLayout, ShadowGrid, splatSamples, writeDc } from './splat-relight';
 import { LightState, StudioLight, Vec3Tuple } from './studio-light';
-import { MultiOp } from '../../edit-ops';
+import { AddSplatOp, MultiOp } from '../../edit-ops';
 import { Element, ElementType } from '../../element';
 import { Splat } from '../../splat';
 import { ShapeGizmoMode, ShapeTransformGizmo } from '../../tools/shape-transform-gizmo';
@@ -56,6 +56,7 @@ type StudioSettings = {
     lightSplats: boolean;                   // the lights also reach the splat layers
     noShadow: string[];                     // objects that cast no shadows in the bake
     splatBase: number;                      // share of the splats' own light that is kept
+    subject: string;                        // what the lights aim at: 'auto' or a mesh / splat layer key
 };
 
 const defaultSettings = (): StudioSettings => ({
@@ -74,7 +75,8 @@ const defaultSettings = (): StudioSettings => ({
     showBeams: true,
     lightSplats: false,
     noShadow: [],
-    splatBase: 1
+    splatBase: 1,
+    subject: 'auto'
 });
 
 const shadowRays = [0, 1, 16, 36];
@@ -90,6 +92,7 @@ const tips = {
     move: 'Move the selected light with the gizmo (shortcut: 1).',
     rotate: 'Turn the selected light with the gizmo (shortcut: 2). Turning switches off "Aim at subject".',
     aim: 'Point the light at the centre of the subject and keep it pointed there while you move it.',
+    subject: 'What the lights are set up around and aim at: pick a mesh or a splat layer of the scene. Automatic: the selected mesh, else everything visible. Lights that are aiming turn to a newly picked subject.',
     power: 'Brightness in stops: +1 doubles the light, -1 halves it. Like a real lamp, it also gets brighter as you move it closer to the subject.',
     kelvin: 'Colour temperature: low values are warm and orange (candle, tungsten bulb), around 5600 K is neutral daylight, high values are cool and blue (shade, overcast).',
     gel: 'Colour filter in front of the lamp (white = no filter), like a coloured gel on a film light.',
@@ -268,6 +271,24 @@ const init = (ctx: ToolkitContext) => {
 
     const splatLayers = () => scene.getElementsByType(ElementType.splat) as Splat[];
     const targetKey = (element: MeshPrimitive | Splat) => (isPrimitive(element) ? `mesh:${element.name}` : `splat:${element.name}`);
+    // the subject picked in the panel, if it is still in the scene and shown
+    const subjectElement = (): MeshPrimitive | Splat | null => {
+        if (!settings.subject || settings.subject === 'auto') return null;
+        const all: (MeshPrimitive | Splat)[] = [...primitives(), ...splatLayers()];
+        return all.find(e => targetKey(e) === settings.subject && (isPrimitive(e) ? e.entity.enabled : e.visible)) ?? null;
+    };
+    // what lights are arranged around and aim at
+    const chosenSubjectBound = () => {
+        const element = subjectElement();
+        const b = element?.worldBound;
+        if (b) {
+            const bound = new BoundingBox();
+            bound.copy(b);
+            return bound;
+        }
+        return subjectBound(selectedPrimitive ? [selectedPrimitive] : undefined);
+    };
+
     const reaches = (light: StudioLight, element: MeshPrimitive | Splat) => {
         if (!isPrimitive(element) && !settings.lightSplats) return false;
         return !light.state.only || (light.state.targets ?? []).includes(targetKey(element));
@@ -372,6 +393,13 @@ const init = (ctx: ToolkitContext) => {
     body.append(presetRow);
     const presetHint = hint();
     body.append(presetHint);
+
+    // the subject the setup is arranged around and the lights aim at
+    const subjectRow = row('Subject', tips.subject);
+    const subjectSelect = new SelectInput({ class: 'toolkit-select', type: 'string', options: [{ v: 'auto', t: 'Automatic' }], value: 'auto' });
+    subjectRow.append(subjectSelect);
+    tooltips.register(subjectSelect, tips.subject, 'bottom');
+    body.append(subjectRow);
     tooltips.register(presetSelect, tips.preset, 'left');
     tooltips.register(applyPreset, tips.apply, 'bottom');
 
@@ -426,6 +454,11 @@ const init = (ctx: ToolkitContext) => {
     modeRow.append(rotateButton);
     modeRow.append(aimButton);
     editor.append(modeRow);
+    const aimAtRow = row('Aim at', tips.subject);
+    const aimAtSelect = new SelectInput({ class: 'toolkit-select', type: 'string', options: [{ v: 'auto', t: 'Automatic' }], value: 'auto' });
+    aimAtRow.append(aimAtSelect);
+    tooltips.register(aimAtSelect, tips.subject, 'bottom');
+    editor.append(aimAtRow);
     tooltips.register(moveButton, tips.move, 'bottom');
     tooltips.register(rotateButton, tips.rotate, 'bottom');
     tooltips.register(aimButton, tips.aim, 'bottom');
@@ -633,6 +666,8 @@ const init = (ctx: ToolkitContext) => {
     // ---- settings editing (debounced into one undo step)
 
     let uiUpdating = false;
+    // declared up front: the settings ui keeps the subject lists current
+    let refreshSubjects: () => void = () => {};
 
     const applySettings = (next: StudioSettings) => {
         const beamsChanged = next.showBeams !== settings.showBeams || next.scale !== settings.scale;
@@ -680,6 +715,7 @@ const init = (ctx: ToolkitContext) => {
         splatBase.row.hidden = !settings.lightSplats;
         uiUpdating = false;
         refreshCasters();
+        refreshSubjects();
     };
 
     ambient.slider.on('change', (value: number) => editSettings({ ambient: value }));
@@ -704,7 +740,7 @@ const init = (ctx: ToolkitContext) => {
 
     // irradiance at the subject, facing the camera, from the current lights
     const subjectIrradiance = () => {
-        const bound = subjectBound(selectedPrimitive ? [selectedPrimitive] : undefined);
+        const bound = chosenSubjectBound();
         const c = bound.center;
         const n = new Vec3().sub2(scene.camera.mainCamera.getPosition(), c).normalize();
         let e = 0;
@@ -797,7 +833,7 @@ const init = (ctx: ToolkitContext) => {
 
     const addLight = (kind: FixtureKind) => {
         flushPending();
-        const bound = subjectBound(selectedPrimitive ? [selectedPrimitive] : undefined);
+        const bound = chosenSubjectBound();
         if (lights().length === 0) {
             // the first light sets the scale of the rig
             applySettings({ ...settings, scale: subjectSize(bound) });
@@ -818,7 +854,7 @@ const init = (ctx: ToolkitContext) => {
     const applySetup = (preset: Preset) => {
         flushPending();
         flushSettings();
-        const bound = subjectBound(selectedPrimitive ? [selectedPrimitive] : undefined);
+        const bound = chosenSubjectBound();
         const oldSettings = { ...settings };
         const newSettings: StudioSettings = {
             ...settings,
@@ -1072,11 +1108,55 @@ const init = (ctx: ToolkitContext) => {
     spread.slider.on('change', (value: number) => selected && editLight(selected, { spread: value }));
     shadowsToggle.on('change', (value: boolean) => selected && editLight(selected, { shadows: value }));
 
+    // ---- subject choice
+
+    const subjectOptions = () => [
+        { v: 'auto', t: 'Automatic (selected mesh, else everything)' },
+        ...visiblePrimitives().map(p => ({ v: targetKey(p), t: `Mesh: ${p.name}` })),
+        ...splatLayers().filter(sp => sp.visible).map(sp => ({ v: targetKey(sp), t: `Splat: ${sp.name}` }))
+    ];
+    refreshSubjects = () => {
+        const options = subjectOptions();
+        // a picked subject that is hidden or gone stays listed, so the choice is kept
+        if (settings.subject !== 'auto' && !options.some(o => o.v === settings.subject)) {
+            options.push({ v: settings.subject, t: `${settings.subject.replace(/^(mesh|splat):/, '')} (not shown)` });
+        }
+        const wasUpdating = uiUpdating;
+        uiUpdating = true;
+        [subjectSelect, aimAtSelect].forEach((select) => {
+            select.options = options;
+            select.value = settings.subject ?? 'auto';
+        });
+        uiUpdating = wasUpdating;
+    };
+    const pickSubject = (value: string) => {
+        if (uiUpdating || value === settings.subject) return;
+        flushPending();
+        editSettings({ subject: value });
+        flushSettings();
+        refreshSubjects();
+        // lights that are aiming turn to the new subject
+        const c = chosenSubjectBound().center;
+        const ops = lights().filter(l => l.state.target).map((light) => {
+            const old = light.getState();
+            return new LightStateOp(light, old, { ...old, target: [c.x, c.y, c.z] as Vec3Tuple });
+        });
+        if (ops.length) events.fire('edit.add', new MultiOp(ops));
+    };
+    subjectSelect.on('change', pickSubject);
+    aimAtSelect.on('change', pickSubject);
+    ['scene.elementAdded', 'scene.elementRemoved', 'splat.name', 'splat.visibility', 'toolkit.primitive.changed'].forEach((name) => {
+        events.on(name, () => refreshSubjects());
+    });
+    events.on('toolkit.lightingPanel.setVisible', () => refreshSubjects());
+    events.function('toolkit.studio.subjects', () => subjectOptions());
+    events.function('toolkit.studio.setSubject', (value: string) => pickSubject(value));
+
     aimButton.on('click', () => {
         if (!selected) return;
         flushPending();
         const old = selected.getState();
-        const c = subjectBound(selectedPrimitive ? [selectedPrimitive] : undefined).center;
+        const c = chosenSubjectBound().center;
         const next = { ...old, target: old.target ? null : [c.x, c.y, c.z] as Vec3Tuple };
         events.fire('edit.add', new LightStateOp(selected, old, next));
     });
@@ -1471,6 +1551,8 @@ const init = (ctx: ToolkitContext) => {
                 if (created) {
                     created.noSizeCull = true;
                     created.studioMask = 0;
+                    // part of the same undo step as hiding the meshes
+                    ops.push(new AddSplatOp(scene, created));
                 }
                 count += samples.count;
 
@@ -1505,7 +1587,10 @@ const init = (ctx: ToolkitContext) => {
                 }, control);
                 const name = `${splat.name.replace(/\.(compressed\.)?ply$/i, '').replace(/[^\w\- ]+/g, '_')} lit.ply`;
                 const created = await importLayer(name, writeDc(buffer, layout, colors.dc));
-                if (created) created.studioMask = 0;
+                if (created) {
+                    created.studioMask = 0;
+                    ops.push(new AddSplatOp(scene, created));
+                }
                 count += layout.count;
                 ops.push(new SplatVisibleOp(splat, false));
             }

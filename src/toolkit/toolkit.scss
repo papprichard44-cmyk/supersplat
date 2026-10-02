@@ -611,3 +611,35 @@
         width: 88px;
     }
 }
+
+// ---- vegetation tabs and the place brush
+.toolkit-tabs {
+    padding-top: 8px;
+}
+
+.toolkit-veg-page.pcui-hidden {
+    display: none;
+}
+
+#toolkit-plant-svg {
+    > circle {
+        fill: #6c3;
+        stroke: none;
+    }
+
+    > polygon {
+        fill: rgba(102, 204, 51, 0.12);
+        stroke: #6c3;
+        stroke-width: 1.5;
+        stroke-linejoin: round;
+    }
+
+    > polyline {
+        fill: none;
+        stroke: #6c3;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-dasharray: 5, 5;
+    }
+}

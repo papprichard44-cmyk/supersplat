@@ -29,8 +29,12 @@ class MeshRaycaster {
     private building: Promise<void> | null = null;
     private stack = new Int32Array(128);
 
-    constructor(scene: Scene, events: Events) {
+    private filter: ((primitive: MeshPrimitive) => boolean) | null;
+
+    // `filter` limits the casts to some of the meshes
+    constructor(scene: Scene, events: Events, filter: ((primitive: MeshPrimitive) => boolean) | null = null) {
         this.scene = scene;
+        this.filter = filter;
         const invalidate = () => {
             this.dirty = true;
         };
@@ -42,7 +46,7 @@ class MeshRaycaster {
 
     private primitives() {
         return this.scene.getElementsByType(ElementType.model)
-        .filter(e => e instanceof MeshPrimitive && (e as MeshPrimitive).entity.enabled) as MeshPrimitive[];
+        .filter(e => e instanceof MeshPrimitive && (e as MeshPrimitive).entity.enabled && (!this.filter || this.filter(e as MeshPrimitive))) as MeshPrimitive[];
     }
 
     private currentKey(primitives: MeshPrimitive[]) {

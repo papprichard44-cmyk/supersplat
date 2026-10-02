@@ -1,5 +1,5 @@
 import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput, VectorInput } from '@playcanvas/pcui';
-import { OrientedBox, Ray, Vec3 } from 'playcanvas';
+import { OrientedBox, Quat, Ray, Vec3 } from 'playcanvas';
 
 import { MultiOp } from '../edit-ops';
 import { Element, ElementType } from '../element';
@@ -941,17 +941,24 @@ const init = (ctx: ToolkitContext) => {
 
     events.function('toolkit.addModel', createModel);
 
-    // a model made by a generator (vegetation panel): stands on the ground at
-    // the camera focus, sized to `height` (its top above the ground) or
-    // `longest` (its longest side), or takes the place of `replace`
-    const addGeneratedModel = async (glb: ArrayBuffer, options: {
+    // a model made by a generator (vegetation panel). By default it stands on
+    // the ground at the camera focus, sized to `height` (its top above the
+    // ground) or `longest` (its longest side); `unitScale` keeps the .glb's own
+    // units (times the factor). With `anchor` the .glb's origin goes exactly
+    // there (a point picked on a surface), turned by `yaw` degrees. `replace`
+    // takes the place of an existing model.
+    type GeneratedOptions = {
         name: string,
         generator: PrimitiveGenerator,
         height?: number,
         longest?: number,
+        unitScale?: number,
+        anchor?: [number, number, number],
+        yaw?: number,
         replace?: MeshPrimitive | null
-    }) => {
-        flushPending();
+    };
+
+    const prepareGeneratedModel = async (glb: ArrayBuffer, options: GeneratedOptions) => {
         const blob = new Blob([glb], { type: 'model/gltf-binary' });
         const dataUrl = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
@@ -968,14 +975,14 @@ const init = (ctx: ToolkitContext) => {
             model: dataUrl,
             generator: options.generator,
             position: oldState ? oldState.position : [focus.x, focus.y, focus.z],
-            rotation: oldState ? oldState.rotation : [0, 0, 0],
+            rotation: oldState ? oldState.rotation : [0, options.yaw ?? 0, 0],
             scale: [1, 1, 1],
             color: oldState ? oldState.color : [1, 1, 1],
             visible: true,
             alphaCutoff: 0.5
         });
 
-        // size and ground it once its geometry is known
+        // size and place it once its geometry is known
         const added = new Promise<void>((resolve) => {
             const handle = events.on('scene.elementAdded', (element: Element) => {
                 if (element !== primitive) return;
@@ -985,29 +992,64 @@ const init = (ctx: ToolkitContext) => {
                 if (old) {
                     // keep the replaced model's height
                     scale = old.localHalf.y * old.getState().scale[1] / Math.max(half.y, 1e-6);
+                } else if (options.unitScale) {
+                    scale = primitive.modelUnits * options.unitScale;
                 } else if (options.height) {
                     scale = options.height / Math.max(2 * half.y, 1e-6);
                 } else if (options.longest) {
                     scale = options.longest;
                 }
                 const state = primitive.getState();
-                let y = state.position[1];
-                if (!old) {
-                    // on the floor: the lowest visible primitive, else the focus
-                    const others = primitives().filter(p => p !== primitive && p.entity.enabled && p.worldBound);
-                    const ground = others.length ? Math.min(...others.map(p => p.worldBound.getMin().y)) : focus.y;
-                    y = ground + half.y * scale;
+                if (options.anchor && !old) {
+                    // the .glb's origin onto the anchor
+                    const offset = new Quat().setFromEulerAngles(0, options.yaw ?? 0, 0)
+                    .transformVector(primitive.modelOrigin.clone().mulScalar(scale), new Vec3());
+                    const [ax, ay, az] = options.anchor;
+                    primitive.setState({
+                        ...state,
+                        position: [ax - offset.x, ay - offset.y, az - offset.z],
+                        rotation: [0, options.yaw ?? 0, 0],
+                        scale: [scale, scale, scale]
+                    });
+                } else {
+                    let y = state.position[1];
+                    if (!old) {
+                        // on the floor: the lowest visible primitive, else the focus
+                        const others = primitives().filter(p => p !== primitive && p.entity.enabled && p.worldBound);
+                        const ground = others.length ? Math.min(...others.map(p => p.worldBound.getMin().y)) : focus.y;
+                        y = ground + half.y * scale;
+                    }
+                    primitive.setState({ ...state, position: [state.position[0], y, state.position[2]], scale: [scale, scale, scale] });
                 }
-                primitive.setState({ ...state, position: [state.position[0], y, state.position[2]], scale: [scale, scale, scale] });
                 resolve();
             });
         });
 
+        const op = old ? new MultiOp([new RemovePrimitiveOp(scene, old), new AddPrimitiveOp(scene, primitive)]) : new AddPrimitiveOp(scene, primitive);
+        return { primitive, op, added };
+    };
+
+    const addGeneratedModel = async (glb: ArrayBuffer, options: GeneratedOptions) => {
+        flushPending();
+        const { primitive, op, added } = await prepareGeneratedModel(glb, options);
         selectOnAdd = primitive;
-        events.fire('edit.add', old ? new MultiOp([new RemovePrimitiveOp(scene, old), new AddPrimitiveOp(scene, primitive)]) : new AddPrimitiveOp(scene, primitive));
+        events.fire('edit.add', op);
         await added;
         return primitive;
     };
+
+    // several models in one undo step (a placement stroke)
+    events.function('toolkit.addGeneratedModels', async (items: { glb: ArrayBuffer, options: GeneratedOptions }[]) => {
+        flushPending();
+        const prepared = [];
+        for (const item of items) {
+            prepared.push(await prepareGeneratedModel(item.glb, item.options));
+        }
+        if (!prepared.length) return [];
+        events.fire('edit.add', prepared.length === 1 ? prepared[0].op : new MultiOp(prepared.map(p => p.op)));
+        await Promise.all(prepared.map(p => p.added));
+        return prepared.map(p => p.primitive);
+    });
 
     events.function('toolkit.addGeneratedModel', addGeneratedModel);
     events.function('toolkit.selectedPrimitive', () => selected);

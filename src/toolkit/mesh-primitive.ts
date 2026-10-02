@@ -75,7 +75,7 @@ type PrimitiveState = {
 
 // what generated a model (vegetation panel), kept so it can be regenerated or
 // converted in its own way (grass becomes blade-shaped splats)
-type PrimitiveGenerator = { type: 'grass' | 'tree', params: any };
+type PrimitiveGenerator = { type: 'grass' | 'tree' | 'rocks', params: any };
 
 type PrimitiveData = PrimitiveState & {
     kind: PrimitiveKind;
@@ -359,6 +359,10 @@ class MeshPrimitive extends Element {
     generator: PrimitiveGenerator | null;
     // half size of the primitive in its own space (before the entity's scale)
     localHalf = new Vec3(0.5, 0.5, 0.5);
+    // models: the .glb's longest side in its own units, and where its origin
+    // lies in the primitive's space (the model is normalised to a longest side of 1)
+    modelUnits = 1;
+    modelOrigin = new Vec3();
     private modelRoot: Entity | null = null;
     private modelAsset: Asset | null = null;
     private modelParts: ModelPart[] = [];
@@ -475,6 +479,8 @@ class MeshPrimitive extends Element {
         root.setLocalScale(1 / longest, 1 / longest, 1 / longest);
         root.setLocalPosition(-bound.center.x / longest, -bound.center.y / longest, -bound.center.z / longest);
         this.localHalf.set(half.x / longest, half.y / longest, half.z / longest);
+        this.modelUnits = longest;
+        this.modelOrigin.set(-bound.center.x / longest, -bound.center.y / longest, -bound.center.z / longest);
 
         this.modelRoot = root;
         this.entity.addChild(root);

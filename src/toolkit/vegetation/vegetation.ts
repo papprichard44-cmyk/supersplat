@@ -1,19 +1,30 @@
 import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
-import { BoundingBox } from 'playcanvas';
+import { BoundingBox, Vec3 } from 'playcanvas';
 
 import { bladeCount, defaultGrass, flowerPalettes, GrassParams, grassGlb, MAX_BLADES } from './grass';
+import { defaultRocks, RockParams, rocksGlb, speciesNames } from './rocks';
 import { barkTypes, defaultTree, leafTypes, presetInfo, TreeParams, treeGlb, treePresets } from './tree';
 import { ElementType } from '../../element';
 import vegetationSvg from '../icons/vegetation.svg';
 import type { ToolkitContext, ToolkitModule } from '../index';
 import { MeshPrimitive } from '../mesh-primitive';
+import { MeshRaycaster } from '../mesh-raycast';
 import { headerIcon, registerPanel } from '../panels';
+import { createSurfaceProbe } from '../surface-probe';
 
 
-// Vegetation: procedural trees (EZ-Tree) and grass. Both are generated as
-// .glb models and placed in the scene like an imported model: move, size,
-// light and convert them like any mesh. Grass can also go straight to splats:
-// its conversion lays gaussians along the blades.
+// Vegetation: procedural trees (EZ-Tree), grass and rocks (SeedRock). All are
+// generated as .glb models and placed in the scene like an imported model:
+// move, size, light and convert them like any mesh. Grass can also go straight
+// to splats: its conversion lays gaussians along the blades.
+//
+// Placement: besides "Add" (at the camera focus), the place brush puts the
+// current kind where you click on a surface (splats or meshes), or several
+// along a drag, each with its own shape, size and turn; one stroke is one
+// undo step.
+
+const TOOL = 'toolkitPlant';
+const MAX_PER_STROKE = 40;
 
 const tips = {
     toggle: 'Vegetation: generate trees, bushes and grass, as models you can light and turn into splats.',
@@ -52,7 +63,29 @@ const tips = {
     addGrass: 'Generate a grass patch and put it on the ground at the camera focus.',
     addGrassSplats: 'Generate the grass and convert it to splats right away (with the studio lighting if there are lights).',
     updateGrass: 'Regenerate the selected grass patch with these settings, keeping its place.',
-    downloadGrass: 'Save the grass as a .glb file.'
+    downloadGrass: 'Save the grass as a .glb file.',
+    tabs: 'What to generate and place: trees, grass or rocks.',
+    place: 'Place by clicking: click on a surface (splats or meshes) to put the current kind there, or drag to place several along the stroke. Press again (or Esc) to stop.',
+    spacing: 'Distance between the things placed along a drag, in scene units.',
+    scaleVariation: 'Random size difference between placed things (0 = all the same).',
+    varyShape: 'Every placed thing gets a new random shape (seed). Off: copies of the current one.',
+    randomTurn: 'Every placed thing is turned randomly about the vertical.',
+    rockKind: 'Kind of stone (SeedRock species). Basalt grows columns, slate stacks slabs, crystal and ore grow shard clusters, the rest are boulders.',
+    rockCount: 'How many rocks in one group: 1 for a single stone, more for a pile or a scatter.',
+    rockSize: 'Longest side of an average rock, in scene units.',
+    rockSizeVariation: 'How much the rocks of a group differ in size.',
+    spread: 'Radius of the group, in rock sizes: small = a tight pile, large = scattered stones.',
+    turn: 'Random turn of each rock about the vertical: 0 = all the same way, 1 = any way.',
+    tilt: 'Random lean of each rock, in degrees.',
+    flatten: 'Squash the rocks flatter (pebbles, flagstones).',
+    relief: 'How rugged the surface is: lower = smoother, rounder stones.',
+    detail: 'Mesh detail: more = finer shape, more triangles.',
+    sink: 'How deep each rock sits in the ground, as a share of its height.',
+    tintVariation: 'Colour difference between the rocks of a group.',
+    rockTint: 'Tint over the stone texture (white = as is).',
+    addRocks: 'Generate the rock(s) and put them on the ground at the camera focus.',
+    updateRocks: 'Regenerate the selected rock group with these settings, keeping its place.',
+    downloadRocks: 'Save the rock(s) as a .glb file.'
 };
 
 const init = (ctx: ToolkitContext) => {
@@ -77,6 +110,10 @@ const init = (ctx: ToolkitContext) => {
 
     let tree: TreeParams = defaultTree();
     let treeHeight = 2;
+    let rocks: RockParams = defaultRocks();
+    // placement brush settings
+    let placeSpacing = 1;
+    let placeScaleVariation = 0.2;
     let grass: GrassParams = { ...defaultGrass(2), direct: true };
     let uiUpdating = false;
     // declared up front: the ui helpers refer to each other
@@ -96,14 +133,16 @@ const init = (ctx: ToolkitContext) => {
     const body = new Container({ class: 'toolkit-lighting-body' });
     panel.append(body);
 
-    const section = (title: string) => body.append(new Label({ text: title, class: 'toolkit-section' }));
+    // the helpers below add to `target`: the panel body or a tab's page
+    let target: Container = body;
+    const section = (title: string) => target.append(new Label({ text: title, class: 'toolkit-section' }));
     const hint = (text = '') => new Label({ text, class: 'toolkit-hint' });
     const row = (labelText: string, tip: string) => {
         const r = new Container({ class: 'toolkit-row' });
         const label = new Label({ text: labelText, class: 'toolkit-label' });
         r.append(label);
         tooltips.register(label, tip, 'left');
-        body.append(r);
+        target.append(r);
         return r;
     };
     const slider = (labelText: string, tip: string, min: number, max: number, precision: number, step?: number) => {
@@ -134,7 +173,7 @@ const init = (ctx: ToolkitContext) => {
             tooltips.register(b, tip, 'bottom');
             return b;
         });
-        body.append(r);
+        target.append(r);
         return result;
     };
     const seedRow = (tip: string) => {
@@ -147,9 +186,45 @@ const init = (ctx: ToolkitContext) => {
         return { s, dice };
     };
 
-    body.append(hint('Trees by EZ-Tree (Daniel Greenheck, MIT). Generated plants are models: move, light and convert them like any mesh.'));
+    // tabs: one kind at a time
+    type Kind = 'tree' | 'grass' | 'rocks';
+    let kind: Kind = 'tree';
+    const tabRow = new Container({ class: ['toolkit-row', 'toolkit-tabs'] });
+    const tabButtons = new Map<Kind, Button>();
+    ([['tree', 'Trees'], ['grass', 'Grass'], ['rocks', 'Rocks']] as [Kind, string][]).forEach(([k, text]) => {
+        const b = new Button({ text, class: 'toolkit-button' });
+        tabRow.append(b);
+        tooltips.register(b, tips.tabs, 'bottom');
+        tabButtons.set(k, b);
+    });
+    body.append(tabRow);
+
+    // placement brush, for whichever kind is shown
+    section('Place');
+    const [placeButton] = buttons([['Place by clicking', tips.place]]);
+    const spacing = slider('Spacing', tips.spacing, 0.01, 20, 2, 0.01);
+    const scaleVariation = slider('Size var.', tips.scaleVariation, 0, 0.8, 2, 0.01);
+    const varyRow = row('New shapes', tips.varyShape);
+    const varyShape = new BooleanInput({ type: 'toggle', value: true });
+    varyRow.append(varyShape);
+    tooltips.register(varyShape, tips.varyShape, 'bottom');
+    const turnRow = row('Random turn', tips.randomTurn);
+    const randomTurn = new BooleanInput({ type: 'toggle', value: true });
+    turnRow.append(randomTurn);
+    tooltips.register(randomTurn, tips.randomTurn, 'bottom');
+    const placeStatus = hint('Click on the scene to put one, drag to place several.');
+    body.append(placeStatus);
+
+    const treePage = new Container({ class: 'toolkit-veg-page' });
+    const grassPage = new Container({ class: 'toolkit-veg-page' });
+    const rockPage = new Container({ class: 'toolkit-veg-page' });
+    body.append(treePage);
+    body.append(grassPage);
+    body.append(rockPage);
 
     // tree
+    target = treePage;
+    target.append(hint('Trees by EZ-Tree (Daniel Greenheck, MIT). Generated plants are models: move, light and convert them like any mesh.'));
     section('Tree');
     const preset = select('Kind', tips.preset, treePresets.map(p => ({ v: p, t: p })));
     const treeSeed = seedRow(tips.seed);
@@ -165,9 +240,10 @@ const init = (ctx: ToolkitContext) => {
     const barkTint = color('Bark tint', tips.barkTint);
     const [addTree, updateTree, downloadTree] = buttons([['Add tree', tips.addTree], ['Update selected', tips.updateTree], ['Download .glb', tips.downloadTree]]);
     const treeStatus = hint();
-    body.append(treeStatus);
+    treePage.append(treeStatus);
 
     // grass
+    target = grassPage;
     section('Grass');
     const grassSeed = seedRow(tips.seed);
     const width = slider('Width', tips.width, 0.05, 50, 2, 0.01);
@@ -189,9 +265,32 @@ const init = (ctx: ToolkitContext) => {
     const direct = new BooleanInput({ type: 'toggle', value: true });
     directRow.append(direct);
     const grassCount = hint();
-    body.append(grassCount);
+    grassPage.append(grassCount);
     const [addGrass, addGrassSplats] = buttons([['Add grass', tips.addGrass], ['Add as splats', tips.addGrassSplats]]);
     const [updateGrass, downloadGrass] = buttons([['Update selected', tips.updateGrass], ['Download .glb', tips.downloadGrass]]);
+
+    // rocks
+    target = rockPage;
+    target.append(hint('Rocks by SeedRock (reed-soul, MIT). One rock or a whole group per placement.'));
+    section('Rocks');
+    const rockKind = select('Kind', tips.rockKind, speciesNames.map(n => ({ v: n.key, t: n.name })));
+    const rockSeed = seedRow(tips.seed);
+    const rockCount = slider('Count', tips.rockCount, 1, 50, 0, 1);
+    const rockSize = slider('Size', tips.rockSize, 0.01, 20, 2, 0.01);
+    const rockSizeVariation = slider('Size var.', tips.rockSizeVariation, 0, 1, 2, 0.01);
+    const spread = slider('Spread', tips.spread, 0.5, 8, 2, 0.01);
+    const turn = slider('Turn', tips.turn, 0, 1, 2, 0.01);
+    const tilt = slider('Tilt', tips.tilt, 0, 90, 0, 1);
+    const flatten = slider('Flatten', tips.flatten, 0, 1, 2, 0.01);
+    const relief = slider('Relief', tips.relief, 0, 2, 2, 0.01);
+    const detail = slider('Detail', tips.detail, 2, 5, 0, 1);
+    const sink = slider('Sink', tips.sink, 0, 0.5, 2, 0.01);
+    const tintVariation = slider('Colour var.', tips.tintVariation, 0, 1, 2, 0.01);
+    const rockTint = color('Tint', tips.rockTint);
+    const [addRocks, updateRocks, downloadRocks] = buttons([['Add rocks', tips.addRocks], ['Update selected', tips.updateRocks], ['Download .glb', tips.downloadRocks]]);
+    const rockStatus = hint();
+    rockPage.append(rockStatus);
+    target = body;
 
     canvasContainer.append(panel);
 
@@ -202,7 +301,11 @@ const init = (ctx: ToolkitContext) => {
         icon: vegetationSvg,
         title: 'Vegetation',
         tooltip: tips.toggle,
-        order: 2.5
+        order: 2.5,
+        // placing needs the panel's settings
+        onHide: () => {
+            if (ctx.toolManager.active === TOOL) ctx.toolManager.activate(null);
+        }
     });
 
     // ---- ui <-> params
@@ -239,6 +342,28 @@ const init = (ctx: ToolkitContext) => {
         flowers.value = grass.flowers;
         palette.value = grass.flowerPalette;
         direct.value = grass.direct !== false;
+
+        rockKind.value = rocks.species;
+        rockSeed.s.value = rocks.seed;
+        rockCount.value = rocks.count;
+        rockSize.value = rocks.size;
+        rockSizeVariation.value = rocks.sizeVariation;
+        spread.value = rocks.spread;
+        turn.value = rocks.turn;
+        tilt.value = rocks.tilt;
+        flatten.value = rocks.flatten;
+        relief.value = rocks.roughness;
+        detail.value = rocks.detail;
+        sink.value = rocks.sink;
+        tintVariation.value = rocks.tintVariation;
+        rockTint.value = rocks.tint;
+
+        spacing.value = placeSpacing;
+        scaleVariation.value = placeScaleVariation;
+        tabButtons.forEach((b, k) => b.class[k === kind ? 'add' : 'remove']('active'));
+        treePage.hidden = kind !== 'tree';
+        grassPage.hidden = kind !== 'grass';
+        rockPage.hidden = kind !== 'rocks';
         uiUpdating = false;
         updateGrassCount();
         updateButtons();
@@ -314,7 +439,7 @@ const init = (ctx: ToolkitContext) => {
 
     // ---- generation
 
-    const selectedGenerated = (type: 'tree' | 'grass') => {
+    const selectedGenerated = (type: 'tree' | 'grass' | 'rocks') => {
         const p = events.invoke('toolkit.selectedPrimitive') as MeshPrimitive | null;
         return p && p.generator?.type === type ? p : null;
     };
@@ -322,6 +447,7 @@ const init = (ctx: ToolkitContext) => {
     updateButtons = () => {
         updateTree.enabled = !!selectedGenerated('tree');
         updateGrass.enabled = !!selectedGenerated('grass');
+        updateRocks.enabled = !!selectedGenerated('rocks');
     };
 
     // show a generated plant's settings when it is selected
@@ -332,13 +458,16 @@ const init = (ctx: ToolkitContext) => {
         } else if (p?.generator?.type === 'grass') {
             grass = { ...grass, ...p.generator.params };
             updateUI();
+        } else if (p?.generator?.type === 'rocks') {
+            rocks = { ...defaultRocks(), ...p.generator.params };
+            updateUI();
         }
         updateButtons();
     });
 
     const busy = async <T>(text: string, work: () => Promise<T>) => {
         events.fire('startSpinner');
-        [addTree, updateTree, downloadTree, addGrass, addGrassSplats, updateGrass, downloadGrass].forEach((b) => {
+        [addTree, updateTree, downloadTree, addGrass, addGrassSplats, updateGrass, downloadGrass, addRocks, updateRocks, downloadRocks].forEach((b) => {
             b.enabled = false;
         });
         await new Promise((resolve) => {
@@ -351,7 +480,7 @@ const init = (ctx: ToolkitContext) => {
             return null;
         } finally {
             events.fire('stopSpinner');
-            [addTree, downloadTree, addGrass, addGrassSplats, downloadGrass].forEach((b) => {
+            [addTree, downloadTree, addGrass, addGrassSplats, downloadGrass, addRocks, downloadRocks].forEach((b) => {
                 b.enabled = true;
             });
             updateButtons();
@@ -420,6 +549,322 @@ const init = (ctx: ToolkitContext) => {
         download((await grassGlb(grass)).glb, `grass_${grass.seed}.glb`);
     }));
 
+    // ---- rocks
+
+    const onRocks = (change: Partial<RockParams>) => {
+        if (!uiUpdating) rocks = { ...rocks, ...change };
+    };
+    rockKind.on('change', (v: string) => onRocks({ species: v }));
+    rockSeed.s.on('change', (v: number) => onRocks({ seed: Math.round(v) }));
+    rockSeed.dice.on('click', () => {
+        rocks = { ...rocks, seed: 1 + Math.floor(Math.random() * 9998) };
+        updateUI();
+    });
+    rockCount.on('change', (v: number) => onRocks({ count: Math.round(v) }));
+    rockSize.on('change', (v: number) => onRocks({ size: v }));
+    rockSizeVariation.on('change', (v: number) => onRocks({ sizeVariation: v }));
+    spread.on('change', (v: number) => onRocks({ spread: v }));
+    turn.on('change', (v: number) => onRocks({ turn: v }));
+    tilt.on('change', (v: number) => onRocks({ tilt: v }));
+    flatten.on('change', (v: number) => onRocks({ flatten: v }));
+    relief.on('change', (v: number) => onRocks({ roughness: v }));
+    detail.on('change', (v: number) => onRocks({ detail: Math.round(v) }));
+    sink.on('change', (v: number) => onRocks({ sink: v }));
+    tintVariation.on('change', (v: number) => onRocks({ tintVariation: v }));
+    rockTint.on('change', (v: number[]) => onRocks({ tint: rgb(v) }));
+
+    const makeRocks = async (params: RockParams) => {
+        const start = performance.now();
+        const result = await rocksGlb(params);
+        rockStatus.text = `${params.count} ${params.count === 1 ? 'rock' : 'rocks'}, ${Math.round(result.triangles).toLocaleString()} triangles, generated in ${((performance.now() - start) / 1000).toFixed(1)} s.`;
+        return result.glb;
+    };
+    const rockName = () => speciesNames.find(n => n.key === rocks.species)?.name.replace(/\s*\(.*\)$/, '') ?? 'Rock';
+
+    addRocks.on('click', () => busy('Rocks', async () => {
+        const focus = scene.camera.focalPoint;
+        // stand on the floor under the focus: the lowest visible mesh, else the focus
+        const floor = primitives().filter(p => p.entity.enabled && p.worldBound);
+        const y = floor.length ? Math.min(...floor.map(p => p.worldBound.getMin().y)) : focus.y;
+        await events.invoke('toolkit.addGeneratedModels', [{
+            glb: await makeRocks(rocks),
+            options: { name: rockName(), generator: { type: 'rocks', params: { ...rocks } }, unitScale: 1, anchor: [focus.x, y, focus.z], yaw: 0 }
+        }]);
+    }));
+    updateRocks.on('click', () => busy('Rocks', async () => {
+        const target = selectedGenerated('rocks');
+        if (!target) return;
+        await events.invoke('toolkit.addGeneratedModel', await makeRocks(rocks), {
+            name: rockName(),
+            generator: { type: 'rocks', params: { ...rocks } },
+            replace: target
+        });
+    }));
+    downloadRocks.on('click', () => busy('Rocks', async () => {
+        download(await makeRocks(rocks), `${rocks.species}_${rocks.seed}.glb`);
+    }));
+
+    // ---- placement brush
+
+    // footprint of one placed thing, for the spacing and the cursor ring
+    const footprint = () => {
+        if (kind === 'tree') return treeHeight * 0.35;
+        if (kind === 'grass') return Math.max(grass.width, grass.depth) * 0.5;
+        return rocks.count > 1 ? rocks.size * (rocks.spread + 0.5) : rocks.size * 0.5;
+    };
+    const defaultSpacing = () => Math.max(0.01, footprint() * 2);
+
+    // ---- tabs
+
+    tabButtons.forEach((b, k) => b.on('click', () => {
+        kind = k;
+        placeSpacing = defaultSpacing();
+        updateUI();
+    }));
+
+
+    spacing.on('change', (v: number) => {
+        if (!uiUpdating) placeSpacing = v;
+    });
+    scaleVariation.on('change', (v: number) => {
+        if (!uiUpdating) placeScaleVariation = v;
+    });
+
+    const parent = ctx.toolsContainer.dom;
+    // trees and grass are not something to place things onto
+    const raycaster = new MeshRaycaster(scene, events, p => !p.generator || p.generator.type === 'rocks');
+    const { probe, resample } = createSurfaceProbe(scene, raycaster);
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.classList.add('tool-svg', 'hidden');
+    svg.id = 'toolkit-plant-svg';
+    const ring = document.createElementNS(svg.namespaceURI, 'polygon') as SVGPolygonElement;
+    const strokeLine = document.createElementNS(svg.namespaceURI, 'polyline') as SVGPolylineElement;
+    const dot = document.createElementNS(svg.namespaceURI, 'circle') as SVGCircleElement;
+    dot.setAttribute('r', '4');
+    svg.appendChild(ring);
+    svg.appendChild(strokeLine);
+    svg.appendChild(dot);
+    parent.appendChild(svg);
+
+    let placing = false;
+    let ringAt: Vec3 | null = null;
+
+    const drawRing = () => {
+        if (!ringAt) {
+            ring.setAttribute('points', '');
+            return;
+        }
+        const width = scene.canvas.clientWidth;
+        const height = scene.canvas.clientHeight;
+        const radius = footprint();
+        const screen = new Vec3();
+        const world = new Vec3();
+        const camera = scene.camera.mainCamera;
+        const pts: string[] = [];
+        for (let i = 0; i < 40; ++i) {
+            const a = i / 40 * Math.PI * 2;
+            world.set(ringAt.x + Math.cos(a) * radius, ringAt.y, ringAt.z + Math.sin(a) * radius);
+            if (world.clone().sub(camera.getPosition()).dot(camera.forward) <= 0) {
+                ring.setAttribute('points', '');
+                return;
+            }
+            scene.camera.worldToScreen(world, screen);
+            pts.push(`${(screen.x * width).toFixed(1)},${(screen.y * height).toFixed(1)}`);
+        }
+        ring.setAttribute('points', pts.join(' '));
+    };
+    events.on('postrender', () => {
+        if (ringAt && ctx.toolManager.active === TOOL) drawRing();
+    });
+
+    let hoverAt: { x: number, y: number } | null = null;
+    let hovering = false;
+    const hover = async () => {
+        if (hovering || placing || !hoverAt) return;
+        hovering = true;
+        const at = hoverAt;
+        try {
+            const [hit] = await probe([at], false);
+            ringAt = hit ? hit.position.clone() : null;
+            drawRing();
+        } finally {
+            hovering = false;
+        }
+        if (hoverAt !== at) setTimeout(hover, 60);
+    };
+
+    const glbCache = new Map<string, Promise<ArrayBuffer>>();
+    const cached = (key: string, make: () => Promise<ArrayBuffer>) => {
+        if (!glbCache.has(key)) glbCache.set(key, make());
+        const result = glbCache.get(key);
+        result.catch(() => glbCache.delete(key));
+        return result;
+    };
+
+    // put the current kind at each point, one undo step
+    const placeAt = async (points: Vec3[]) => {
+        const items = [];
+        for (let i = 0; i < points.length; ++i) {
+            const p = points[i];
+            const seedOffset = varyShape.value ? Math.floor(Math.random() * 9000) + 1 : 0;
+            const factor = Math.max(0.1, 1 + (Math.random() * 2 - 1) * placeScaleVariation);
+            const yaw = randomTurn.value ? Math.random() * 360 : 0;
+            const anchor: [number, number, number] = [p.x, p.y, p.z];
+            placeStatus.text = `Generating ${i + 1} / ${points.length}…`;
+            if (kind === 'tree') {
+                const params = { ...tree, seed: (tree.seed + seedOffset) % 9999 || 1 };
+                const glb = await cached(`tree:${JSON.stringify(params)}`, async () => (await treeGlb(params)).glb);
+                items.push({ glb, options: { name: tree.preset, generator: { type: 'tree', params }, height: treeHeight * factor, anchor, yaw } });
+            } else if (kind === 'grass') {
+                const params = { ...grass, seed: (grass.seed + seedOffset) % 9999 || 1 };
+                const glb = await cached(`grass:${JSON.stringify(params)}`, async () => (await grassGlb(params)).glb);
+                items.push({ glb, options: { name: 'Grass', generator: { type: 'grass', params }, longest: Math.max(grass.width, grass.depth) * factor, anchor, yaw } });
+            } else {
+                const params = { ...rocks, seed: (rocks.seed + seedOffset) % 9999 || 1 };
+                const glb = await cached(`rocks:${JSON.stringify(params)}`, () => rocksGlb(params).then(r => r.glb));
+                items.push({ glb, options: { name: rockName(), generator: { type: 'rocks', params }, unitScale: factor, anchor, yaw } });
+            }
+        }
+        if (!items.length) return 0;
+        placeStatus.text = 'Adding…';
+        await events.invoke('toolkit.addGeneratedModels', items);
+        return items.length;
+    };
+
+    const placeStroke = async (stroke: { x: number, y: number }[]) => {
+        if (placing || !stroke.length) return 0;
+        placing = true;
+        events.fire('startSpinner');
+        try {
+            const samples = resample(stroke);
+            const hits = await probe(samples, false);
+            // points along the stroke, `spacing` apart on the surface
+            const points: Vec3[] = [];
+            let last: Vec3 | null = null;
+            hits.forEach((hit) => {
+                if (!hit || points.length >= MAX_PER_STROKE) return;
+                if (!last || hit.position.distance(last) >= placeSpacing) {
+                    points.push(hit.position.clone());
+                    last = hit.position;
+                }
+            });
+            if (!points.length) {
+                placeStatus.text = 'Nothing under the cursor to place onto.';
+                return 0;
+            }
+            const n = await placeAt(points);
+            const what = kind === 'tree' ? 'tree' : kind === 'grass' ? 'grass patch' : (rocks.count > 1 ? 'rock group' : 'rock');
+            placeStatus.text = `Placed ${n} ${what}${n === 1 ? '' : (what.endsWith('ch') ? 'es' : 's')}. Ctrl+Z takes the stroke back.`;
+            return n;
+        } catch (error) {
+            placeStatus.text = '';
+            await events.invoke('showPopup', { type: 'error', header: 'Place', message: (error as Error).message ?? String(error) });
+            return 0;
+        } finally {
+            events.fire('stopSpinner');
+            placing = false;
+        }
+    };
+
+    let dragId: number | undefined;
+    let stroke: { x: number, y: number }[] = [];
+    const drawStroke = () => strokeLine.setAttribute('points', stroke.map(p => `${p.x},${p.y}`).join(' '));
+
+    const pointerdown = (e: PointerEvent) => {
+        if (dragId !== undefined || e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (placing) return;
+        dragId = e.pointerId;
+        parent.setPointerCapture(dragId);
+        stroke = [{ x: e.offsetX, y: e.offsetY }];
+        drawStroke();
+    };
+    const pointermove = (e: PointerEvent) => {
+        dot.setAttribute('cx', `${e.offsetX}`);
+        dot.setAttribute('cy', `${e.offsetY}`);
+        hoverAt = { x: e.offsetX, y: e.offsetY };
+        hover();
+        if (dragId === undefined) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const lastPoint = stroke[stroke.length - 1];
+        if (Math.hypot(e.offsetX - lastPoint.x, e.offsetY - lastPoint.y) >= 3) {
+            stroke.push({ x: e.offsetX, y: e.offsetY });
+            drawStroke();
+        }
+    };
+    const endDrag = () => {
+        if (dragId !== undefined && parent.hasPointerCapture(dragId)) parent.releasePointerCapture(dragId);
+        dragId = undefined;
+        strokeLine.setAttribute('points', '');
+    };
+    const pointerup = (e: PointerEvent) => {
+        if (e.pointerId !== dragId) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const finished = stroke;
+        endDrag();
+        placeStroke(finished);
+    };
+    const pointercancel = (e: PointerEvent) => {
+        if (e.pointerId === dragId) endDrag();
+    };
+    const pointerleave = () => {
+        hoverAt = null;
+        ringAt = null;
+        drawRing();
+    };
+
+    ctx.toolManager.register(TOOL, {
+        activate: () => {
+            svg.classList.remove('hidden');
+            parent.style.display = 'block';
+            parent.addEventListener('pointerdown', pointerdown);
+            parent.addEventListener('pointermove', pointermove);
+            parent.addEventListener('pointerup', pointerup);
+            parent.addEventListener('pointercancel', pointercancel);
+            parent.addEventListener('pointerleave', pointerleave);
+        },
+        deactivate: () => {
+            endDrag();
+            ringAt = null;
+            drawRing();
+            svg.classList.add('hidden');
+            parent.style.display = 'none';
+            parent.removeEventListener('pointerdown', pointerdown);
+            parent.removeEventListener('pointermove', pointermove);
+            parent.removeEventListener('pointerup', pointerup);
+            parent.removeEventListener('pointercancel', pointercancel);
+            parent.removeEventListener('pointerleave', pointerleave);
+        }
+    });
+    events.on('tool.activated', (name: string | null) => {
+        placeButton.class[name === TOOL ? 'add' : 'remove']('active');
+        placeButton.text = name === TOOL ? 'Placing - click or drag on the scene' : 'Place by clicking';
+    });
+    placeButton.on('click', () => {
+        if (ctx.toolManager.active === TOOL) ctx.toolManager.activate(null);
+        else events.fire(`tool.${TOOL}`);
+    });
+
+    events.function('toolkit.vegetation.kind', (k: Kind) => {
+        kind = k;
+        placeSpacing = defaultSpacing();
+        updateUI();
+    });
+    events.function('toolkit.vegetation.place', placeStroke);
+    events.function('toolkit.vegetation.rocks', (change: Partial<RockParams>) => {
+        rocks = { ...rocks, ...change };
+        updateUI();
+    });
+    events.function('toolkit.vegetation.placement', (change: { spacing?: number, scaleVariation?: number }) => {
+        if (change.spacing !== undefined) placeSpacing = change.spacing;
+        if (change.scaleVariation !== undefined) placeScaleVariation = change.scaleVariation;
+        updateUI();
+    });
+
     // sizes follow the scene when the panel opens on a new scene
     let sizedFor = -1;
     events.on('toolkit.panel.vegetation.visible', (visible: boolean) => {
@@ -429,6 +874,8 @@ const init = (ctx: ToolkitContext) => {
             sizedFor = size;
             treeHeight = size * 0.9;
             grass = { ...defaultGrass(size), seed: grass.seed, direct: grass.direct };
+            rocks = { ...rocks, size: Math.max(0.01, size * 0.12) };
+            placeSpacing = defaultSpacing();
         }
         updateUI();
     });
