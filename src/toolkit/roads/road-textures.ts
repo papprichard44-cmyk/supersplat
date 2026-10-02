@@ -101,6 +101,7 @@ const dirt = (x: number, y: number, look: Look, out: number[]) => {
     const n = fbm(x, y, 4, 5, look.seed);
     mix(dark, light, 0.5 + (n - 0.5) * (0.6 + 1.6 * look.colorVariation), out);
     scale(out, 0.9 + 0.2 * noise(x * 160, y * 160, 160, look.seed + 3));
+    out[3] = 0.2 + 0.4 * n + 0.08 * noise(x * 90, y * 90, 90, look.seed + 4);
     // pebbles: a few per cell of a 22-cell grid
     const cells = 22;
     const cx = Math.floor(x * cells);
@@ -122,6 +123,7 @@ const dirt = (x: number, y: number, look: Look, out: number[]) => {
                 out[0] = 0.55 * tone * lit;
                 out[1] = 0.5 * tone * lit;
                 out[2] = 0.44 * tone * lit;
+                out[3] = Math.max(out[3], 0.5 + 0.5 * Math.sqrt(1 - d * d));
                 if (d > 0.82) scale(out, 0.7);
             }
         }
@@ -171,6 +173,7 @@ const cobble = (x: number, y: number, look: Look, out: number[]) => {
             out[1] = 0.19 * k;
             out[2] = 0.17 * k;
         }
+        out[3] = 0.04 + 0.1 * edge / joint;
         return;
     }
     const base = stonePalette[Math.floor(hash(id, 1, look.seed + 24) * stonePalette.length)];
@@ -180,6 +183,8 @@ const cobble = (x: number, y: number, look: Look, out: number[]) => {
     out[2] = base[2] * v;
     // domed: darker toward the joints, lit from the top left
     const dome = 0.72 + 0.32 * smoothstep(joint, 0.32, edge);
+    // rounded tops, some setts sitting higher than others
+    out[3] = 0.25 + 0.6 * Math.sqrt(smoothstep(joint, 0.34, edge)) + 0.15 * hash(id, 7, look.seed + 27) + 0.04 * (noise(x * 150, y * 150, 150, look.seed + 28) - 0.5);
     const lit = 1 + 0.12 * (-ox - oy);
     scale(out, dome * lit * (0.92 + 0.16 * noise(x * 220, y * 220, 220, look.seed + 26)));
     applyWear(x, y, look, out, [0.5, 0.45, 0.38]);
@@ -227,6 +232,7 @@ const pavers = (x: number, y: number, look: Look, out: number[]) => {
             out[1] = 0.38;
             out[2] = 0.34;
         }
+        out[3] = 0.1;
         return;
     }
     const v = 1 + (hash(id, 3, look.seed + 31) - 0.5) * 0.3 * look.colorVariation;
@@ -234,6 +240,7 @@ const pavers = (x: number, y: number, look: Look, out: number[]) => {
     out[0] = (0.55 + warm) * v;
     out[1] = 0.55 * v;
     out[2] = (0.54 - warm) * v;
+    out[3] = 0.72 + 0.22 * smoothstep(joint, joint * 3, edge) - 0.06 * hash(id, 6, look.seed + 34);
     // a chamfer at the edges, and the speckle of the aggregate
     scale(out, (0.8 + 0.2 * smoothstep(joint, joint * 3, edge)) * (0.94 + 0.12 * noise(x * 300, y * 300, 300, look.seed + 33)));
     applyWear(x, y, look, out, [0.48, 0.45, 0.4]);
@@ -247,26 +254,37 @@ const concrete = (x: number, y: number, look: Look, out: number[], joints = true
     out[2] = 0.64 * v;
     // broomed: fine streaks across the walk
     scale(out, 0.96 + 0.08 * noise(x * 12, y * 260, 12, look.seed + 42) + 0.04 * noise(x * 300, y * 300, 300, look.seed + 43));
+    out[3] = 0.7 + 0.08 * (n - 0.5);
     if (joints) {
         const e = Math.min(y, 1 - y);
-        if (e < 0.004) scale(out, 0.45);
-        else if (e < 0.014) scale(out, 0.92);
+        if (e < 0.004) {
+            scale(out, 0.45);
+            out[3] = 0.1;
+        } else if (e < 0.014) {
+            scale(out, 0.92);
+            out[3] -= 0.12 * (1 - (e - 0.004) / 0.01);
+        }
     }
     applyWear(x, y, look, out, [0.5, 0.48, 0.44]);
 };
 
-const mainColor: Record<RoadStyle, (x: number, y: number, look: Look, out: number[]) => void> = { dirt, cobble, pavers, concrete };
+const mainColor: Record<Exclude<RoadStyle, 'custom'>, (x: number, y: number, look: Look, out: number[]) => void> = { dirt, cobble, pavers, concrete };
 
 // ---- textures
 
 type Pixels = { width: number, height: number, data: Uint8ClampedArray };
 
+// colour (and alpha) per pixel; out[3] is the height (0 deep .. 1 high),
+// kept in `heights`
 const render = (width: number, height: number, fn: (x: number, y: number, out: number[]) => number) => {
     const data = new Uint8ClampedArray(width * height * 4);
-    const c = [0, 0, 0];
+    const heights = new Float32Array(width * height);
+    const c = [0, 0, 0, 0.5];
     for (let j = 0; j < height; ++j) {
         for (let i = 0; i < width; ++i) {
+            c[3] = 0.5;
             const alpha = fn((i + 0.5) / width, (j + 0.5) / height, c);
+            heights[j * width + i] = c[3];
             const o = (j * width + i) * 4;
             data[o] = c[0] * 255;
             data[o + 1] = c[1] * 255;
@@ -274,7 +292,7 @@ const render = (width: number, height: number, fn: (x: number, y: number, out: n
             data[o + 3] = alpha * 255;
         }
     }
-    return { width, height, data };
+    return { width, height, data, heights };
 };
 
 const toCanvas = (p: Pixels) => {
@@ -292,8 +310,101 @@ const toPng = async (p: Pixels): Promise<Uint8Array> => {
     return new Uint8Array(await blob.arrayBuffer());
 };
 
+// ---- a picture of the user's own: made seamless, and a height map from it
+
+const loadPicture = async (url: string, size: number) => {
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext('2d');
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(image, 0, 0, size, size);
+    return context.getImageData(0, 0, size, size).data;
+};
+
+// blend the edges with the picture shifted by half a tile: the edges then
+// continue into each other and the tile repeats without seams
+const makeSeamless = (rgba: Uint8ClampedArray, size: number) => {
+    const out = new Uint8ClampedArray(rgba.length);
+    const half = size >> 1;
+    for (let y = 0; y < size; ++y) {
+        for (let x = 0; x < size; ++x) {
+            const fx = Math.abs((x + 0.5) / size - 0.5);
+            const fy = Math.abs((y + 0.5) / size - 0.5);
+            const m = smoothstep(0.3, 0.5, Math.max(fx, fy));
+            const o = (y * size + x) * 4;
+            const q = (((y + half) % size) * size + (x + half) % size) * 4;
+            for (let c = 0; c < 4; ++c) out[o + c] = rgba[o + c] * (1 - m) + rgba[q + c] * m;
+        }
+    }
+    return out;
+};
+
+// box blur that wraps around the tile (two passes per direction, near gaussian)
+const blurWrap = (src: Float32Array, size: number, radius: number) => {
+    const r = Math.max(1, Math.round(radius));
+    let a = Float32Array.from(src);
+    let b = new Float32Array(src.length);
+    const norm = 1 / (2 * r + 1);
+    for (let pass = 0; pass < 4; ++pass) {
+        const horizontal = pass % 2 === 0;
+        for (let line = 0; line < size; ++line) {
+            const at = (i: number) => {
+                const w = ((i % size) + size) % size;
+                return horizontal ? line * size + w : w * size + line;
+            };
+            let sum = 0;
+            for (let i = -r; i <= r; ++i) sum += a[at(i)];
+            for (let i = 0; i < size; ++i) {
+                b[at(i)] = sum * norm;
+                sum += a[at(i + r + 1)] - a[at(i - r)];
+            }
+        }
+        [a, b] = [b, a];
+    }
+    return a;
+};
+
+// height from brightness, as material tools do it: fine detail of the
+// luminance against its blurred surroundings (so a darker region doesn't
+// sink as a whole), normalised. Dark joints come out low, bright stone tops
+// high; `detail` 0 picks up fine grain, 1 whole stones.
+const heightFromPicture = (rgba: Uint8ClampedArray, size: number, detail: number, invert: boolean) => {
+    const lum = new Float32Array(size * size);
+    for (let i = 0; i < lum.length; ++i) {
+        lum[i] = (0.2126 * rgba[i * 4] + 0.7152 * rgba[i * 4 + 1] + 0.0722 * rgba[i * 4 + 2]) / 255;
+    }
+    const fine = blurWrap(lum, size, 1 + detail * 3);
+    const coarse = blurWrap(lum, size, 4 + detail * size * 0.12);
+    let mean = 0;
+    for (let i = 0; i < lum.length; ++i) mean += fine[i] - coarse[i];
+    mean /= lum.length;
+    let variance = 0;
+    for (let i = 0; i < lum.length; ++i) variance += (fine[i] - coarse[i] - mean) ** 2;
+    const std = Math.sqrt(variance / lum.length) || 1;
+    const h = new Float32Array(lum.length);
+    for (let i = 0; i < lum.length; ++i) {
+        const v = Math.min(1, Math.max(0, 0.5 + (fine[i] - coarse[i] - mean) / (4 * std)));
+        h[i] = invert ? 1 - v : v;
+    }
+    return h;
+};
+
+// a quick hash of a long string (a picture's data url), for the cache key
+const textHash = (text: string) => {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i += 7) h = Math.imul(h ^ text.charCodeAt(i), 16777619);
+    return `${text.length}:${h >>> 0}`;
+};
+
 type RoadTextures = {
     main: Uint8Array;
+    // the main texture's height map (SIZE x SIZE, 0 deep .. 1 high)
+    height: Float32Array;
+    heightSize: number;
     // the edge strip: ragged dirt rim (with alpha) or the border row
     strip: Uint8Array | null;
     stripAlpha: boolean;
@@ -316,15 +427,45 @@ const cache = new Map<string, Promise<RoadTextures>>();
 const roadTextures = (p: RoadParams): Promise<RoadTextures> => {
     const look = lookOf(p);
     const hasStrip = p.style === 'dirt' ? p.edge > 0 : (p.style === 'cobble' || p.style === 'pavers') && p.edge > 0;
-    const key = JSON.stringify([p.style, look, hasStrip, p.curb > 0]);
+    const custom = p.style === 'custom' ? [p.customTexture ? textHash(p.customTexture) : '', p.seamless, p.reliefDetail, p.reliefInvert, p.relief] : null;
+    const key = JSON.stringify([p.style, look, hasStrip, p.curb > 0, custom]);
     let result = cache.get(key);
     if (!result) {
         result = (async () => {
-            const fn = mainColor[p.style];
-            const main = await toPng(render(SIZE, SIZE, tinted(look, (x, y, out) => {
-                fn(x, y, look, out);
-                return 1;
-            })));
+            let main: Uint8Array;
+            let height: Float32Array;
+            if (p.style === 'custom') {
+                let rgba: Uint8ClampedArray;
+                if (p.customTexture) {
+                    rgba = await loadPicture(p.customTexture, SIZE);
+                    if (p.seamless) rgba = makeSeamless(rgba, SIZE);
+                } else {
+                    // no picture yet: plain grey
+                    rgba = new Uint8ClampedArray(SIZE * SIZE * 4).fill(150);
+                }
+                height = heightFromPicture(rgba, SIZE, p.reliefDetail, p.reliefInvert);
+                // a little cavity shading: the deep parts darker, the tops
+                // lighter, so it reads as relief even without lights
+                const shade = 0.25 + 0.5 * p.relief;
+                const data = new Uint8ClampedArray(rgba.length);
+                for (let i = 0; i < height.length; ++i) {
+                    const k = 1 + shade * (height[i] - 0.5);
+                    data[i * 4] = rgba[i * 4] * k * look.tint[0];
+                    data[i * 4 + 1] = rgba[i * 4 + 1] * k * look.tint[1];
+                    data[i * 4 + 2] = rgba[i * 4 + 2] * k * look.tint[2];
+                    data[i * 4 + 3] = 255;
+                }
+                main = await toPng({ width: SIZE, height: SIZE, data });
+            } else {
+                const fn = mainColor[p.style];
+                const rendered = render(SIZE, SIZE, tinted(look, (x, y, out) => {
+                    fn(x, y, look, out);
+                    return 1;
+                }));
+                main = await toPng(rendered);
+                // smooth the procedural heights a touch: no stair steps
+                height = blurWrap(rendered.heights, SIZE, 1);
+            }
 
             let strip: Uint8Array | null = null;
             if (hasStrip && p.style === 'dirt') {
@@ -371,7 +512,7 @@ const roadTextures = (p: RoadParams): Promise<RoadTextures> => {
                 return 1;
             }))) : null;
 
-            return { main, strip, stripAlpha: p.style === 'dirt', curb };
+            return { main, height, heightSize: SIZE, strip, stripAlpha: p.style === 'dirt', curb };
         })();
         cache.set(key, result);
         result.catch(() => cache.delete(key));
@@ -390,7 +531,13 @@ const stylePreview = (style: RoadStyle, size = 56): string => {
         const look: Look = { tint: [1, 1, 1], colorVariation: 0.5, wear: 0.3, moss: style === 'cobble' ? 0.25 : 0, seed: 1, pattern: 'running' };
         // a quarter tile: big enough to read the pattern
         url = toCanvas(render(size, size, (x, y, out) => {
-            mainColor[style](x * 0.5, y * 0.5, look, out);
+            if (style === 'custom') {
+                // a placeholder: an "add a picture" grid
+                const line = Math.min(x % 0.25, y % 0.25) < 0.03;
+                out[0] = out[1] = out[2] = line ? 0.55 : 0.32;
+            } else {
+                mainColor[style](x * 0.5, y * 0.5, look, out);
+            }
             return 1;
         })).toDataURL();
         previewCache.set(key, url);

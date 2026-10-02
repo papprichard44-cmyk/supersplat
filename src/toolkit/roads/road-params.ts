@@ -4,7 +4,7 @@
 
 type Rgb = [number, number, number];
 
-type RoadStyle = 'dirt' | 'cobble' | 'pavers' | 'concrete';
+type RoadStyle = 'dirt' | 'cobble' | 'pavers' | 'concrete' | 'custom';
 type PaverPattern = 'running' | 'basket' | 'slabs';
 
 type RoadParams = {
@@ -25,6 +25,15 @@ type RoadParams = {
     followGround: boolean;
     lift: number;               // above the ground, world units
     seed: number;
+    // relief: the surface displaced by the texture's height map, 0 = flat
+    relief: number;
+    // custom texture: the picture (a data url, at most 1024 px), its height
+    // map's scale (0 fine .. 1 coarse), dark = high instead of low, and
+    // whether its edges are blended so it tiles without seams
+    customTexture?: string;
+    reliefDetail: number;
+    reliefInvert: boolean;
+    seamless: boolean;
     // ground heights found under the road (x z y, road space), so a rebuild
     // off screen still follows the ground
     ground?: number[];
@@ -77,8 +86,20 @@ const styles: Record<RoadStyle, StyleInfo> = {
         edge: 0,
         curb: 0.06,
         roughness: 0.85
+    },
+    custom: {
+        name: 'Custom texture',
+        hint: 'Your own picture, tiled along the road. Relief lifts its bright parts and sinks the dark ones (the joints), so it is not flat.',
+        patternLabel: 'Texture size',
+        patternSize: 1,
+        edge: 0,
+        curb: 0,
+        roughness: 0.85
     }
 };
+
+// relief by default: enough to catch the light, not enough to notice as geometry
+const defaultRelief: Record<RoadStyle, number> = { dirt: 0.35, cobble: 0.4, pavers: 0.3, concrete: 0.15, custom: 0.35 };
 
 const defaultRoad = (width: number, style: RoadStyle = 'cobble'): RoadParams => ({
     id: '',
@@ -95,7 +116,11 @@ const defaultRoad = (width: number, style: RoadStyle = 'cobble'): RoadParams => 
     curb: styles[style].curb * width,
     followGround: true,
     lift: width * 0.008,
-    seed: 1
+    seed: 1,
+    relief: defaultRelief[style],
+    reliefDetail: 0.4,
+    reliefInvert: false,
+    seamless: true
 });
 
-export { RoadParams, RoadStyle, PaverPattern, StyleInfo, styles, defaultRoad, Rgb };
+export { RoadParams, RoadStyle, PaverPattern, StyleInfo, styles, defaultRoad, defaultRelief, Rgb };

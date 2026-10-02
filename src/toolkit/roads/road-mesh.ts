@@ -311,29 +311,80 @@ const buildRoad = async (p: RoadParams, sampleGround?: GroundSampler): Promise<R
     const roughness = p.style === 'dirt' ? 0.95 : p.style === 'concrete' ? 0.85 : 0.8;
 
     // ---- the surface
-    const main = new Builder();
-    const mainCols = p.style === 'dirt' ? cols + 1 : 5;
+    // relief: the height map lifts the surface, joints at the base, tops up
+    const reliefDepth = p.relief > 0 ? p.relief * T * 0.045 : 0;
+    const hSize = textures.heightSize;
+    const hMap = textures.height;
+    const heightAt = (u: number, v: number) => {
+        const x = (((u % 1) + 1) % 1) * hSize - 0.5;
+        const y = (((v % 1) + 1) % 1) * hSize - 0.5;
+        const x0 = Math.floor(x);
+        const y0 = Math.floor(y);
+        const fx = x - x0;
+        const fy = y - y0;
+        const w = (i: number) => ((i % hSize) + hSize) % hSize;
+        const at = (i: number, j: number) => hMap[w(j) * hSize + w(i)];
+        return (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+    };
+
+    // rows along the road: the sections themselves, or a finer grid when the
+    // surface carries relief (vertices close enough to show the stones)
+    const total = cl.s[n - 1];
     const inner0 = -half + bw;
     const inner1 = half - bw;
-    for (let i = 0; i < n; ++i) {
+    let rows = n;
+    let mainCols = p.style === 'dirt' ? cols + 1 : 5;
+    if (reliefDepth > 0) {
+        // a custom picture's features are of unknown size: a finer grid
+        const spacing = Math.max(T / (p.style === 'custom' ? 80 : 40), Math.sqrt(total * (inner1 - inner0) / 250000));
+        rows = Math.max(2, Math.ceil(total / spacing) + 1);
+        mainCols = Math.max(2, Math.ceil((inner1 - inner0) / spacing) + 1);
+    }
+    // a row's frame, between sections
+    const frame = (r: number) => {
+        const f = rows === n ? r : r / (rows - 1) * (n - 1);
+        const i0 = Math.min(n - 1, Math.floor(f));
+        const i1 = Math.min(n - 1, i0 + 1);
+        const t = f - i0;
+        let rx = cl.rx[i0] + (cl.rx[i1] - cl.rx[i0]) * t;
+        let rz = cl.rz[i0] + (cl.rz[i1] - cl.rz[i0]) * t;
+        const l = Math.hypot(rx, rz) || 1;
+        rx /= l;
+        rz /= l;
+        return {
+            x: cl.x[i0] + (cl.x[i1] - cl.x[i0]) * t,
+            z: cl.z[i0] + (cl.z[i1] - cl.z[i0]) * t,
+            s: cl.s[i0] + (cl.s[i1] - cl.s[i0]) * t,
+            rx,
+            rz,
+            y: (o: number) => surfaceY(i0, o) + (surfaceY(i1, o) - surfaceY(i0, o)) * t
+        };
+    };
+    const reliefY = (o: number, s: number) => (reliefDepth > 0 ? heightAt(o / T, s / T) * reliefDepth : 0);
+
+    const main = new Builder();
+    for (let r = 0; r < rows; ++r) {
+        const fr = frame(r);
         for (let k = 0; k < mainCols; ++k) {
             const o = inner0 + (inner1 - inner0) * k / (mainCols - 1);
-            main.vertex(cl.x[i] + cl.rx[i] * o, surfaceY(i, o), cl.z[i] + cl.rz[i] * o, o / T, cl.s[i] / T);
+            main.vertex(fr.x + fr.rx * o, fr.y(o) + reliefY(o, fr.s), fr.z + fr.rz * o, o / T, fr.s / T);
         }
     }
-    main.grid(0, n, mainCols);
-    // skirts down the sides (under a curb or rim they don't show)
+    main.grid(0, rows, mainCols);
+    // skirts down the sides (under a curb or rim they don't show); with a
+    // border row they hang from the border stones instead
     if (rim <= 0) {
         [-half, half].forEach((o, side) => {
             const start = main.positions.length / 3;
-            for (let i = 0; i < n; ++i) {
-                const y = surfaceY(i, o);
-                const x = cl.x[i] + cl.rx[i] * o;
-                const z = cl.z[i] + cl.rz[i] * o;
-                main.vertex(x, y, z, o / T, cl.s[i] / T);
-                main.vertex(x, y - depth, z, o / T + depth / T, cl.s[i] / T);
+            for (let r = 0; r < rows; ++r) {
+                const fr = frame(r);
+                const y = fr.y(o) + (bw > 0 ? reliefDepth * 0.75 : reliefY(o, fr.s));
+                const x = fr.x + fr.rx * o;
+                const z = fr.z + fr.rz * o;
+                main.vertex(x, y, z, o / T, fr.s / T);
+                main.vertex(x, y - depth - reliefDepth, z, o / T + depth / T, fr.s / T);
             }
-            main.grid(start, n, 2, side === 0);
+            main.grid(start, rows, 2, side === 0);
         });
     }
     const mainMesh = main.mesh('road', {
@@ -354,7 +405,7 @@ const buildRoad = async (p: RoadParams, sampleGround?: GroundSampler): Promise<R
                     const o = k === 0 ? a : b;
                     // u 0 at the outside, 1 inside
                     const u = side === 0 ? k : 1 - k;
-                    border.vertex(cl.x[i] + cl.rx[i] * o, surfaceY(i, o), cl.z[i] + cl.rz[i] * o, u, cl.s[i] / T);
+                    border.vertex(cl.x[i] + cl.rx[i] * o, surfaceY(i, o) + reliefDepth * 0.75, cl.z[i] + cl.rz[i] * o, u, cl.s[i] / T);
                 }
             }
             border.grid(start, n, 2);
@@ -378,7 +429,7 @@ const buildRoad = async (p: RoadParams, sampleGround?: GroundSampler): Promise<R
             const edgeO = side * half;
             const outO = side * (half + rim);
             for (let i = 0; i < n; ++i) {
-                const yIn = surfaceY(i, edgeO);
+                const yIn = surfaceY(i, edgeO) + reliefDepth * 0.4;
                 const yOut = (side < 0 ? groundL[i] : groundR[i]) + p.lift * 0.4;
                 for (let k = 0; k < 3; ++k) {
                     const t = k / 2;

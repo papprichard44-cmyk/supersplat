@@ -2,7 +2,7 @@ import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, Slide
 import { Mat4, Vec3 } from 'playcanvas';
 
 import { buildRoad, centerline, Centerline, Point } from './road-mesh';
-import { defaultRoad, PaverPattern, RoadParams, RoadStyle, styles } from './road-params';
+import { defaultRelief, defaultRoad, PaverPattern, RoadParams, RoadStyle, styles } from './road-params';
 import { stylePreview } from './road-textures';
 import { ElementType } from '../../element';
 import roadSvg from '../icons/road.svg';
@@ -47,6 +47,11 @@ const tips = {
     moss: 'Moss and weeds in the joints.',
     seed: 'Another random variation of the same road.',
     dice: 'A random seed',
+    loadTexture: 'Load your own road texture (a .jpg, .png or .webp, ideally seen from straight above). It is tiled along the road.',
+    seamless: 'Blend the picture\'s edges so it repeats without visible seams. Off for pictures that already tile.',
+    relief: 'Depth: the surface is lifted by the texture\'s height (stones up, joints down), so it catches the light like a real surface. 0 = flat.',
+    reliefDetail: 'What the relief follows: fine grain (low) or whole stones and slabs (high).',
+    reliefInvert: 'Turn the relief over: for pictures whose joints are lighter than the stones.',
     toSplats: 'Turn the road into splats (with the studio lighting if there are lights). The mesh is kept, hidden.',
     download: 'Save the road as a .glb file.'
 };
@@ -54,6 +59,11 @@ const tips = {
 const patternTexts: Record<PaverPattern, string> = { running: 'Running bond', basket: 'Basket weave', slabs: 'Large slabs' };
 
 const clone = (p: RoadParams): RoadParams => JSON.parse(JSON.stringify(p));
+
+// roads made before relief existed stay flat
+const withDefaults = (p: RoadParams): RoadParams => ({ ...p, relief: p.relief ?? 0, reliefDetail: p.reliefDetail ?? 0.4, reliefInvert: p.reliefInvert ?? false, seamless: p.seamless ?? true });
+
+const MAX_PICTURE = 1024;
 const newId = () => `r${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
 
 const init = (ctx: ToolkitContext) => {
@@ -142,11 +152,13 @@ const init = (ctx: ToolkitContext) => {
     // style tiles
     const styleRow = new Container({ class: 'toolkit-road-styles' });
     const styleTiles = new Map<RoadStyle, Container>();
+    const swatches = new Map<RoadStyle, HTMLImageElement>();
     (Object.keys(styles) as RoadStyle[]).forEach((style) => {
         const tile = new Container({ class: 'toolkit-road-style' });
         const swatch = document.createElement('img');
         swatch.className = 'toolkit-road-swatch';
         swatch.src = stylePreview(style);
+        swatches.set(style, swatch);
         tile.dom.appendChild(swatch);
         tile.append(new Label({ text: styles[style].name, class: 'toolkit-road-style-name' }));
         tooltips.register(tile, `${styles[style].name}: ${styles[style].hint}`, 'bottom');
@@ -157,6 +169,20 @@ const init = (ctx: ToolkitContext) => {
     body.append(styleRow);
     const styleHint = new Label({ text: '', class: 'toolkit-hint' });
     body.append(styleHint);
+
+    // the custom texture
+    const customBox = new Container();
+    body.append(customBox);
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.jpg,.jpeg,.png,.webp,image/*';
+    fileInput.style.display = 'none';
+    panel.dom.appendChild(fileInput);
+    const loadRow = new Container({ class: 'toolkit-row' });
+    const loadButton = new Button({ text: 'Load texture…', class: 'toolkit-button' });
+    loadRow.append(loadButton);
+    tooltips.register(loadButton, tips.loadTexture, 'bottom');
+    customBox.append(loadRow);
 
     // path
     const pathRow = new Container({ class: 'toolkit-row' });
@@ -181,6 +207,18 @@ const init = (ctx: ToolkitContext) => {
     const border = toggle('Border stones', tips.border);
     const curb = toggle('Curb', tips.curb);
     const curbSize = logSlider('Curb height', tips.curbHeight, 0.002, 0.5);
+
+    // the custom texture's own switch
+    target = customBox;
+    const seamless = toggle('Seamless', tips.seamless);
+
+    // relief
+    const reliefGroup = collapsible('Relief', 'road.relief', true);
+    body.append(reliefGroup.root);
+    target = reliefGroup.body;
+    const relief = slider('Depth', tips.relief, 0, 1, 2);
+    const reliefDetail = slider('Follows', tips.reliefDetail, 0, 1, 2);
+    const reliefInvert = toggle('Invert', tips.reliefInvert);
 
     // look
     const look = collapsible('Look', 'road.look', true);
@@ -266,12 +304,24 @@ const init = (ctx: ToolkitContext) => {
         wear.input.value = params.wear;
         moss.input.value = params.moss;
         seed.value = params.seed;
+        seamless.input.value = params.seamless;
+        relief.input.value = params.relief;
+        reliefDetail.input.value = params.reliefDetail;
+        reliefInvert.input.value = params.reliefInvert;
+        customBox.hidden = params.style !== 'custom';
+        reliefDetail.row.hidden = params.style !== 'custom';
+        reliefInvert.row.hidden = params.style !== 'custom';
+        reliefGroup.extra.dom.textContent = params.relief > 0 ? `${Math.round(params.relief * 100)}%` : 'flat';
+        if (params.customTexture) swatches.get('custom').src = params.customTexture;
+        loadButton.text = params.customTexture ? 'Change texture…' : 'Load texture…';
         rim.row.hidden = params.style !== 'dirt';
         border.row.hidden = params.style !== 'cobble' && params.style !== 'pavers';
         curb.row.hidden = params.style === 'dirt';
         curbSize.row.hidden = params.style === 'dirt' || params.curb <= 0;
         patternRow.row.hidden = params.style !== 'pavers';
         moss.row.hidden = params.style !== 'cobble' && params.style !== 'pavers';
+        // the custom picture brings its own colours
+        wear.row.hidden = colorVariation.row.hidden = seedRow.row.hidden = params.style === 'custom';
         shape.extra.dom.textContent = `${Number(params.width.toPrecision(3))} wide`;
         look.extra.dom.textContent = info.name;
         uiUpdating = false;
@@ -375,7 +425,12 @@ const init = (ctx: ToolkitContext) => {
 
     function setStyle(style: RoadStyle) {
         const info = styles[style];
+        if (style === 'custom' && !params.customTexture) {
+            fileInput.click();
+            return;
+        }
         changed({
+            relief: defaultRelief[style],
             style,
             patternSize: info.patternSize * params.width,
             edge: info.edge,
@@ -403,6 +458,43 @@ const init = (ctx: ToolkitContext) => {
     moss.input.on('change', (v: number) => changed({ moss: v }));
     seed.on('change', (v: number) => changed({ seed: Math.round(v) }));
     dice.on('click', () => changed({ seed: 1 + Math.floor(Math.random() * 998) }));
+    seamless.input.on('change', (v: boolean) => changed({ seamless: v }));
+    relief.input.on('change', (v: number) => changed({ relief: v }));
+    reliefDetail.input.on('change', (v: number) => changed({ reliefDetail: v }));
+    reliefInvert.input.on('change', (v: boolean) => changed({ reliefInvert: v }));
+
+    // a picture of the user's: at most 1024 px, kept with the road as a jpeg
+    const usePicture = async (file: File) => {
+        const bitmap = await createImageBitmap(file);
+        const k = Math.min(1, MAX_PICTURE / Math.max(bitmap.width, bitmap.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(bitmap.width * k));
+        canvas.height = Math.max(1, Math.round(bitmap.height * k));
+        const context = canvas.getContext('2d');
+        context.imageSmoothingQuality = 'high';
+        context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+        const url = canvas.toDataURL('image/jpeg', 0.9);
+        const first = params.style !== 'custom';
+        changed({
+            style: 'custom',
+            customTexture: url,
+            // one tile of the picture as wide as the road, to start with
+            ...(first ? { patternSize: params.width, relief: defaultRelief.custom, edge: 0, curb: 0, moss: 0 } : {})
+        });
+    };
+    loadButton.on('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        try {
+            await usePicture(file);
+        } catch (error) {
+            await events.invoke('showPopup', { type: 'error', header: 'Road texture', message: (error as Error).message ?? String(error) });
+        }
+    });
+    events.function('toolkit.roads.texture', usePicture);
 
     toSplats.on('click', async () => {
         const road = current();
@@ -428,7 +520,7 @@ const init = (ctx: ToolkitContext) => {
         }
         editingId = p.generator.params.id;
         draftOrigin = null;
-        params = clone(p.generator.params);
+        params = withDefaults(clone(p.generator.params));
         updateUI();
     });
 
@@ -436,7 +528,7 @@ const init = (ctx: ToolkitContext) => {
     let dragging = -1;
     events.on('scene.elementAdded', (e: unknown) => {
         if (e instanceof MeshPrimitive && e.generator?.type === 'road' && e.generator.params.id === editingId && dragging < 0 && !building) {
-            params = clone(e.generator.params);
+            params = withDefaults(clone(e.generator.params));
             updateUI();
         }
     });
