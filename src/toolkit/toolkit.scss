@@ -253,7 +253,7 @@
 // left of the right toolbar, like the studio lighting and vegetation panels
 #toolkit-stamp-panel {
     top: 72px;
-    right: 138px;
+    right: 482px;
     width: 300px;
     max-height: calc(100vh - 126px);
     display: flex;
@@ -375,9 +375,10 @@
 // option popups open (they close each other)
 #toolkit-lighting-panel {
     top: 24px;
-    right: 102px;
+    // left of the inspector
+    right: 466px;
     width: 340px;
-    max-height: calc(100vh - 140px);
+    max-height: calc(100vh - 200px);
     display: flex;
     flex-direction: column;
 
@@ -597,7 +598,7 @@
 // ---- vegetation: same column as the studio lighting, a little lower
 #toolkit-vegetation-panel {
     top: 48px;
-    right: 120px;
+    right: 464px;
     width: 340px;
     max-height: calc(100vh - 160px);
     display: flex;
@@ -642,4 +643,131 @@
         stroke-linejoin: round;
         stroke-dasharray: 5, 5;
     }
+}
+
+// ---- inspector: the selected mesh or light, in folding groups
+#toolkit-inspector-panel {
+    top: 24px;
+    right: 102px;
+    width: 350px;
+    // clear of the bottom toolbar
+    max-height: calc(100vh - 200px);
+    display: flex;
+    flex-direction: column;
+
+    & > .panel-header {
+        flex-shrink: 0;
+    }
+
+    .toolkit-label {
+        width: 88px;
+    }
+}
+
+.toolkit-inspector-kind {
+    margin: 0 4px 0 auto;
+    font-size: 11px;
+    color: $text-secondary;
+    white-space: nowrap;
+}
+
+.toolkit-inspector-body {
+    overflow-y: auto;
+    padding-bottom: 6px;
+
+    & > .toolkit-editor {
+        border-top: none;
+    }
+}
+
+.toolkit-inspector-empty {
+    margin: 12px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    background-color: $bcg-dark;
+}
+
+.toolkit-group {
+    border-top: 1px solid $bcg-darkest;
+}
+
+.toolkit-group-head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 30px;
+    padding: 0 10px 0 6px;
+    cursor: pointer;
+    user-select: none;
+
+    &:hover {
+        background-color: $bcg-darker;
+    }
+}
+
+.toolkit-group-chevron {
+    margin: 0 4px 0 0;
+    width: 12px;
+    color: $text-secondary;
+
+    &::before {
+        content: '▸';
+    }
+}
+
+.toolkit-group.open > .toolkit-group-head > .toolkit-group-chevron::before {
+    content: '▾';
+}
+
+.toolkit-group-title {
+    margin: 0;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: $text-primary;
+}
+
+.toolkit-group.open > .toolkit-group-head > .toolkit-group-title {
+    color: $clr-hilight;
+}
+
+.toolkit-group-extra {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+}
+
+.toolkit-group-summary {
+    margin: 0;
+    font-size: 11px;
+    color: $text-secondary;
+}
+
+.toolkit-group-body {
+    padding-bottom: 4px;
+}
+
+.toolkit-swatch-small {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
+}
+
+.toolkit-mode.toolkit-lock.pcui-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+
+    svg {
+        pointer-events: none;
+    }
+}
+
+// the studio panel's own folding sections
+.toolkit-lighting-body > .toolkit-group:first-of-type {
+    margin-top: 6px;
 }

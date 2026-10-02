@@ -30,6 +30,8 @@ class ShapeTransformGizmo {
     detach: () => void;
     setMode: (mode: ShapeGizmoMode) => void;
     toggleMode: (mode: Exclude<ShapeGizmoMode, 'none'>) => void;
+    // toolkit: keep the scale handles to uniform scaling (or free them again)
+    setUniformScale: (uniform: boolean) => void;
 
     private _mode: ShapeGizmoMode = 'translate';
 
@@ -41,11 +43,15 @@ class ShapeTransformGizmo {
         const translate = new TranslateGizmo(scene.camera.camera, scene.gizmoLayer);
 
         const scale = new ScaleGizmo(scene.camera.camera, scene.gizmoLayer);
-        if (options.uniformScale) {
-            // disable everything except uniform scale
+        this.setUniformScale = (uniform: boolean) => {
+            // uniform: disable everything except the centre handle
             ['x', 'y', 'z', 'yz', 'xz', 'xy'].forEach((axis) => {
-                scale.enableShape(axis as 'x' | 'y' | 'z' | 'yz' | 'xz' | 'xy', false);
+                scale.enableShape(axis as 'x' | 'y' | 'z' | 'yz' | 'xz' | 'xy', !uniform);
             });
+            scene.forceRender = true;
+        };
+        if (options.uniformScale) {
+            this.setUniformScale(true);
         }
         scale.lowerBoundScale.copy(options.lowerBoundScale);
 

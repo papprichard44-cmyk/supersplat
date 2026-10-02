@@ -21,11 +21,12 @@ import hiddenSvg from '../../ui/svg/hidden.svg';
 import shownSvg from '../../ui/svg/shown.svg';
 import lightingSvg from '../icons/lighting.svg';
 import type { ToolkitContext, ToolkitModule } from '../index';
+import { collapsible } from '../inspector';
 import { MemorySink } from '../memory-sink';
 import { MeshPrimitive, PrimitiveState } from '../mesh-primitive';
 import { headerIcon, registerPanel } from '../panels';
 import { PrimitiveStateOp } from '../primitive-ops';
-import { Occluder, primitiveOccluder, samplePrimitive } from '../primitive-to-splat';
+import { cellForDensity, Occluder, primitiveOccluder, samplePrimitive } from '../primitive-to-splat';
 import { bladeCount } from '../vegetation/grass';
 
 
@@ -37,7 +38,9 @@ import { bladeCount } from '../vegetation/grass';
 const TOOL = 'toolkitLight';
 
 // splats per conversion, beyond which the browser runs out of memory
-const MAX_SPLATS = 6_000_000;
+const MAX_SPLATS = 15_000_000;
+// above this much memory a conversion asks before it starts
+const MEMORY_WARNING = 3 * 1024 * 1024 * 1024;
 
 type StudioSettings = {
     scale: number;                          // subject size the rig was laid out for
@@ -156,6 +159,14 @@ const approxArea = (primitive: MeshPrimitive) => {
 };
 
 // approximate number of splats a primitive converts to at a sample spacing
+// bytes a conversion of `count` splats holds at its peak: the samples, the
+// colours and the PLY written from them (plus the far-view backing)
+const conversionMemoryFor = (count: number, degree: number, backing: boolean) => {
+    const rest = [0, 9, 24, 45][degree];
+    const perSplat = 24 * 4 + (3 + rest) * 4 + (14 + rest) * 4;
+    return count * perSplat * (backing ? 1.3 : 1);
+};
+
 const approxSplats = (primitive: MeshPrimitive, cell: number) => {
     const g = primitive.generator;
     if (primitive.kind === 'model' && g?.type === 'grass' && g.params?.direct !== false) {
@@ -628,6 +639,55 @@ const init = (ctx: ToolkitContext) => {
     body.append(convertRow);
     tooltips.register(convertButton, tips.convert, 'left');
 
+    // ---- the selected light goes to the inspector, in groups
+    editorTitle.hidden = true;
+    const lightGroup = collapsible('Light', 'light.main');
+    lightGroup.body.append(editorHint);
+    lightGroup.body.append(modeRow);
+    lightGroup.body.append(aimAtRow);
+    const lookGroup = collapsible('Brightness & colour', 'light.look');
+    lookGroup.body.append(power.row);
+    lookGroup.body.append(kelvinRow);
+    lookGroup.body.append(gelRow);
+    const shapeGroup = collapsible('Shape', 'light.shape');
+    [size.row, aspect.row, beam.row, softEdge.row, spread.row].forEach(r => shapeGroup.body.append(r));
+    const reachGroup = collapsible('Reach & shadows', 'light.reach');
+    reachGroup.body.append(shadowsRow);
+    reachGroup.body.append(onlyRow);
+    reachGroup.body.append(targetList);
+    [lightGroup, lookGroup, shapeGroup, reachGroup].forEach(g => editor.append(g.root));
+    body.remove(editor);
+    editor.hidden = false;
+
+    // conversion settings live with each mesh now (inspector); this panel
+    // keeps what is scene-wide: setups, lights, environment, bake quality
+    density.row.hidden = true;
+    hideRow.hidden = true;
+    backingRow.hidden = true;
+    convertButton.text = 'Bake & convert all visible meshes';
+
+    // the panel's sections fold
+    const sectionOpen: Record<string, boolean> = {
+        'Lighting setup': true,
+        'Add a light': true,
+        'Lights': true,
+        'What the lights reach': false,
+        'Environment & camera': false,
+        'Bake & convert': true
+    };
+    let group: ReturnType<typeof collapsible> | null = null;
+    Array.from(body.dom.children).forEach((child) => {
+        const el = child as HTMLElement;
+        if (el.classList.contains('toolkit-section')) {
+            const title = el.textContent ?? '';
+            group = collapsible(title === 'Bake & convert' ? 'Bake quality & convert all' : title, `studio.${title}`, sectionOpen[title] ?? true);
+            body.dom.insertBefore(group.root.dom, el);
+            el.remove();
+        } else if (group) {
+            group.body.dom.appendChild(el);
+        }
+    });
+
     canvasContainer.append(panel);
 
     // ---- toolbar toggle, close button and dragging come from the panel manager
@@ -851,7 +911,7 @@ const init = (ctx: ToolkitContext) => {
     fixtureButtons.forEach((button, kind) => button.on('click', () => addLight(kind)));
 
     // apply a preset: replace all lights in one undo step
-    const applySetup = (preset: Preset) => {
+    const applySetup = (preset: Preset, selectLight = true) => {
         flushPending();
         flushSettings();
         const bound = chosenSubjectBound();
@@ -886,8 +946,8 @@ const init = (ctx: ToolkitContext) => {
             ...created.map(light => new AddLightOp(scene, light)),
             new StudioSettingsOp<StudioSettings>(applySettings, oldSettings, newSettings)
         ];
-        select(null);
-        selectOnAdd = created[0] ?? null;
+        if (selectLight) select(null);
+        selectOnAdd = selectLight ? created[0] ?? null : null;
         events.fire('edit.add', new MultiOp(ops));
     };
 
@@ -973,10 +1033,13 @@ const init = (ctx: ToolkitContext) => {
     };
 
     updateEditor = () => {
-        editor.hidden = !selected;
-        if (!selected) return;
+        if (!selected) {
+            events.invoke('toolkit.inspector.hide', 'light');
+            return;
+        }
         const s = selected.state;
         const info = selected.info;
+        events.invoke('toolkit.inspector.show', 'light', { title: s.name, kind: info.label, content: editor });
         const isSun = s.kind === 'sun';
         uiUpdating = true;
         editorTitle.text = `${s.name}`;
@@ -1150,6 +1213,7 @@ const init = (ctx: ToolkitContext) => {
     });
     events.on('toolkit.lightingPanel.setVisible', () => refreshSubjects());
     events.function('toolkit.studio.subjects', () => subjectOptions());
+
     events.function('toolkit.studio.setSubject', (value: string) => pickSubject(value));
 
     aimButton.on('click', () => {
@@ -1230,11 +1294,14 @@ const init = (ctx: ToolkitContext) => {
         }
         previous?.invalidate();
         light?.invalidate();
-        if (light && panel.hidden) setPanelVisible(true);
+        if (light) events.invoke('toolkit.inspector.reveal');
         refreshList();
         updateEditor();
         scene.forceRender = true;
     };
+
+    // scripted access (and tests)
+    events.function('toolkit.selectLight', (index: number) => select(lights()[index] ?? null));
 
     toolManager.register(TOOL, {
         activate: () => {
@@ -1318,13 +1385,10 @@ const init = (ctx: ToolkitContext) => {
 
     const estimateFor = (prims: MeshPrimitive[]) => {
         if (prims.length === 0) return null;
-        const bound = subjectBound(prims);
-        const longest = Math.max(bound.halfExtents.x, bound.halfExtents.y, bound.halfExtents.z) * 2;
-        const cell = longest / Math.max(1, settings.density);
-        const count = prims.reduce((sum, p) => sum + approxSplats(p, cell), 0);
-        const lit = activeLights().length > 0;
+        const count = prims.reduce((sum, p) => sum + approxSplats(p, cellForDensity(p, p.detail)), 0) * (settings.backing ? 1.2 : 1);
+        const lit = prims.some(p => bakeLights().some(l => reaches(l, p)));
         const floats = 14 + (lit ? [0, 3, 8, 15][settings.degree] * 3 : 0);
-        return { count, bytes: count * floats * 4, cell, lit };
+        return { count, bytes: count * floats * 4, lit };
     };
 
     const formatCount = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} M` : `${Math.round(n / 1000)} k`);
@@ -1401,6 +1465,8 @@ const init = (ctx: ToolkitContext) => {
         return null;
     };
 
+    const conversionMemory = (count: number, lit: boolean) => conversionMemoryFor(count, lit ? settings.degree : 0, settings.backing);
+
     // Convert primitives into one splat layer and, when the lights reach
     // splat layers, relight those into lit copies. `cell` is the spacing
     // between splats; by default it follows the panel's detail setting.
@@ -1414,15 +1480,27 @@ const init = (ctx: ToolkitContext) => {
 
         const bound = subjectBound(targets.length ? targets : undefined);
         const longest = Math.max(bound.halfExtents.x, bound.halfExtents.y, bound.halfExtents.z) * 2;
-        const cell = options.cell ?? longest / Math.max(1, settings.density);
-        const estimated = targets.reduce((sum, p) => sum + approxSplats(p, cell), 0);
+        // every object at its own detail (splats along its longest side)
+        const cellOf = (p: MeshPrimitive) => options.cell ?? cellForDensity(p, p.detail);
+        const cell = targets.length ? Math.min(...targets.map(cellOf)) : longest / 300;
+        const estimated = targets.reduce((sum, p) => sum + approxSplats(p, cellOf(p)), 0);
         if (estimated > MAX_SPLATS) {
             await events.invoke('showPopup', {
                 type: 'error',
                 header: 'Too many splats',
-                message: `This would create about ${formatCount(estimated)} splats, more than the browser can handle. Lower the detail and try again.`
+                message: `This would create about ${formatCount(estimated)} splats, more than the ${formatCount(MAX_SPLATS)} a conversion can make. Lower the detail and try again.`
             });
             return 0;
+        }
+        // big conversions: say what memory they need before starting
+        const memory = conversionMemory(estimated, lit.length > 0);
+        if (memory > MEMORY_WARNING) {
+            const answer = await events.invoke('showPopup', {
+                type: 'yesno',
+                header: 'Large conversion',
+                message: `About ${formatCount(estimated)} splats: this needs roughly ${(memory / 1024 ** 3).toFixed(1)} GB of memory while it runs, and the browser tab may run out. ${lit.length && settings.degree > 1 ? 'Lower "Highlights" in the lighting panel to need much less. ' : ''}Convert anyway?`
+            });
+            if (answer?.action !== 'yes') return 0;
         }
 
         const control = { cancelled: false };
@@ -1510,13 +1588,14 @@ const init = (ctx: ToolkitContext) => {
             // ---- meshes -> one new splat layer
             if (targets.length) {
                 const samples = new SampleBuffer();
+                samples.reserveTotal(Math.ceil(estimated * 1.1) + 1024);
                 const backingTargets: BackingTarget[] = [];
                 for (let i = 0; i < targets.length; ++i) {
                     if (control.cancelled) throw new BakeCancelled();
                     const p = targets[i];
                     const start = samples.count;
-                    await samplePrimitive(p, cell, samples, meshes);
-                    const backing = (options.backing ?? settings.backing) ? backingTargetOf(p, start, samples.count, cell) : null;
+                    await samplePrimitive(p, cellOf(p), samples, meshes);
+                    const backing = (options.backing ?? settings.backing) ? backingTargetOf(p, start, samples.count, cellOf(p)) : null;
                     if (backing) backingTargets.push(backing);
                     const id = occluderIds.get(p);
                     if (id !== undefined && occluders[id].convex) samples.setOccluder(start, id);
@@ -1619,6 +1698,64 @@ const init = (ctx: ToolkitContext) => {
     };
 
     events.function('toolkit.convertPrimitives', convertPrimitives);
+
+    // ---- quick lighting of one mesh, for the inspector
+
+    events.function('toolkit.studio.meshLighting', (p: MeshPrimitive) => ({
+        lights: lights().map((light, index) => ({ index, name: light.state.name, visible: light.state.visible, reaches: reaches(light, p) })),
+        casts: !settings.noShadow.includes(targetKey(p)),
+        subject: settings.subject === targetKey(p),
+        presets: presets.map(preset => ({ v: preset.id, t: preset.label }))
+    }));
+    // let one light reach the mesh, or not (switching the light to chosen objects)
+    events.function('toolkit.studio.setReach', (p: MeshPrimitive, index: number, value: boolean) => {
+        const light = lights()[index];
+        if (!light) return;
+        const key = targetKey(p);
+        const old = light.getState();
+        let next: LightState;
+        if (value) {
+            if (!old.only) return;
+            next = { ...old, targets: [...new Set([...(old.targets ?? []), key])] };
+        } else {
+            const all = old.only ? (old.targets ?? []) :
+                [...visiblePrimitives(), ...(settings.lightSplats ? splatLayers().filter(sp => sp.visible) : [])].map(targetKey);
+            next = { ...old, only: true, targets: all.filter(k => k !== key) };
+        }
+        flushPending();
+        events.fire('edit.add', new LightStateOp(light, old, next));
+    });
+    events.function('toolkit.studio.setCasts', (p: MeshPrimitive, value: boolean) => {
+        const key = targetKey(p);
+        const next = new Set(settings.noShadow);
+        if (value) next.delete(key); else next.add(key);
+        editSettings({ noShadow: [...next] });
+        flushSettings();
+    });
+    // light the mesh with a setup: it becomes the subject, the setup is applied around it
+    events.function('toolkit.studio.lightWith', (p: MeshPrimitive, presetId: string) => {
+        const preset = presets.find(pr => pr.id === presetId);
+        if (!preset) return;
+        if (settings.subject !== targetKey(p)) {
+            editSettings({ subject: targetKey(p) });
+            flushSettings();
+        }
+        // the mesh stays selected: its inspector shows the result
+        applySetup(preset, false);
+    });
+    events.function('toolkit.studio.aimHere', (p: MeshPrimitive) => pickSubject(targetKey(p)));
+    events.function('toolkit.studio.openPanel', () => setPanelVisible(true));
+    events.function('toolkit.studio.hideAfter', () => settings.hideAfter);
+    events.function('toolkit.studio.setHideAfter', (value: boolean) => {
+        editSettings({ hideAfter: value });
+        flushSettings();
+    });
+    // what converting one mesh makes: splats, whether lights are baked in, memory
+    events.function('toolkit.studio.estimatePrimitive', (p: MeshPrimitive, detail?: number) => {
+        const count = approxSplats(p, cellForDensity(p, detail ?? p.detail)) * (settings.backing ? 1.2 : 1);
+        const lit = bakeLights().some(l => reaches(l, p));
+        return { count, lit, memory: conversionMemory(count, lit), max: MAX_SPLATS };
+    });
     events.function('toolkit.studio.active', () => activeLights().length > 0);
 
     convertButton.on('click', async () => {

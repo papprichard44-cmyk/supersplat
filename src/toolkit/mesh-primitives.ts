@@ -4,6 +4,7 @@ import { OrientedBox, Quat, Ray, Vec3 } from 'playcanvas';
 import { MultiOp } from '../edit-ops';
 import { Element, ElementType } from '../element';
 import primitivesSvg from './icons/primitives.svg';
+import { collapsible } from './inspector';
 import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveGenerator, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
 import { headerIcon, registerPanel } from './panels';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
@@ -28,6 +29,15 @@ const tips = {
     addModel: 'Add a 3D model (.glb) as a mesh. Place and size it like any primitive, then turn it into splats with "To splat". You can also drop a .glb onto the viewport.',
     cutoff: 'Alpha cutoff: pixels of the picture more transparent than this are cut away. Raise it to trim soft, semi-transparent fringes.',
     density: 'How many splats are generated along the longest side when converting. Higher = sharper picture and edges, but more splats and a bigger file.',
+    lock: 'Lock: X, Y and Z sizes change together, keeping the proportions (also on the scale gizmo). Unlocked: each size on its own.',
+    detail: 'Detail of the splats: how many along the object\'s longest side. Higher = sharper, but more splats and a bigger file. Saved with the object.',
+    hideAfter: 'Hide the mesh (and the lights, once nothing else needs them) after converting, so you see the splats. Nothing is deleted.',
+    convertLit: 'Turn this mesh into splats with the studio lights that reach it baked in (shading, highlights, shadows). The mesh is kept, hidden.',
+    convertPlain: 'Turn this mesh into splats with its own colours (no studio lights reach it). The mesh is kept, hidden.',
+    lightWith: 'Light this object with a ready-made setup: the lights are placed around it and aimed at it.',
+    reach: 'Which studio lights reach this object. Untick a light to keep it off this object (the light then lights only the objects ticked for it).',
+    casts: 'Whether this object casts shadows onto others when the lighting is baked.',
+    aimHere: 'Make this object the subject: every light that is set to aim turns to it.',
     farView: 'Keep the converted object visible from far away. Splat viewers (the editor, published and exported scenes alike) skip gaussians smaller than about half a pixel, and a converted mesh is made of equally tiny ones, so it would vanish all at once as you move away. On: solids and extruded pictures get hidden layers of larger gaussians inside that take over from a distance (about a third more splats).',
     convert: 'Turn the selected primitive into a real gaussian splat layer (it then exports to PLY / SOG / SPZ and can be edited like any splat). With studio lights in the scene, their light is baked in. The primitive itself is hidden, not deleted.',
     addShape: (label: string) => `Add a ${label.toLowerCase()} at the camera focus. Curved shapes show light and highlights best; light them in the Studio lighting panel.`,
@@ -91,7 +101,7 @@ const init = (ctx: ToolkitContext) => {
 
     const header = new Container({ class: 'panel-header' });
     header.append(headerIcon(primitivesSvg));
-    header.append(new Label({ text: 'Primitives & images', class: 'panel-header-label' }));
+    header.append(new Label({ text: 'Meshes', class: 'panel-header-label' }));
 
     const addRow = new Container({ class: 'toolkit-row' });
     const addPlane = new Button({ text: '+ Plane', class: 'toolkit-button' });
@@ -157,13 +167,32 @@ const init = (ctx: ToolkitContext) => {
         row.append(label);
         row.append(input);
         editor.append(row);
-        return { label, input };
+        return { row, label, input };
     };
 
     editor.append(modeRow);
     const position = vectorRow('Position', 3);
     const rotation = vectorRow('Rotation', 2);
     const size = vectorRow('Size', 3, 0.001);
+
+    // size lock: all three sizes change together, keeping the proportions
+    const lockIcon = (locked: boolean) => `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none">
+<rect x="3.5" y="7" width="9" height="6.5" rx="1.2" stroke="currentColor" stroke-width="1.3"/>
+<path d="${locked ? 'M5.5 7 V5 a2.5 2.5 0 0 1 5 0 V7' : 'M5.5 7 V5 a2.5 2.5 0 0 1 4.9 -0.7'}" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>`;
+    const lockButton = new Button({ class: ['toolkit-mode', 'toolkit-lock'] });
+    size.row.append(lockButton);
+    let scaleLocked = true;
+    try {
+        scaleLocked = localStorage.getItem('supersplat.toolkit.scaleLock') !== 'false';
+    } catch {
+        // storage unavailable
+    }
+    const showLock = () => {
+        lockButton.dom.innerHTML = lockIcon(scaleLocked);
+        lockButton.class[scaleLocked ? 'add' : 'remove']('active');
+    };
+    showLock();
 
     // ---- paint: opacity, gradient, picture (planes, boxes and shapes)
     const paintBox = new Container({ class: 'toolkit-paint' });
@@ -346,7 +375,7 @@ const init = (ctx: ToolkitContext) => {
 
     const convertRow = new Container({ class: 'toolkit-row' });
     const densityLabel = new Label({ text: 'Density', class: 'toolkit-label' });
-    const density = new SliderInput({ class: 'toolkit-slider', min: 16, max: 1024, precision: 0, step: 1, value: 200 });
+    const density = new SliderInput({ class: 'toolkit-slider', min: 16, max: 2000, precision: 0, step: 1, value: 300 });
     const convert = new Button({ text: 'To splat', class: 'toolkit-convert' });
     convertRow.append(densityLabel);
     convertRow.append(density);
@@ -366,11 +395,73 @@ const init = (ctx: ToolkitContext) => {
     tooltips.register(farLabel, tips.farView, 'right');
     tooltips.register(farToggle, tips.farView, 'bottom');
 
+    // ---- the inspector content: the selected mesh's settings in groups
+    editor.hidden = false;
+    const transformGroup = collapsible('Transform', 'mesh.transform');
+    transformGroup.body.append(modeRow);
+    transformGroup.body.append(position.row);
+    transformGroup.body.append(rotation.row);
+    transformGroup.body.append(size.row);
+
+    const lookGroup = collapsible('Look', 'mesh.look');
+    const colorRow = new Container({ class: 'toolkit-row' });
+    colorRow.append(colorLabel);
+    colorRow.append(colorPicker);
+    lookGroup.body.append(colorRow);
+    lookGroup.body.append(paintBox);
+    lookGroup.body.append(cutoffRow);
+    const lookSwatch = new Container({ class: 'toolkit-swatch-small' });
+    lookGroup.extra.append(lookSwatch);
+
+    const surfaceGroup = collapsible('Surface', 'mesh.surface');
+    surfaceGroup.body.append(surfaceRow);
+    surfaceGroup.body.append(shineRow);
+    surfaceGroup.body.append(metalRow);
+    const surfaceSummary = new Label({ text: '', class: 'toolkit-group-summary' });
+    surfaceGroup.extra.append(surfaceSummary);
+
+    const lightGroup = collapsible('Lighting', 'mesh.lighting');
+    const lightBox = new Container();
+    lightGroup.body.append(lightBox);
+    const lightSummary = new Label({ text: '', class: 'toolkit-group-summary' });
+    lightGroup.extra.append(lightSummary);
+
+    const splatGroup = collapsible('Splats', 'mesh.splats');
+    const detailRow = new Container({ class: 'toolkit-row' });
+    densityLabel.text = 'Detail';
+    detailRow.append(densityLabel);
+    detailRow.append(density);
+    splatGroup.body.append(detailRow);
+    const splatEstimate = new Label({ text: '', class: ['toolkit-hint', 'toolkit-estimate'] });
+    splatGroup.body.append(splatEstimate);
+    splatGroup.body.append(farRow);
+    splatGroup.body.append(farHint);
+    const hideRow = new Container({ class: 'toolkit-row' });
+    const hideLabel = new Label({ text: 'Hide after', class: 'toolkit-label' });
+    const hideToggle = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: true });
+    hideRow.append(hideLabel);
+    hideRow.append(hideToggle);
+    splatGroup.body.append(hideRow);
+    const convertBigRow = new Container({ class: 'toolkit-row' });
+    convert.class.remove('toolkit-convert');
+    convert.class.add('toolkit-bake');
+    convertBigRow.append(convert);
+    splatGroup.body.append(convertBigRow);
+    const splatSummary = new Label({ text: '', class: 'toolkit-group-summary' });
+    splatGroup.extra.append(splatSummary);
+    convertRow.destroy();
+
+    [transformGroup, lookGroup, surfaceGroup, lightGroup, splatGroup].forEach(g => editor.append(g.root));
+
+    tooltips.register(lockButton, tips.lock, 'bottom');
+    tooltips.register(densityLabel, tips.detail, 'right');
+    tooltips.register(hideLabel, tips.hideAfter, 'right');
+    tooltips.register(hideToggle, tips.hideAfter, 'bottom');
+
     panel.append(header);
     panel.append(addRow);
     panel.append(shapeRow);
     panel.append(list);
-    panel.append(editor);
     canvasContainer.append(panel);
 
     registerPanel(ctx, {
@@ -435,10 +526,126 @@ const init = (ctx: ToolkitContext) => {
         }
     };
 
+    const formatCount = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} M` : `${Math.max(1, Math.round(n / 1000))} k`);
+
+    // what converting the selected mesh makes, and the button to do it
+    const updateSplatInfo = () => {
+        if (!selected) return;
+        const info = events.invoke('toolkit.studio.estimatePrimitive', selected, density.value) as { count: number, lit: boolean, memory: number, max: number } | null;
+        if (!info) return;
+        const parts = [`About ${formatCount(info.count)} splats`];
+        parts.push(info.lit ? 'the studio lights that reach it are baked in' : 'its own colours (no studio light reaches it)');
+        if (info.memory > 3 * 1024 ** 3) parts.push(`needs ~${(info.memory / 1024 ** 3).toFixed(1)} GB of memory`);
+        splatEstimate.text = `${parts.join(', ')}.`;
+        splatSummary.text = `≈ ${formatCount(info.count)}`;
+        const tooMany = info.count > info.max;
+        convert.enabled = !tooMany;
+        if (tooMany) splatEstimate.text += ` More than ${formatCount(info.max)}: lower the Detail.`;
+        convert.text = info.lit ? 'Bake lighting & convert to splats' : 'Convert to splats';
+        tooltips.register(convert, info.lit ? tips.convertLit : tips.convertPlain, 'bottom');
+        hideToggle.value = events.invoke('toolkit.studio.hideAfter') ?? true;
+    };
+
+    // the selected mesh's lighting at a glance, with quick actions
+    let lightPreset = '';
+    const refreshLighting = () => {
+        if (!selected) return;
+        const info = events.invoke('toolkit.studio.meshLighting', selected) as {
+            lights: { index: number, name: string, visible: boolean, reaches: boolean }[],
+            casts: boolean,
+            subject: boolean,
+            presets: { v: string, t: string }[]
+        } | null;
+        lightBox.clear();
+        if (!info) return;
+        const target = selected;
+        const on = info.lights.filter(l => l.visible && l.reaches).length;
+        lightSummary.text = info.lights.length ? `${on} of ${info.lights.length} lights` : 'no lights';
+
+        lightBox.append(new Label({
+            text: info.lights.length ?
+                `Lit by ${on} of ${info.lights.length} light${info.lights.length === 1 ? '' : 's'}${info.subject ? '. The lights aim at it.' : '.'}` :
+                'No studio lights yet. Light it with a setup:',
+            class: 'toolkit-hint'
+        }));
+
+        // a setup around this object
+        const setupRow = new Container({ class: 'toolkit-row' });
+        const setupSelect = new SelectInput({ class: 'toolkit-select', type: 'string', options: info.presets, value: lightPreset || info.presets[0]?.v });
+        const setupButton = new Button({ text: info.lights.length ? 'Relight' : 'Light it', class: 'toolkit-convert' });
+        setupRow.append(setupSelect);
+        setupRow.append(setupButton);
+        lightBox.append(setupRow);
+        tooltips.register(setupSelect, tips.lightWith, 'bottom');
+        tooltips.register(setupButton, tips.lightWith, 'bottom');
+        setupSelect.on('change', (v: string) => {
+            lightPreset = v;
+        });
+        setupButton.on('click', () => {
+            lightPreset = setupSelect.value;
+            events.invoke('toolkit.studio.lightWith', target, setupSelect.value);
+        });
+
+        if (info.lights.length) {
+            const checklist = new Container({ class: 'toolkit-checklist' });
+            tooltips.register(checklist, tips.reach, 'left');
+            info.lights.forEach((light) => {
+                const r = new Container({ class: 'toolkit-check-row' });
+                if (!light.visible) r.class.add('dimmed');
+                const box = new BooleanInput({ type: 'checkbox', value: light.reaches });
+                const name = new Label({ text: light.name, class: 'toolkit-check-name' });
+                const state = new Label({ text: light.visible ? '' : 'off', class: 'toolkit-check-kind' });
+                r.append(box);
+                r.append(name);
+                r.append(state);
+                box.on('change', (value: boolean) => events.invoke('toolkit.studio.setReach', target, light.index, value));
+                name.dom.addEventListener('click', () => {
+                    box.value = !box.value;
+                });
+                checklist.append(r);
+            });
+            lightBox.append(checklist);
+
+            const castsRow = new Container({ class: 'toolkit-row' });
+            const castsLabel = new Label({ text: 'Shadows', class: 'toolkit-label' });
+            const castsToggle = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: info.casts });
+            castsRow.append(castsLabel);
+            castsRow.append(castsToggle);
+            lightBox.append(castsRow);
+            tooltips.register(castsLabel, tips.casts, 'right');
+            tooltips.register(castsToggle, tips.casts, 'bottom');
+            castsToggle.on('change', (value: boolean) => events.invoke('toolkit.studio.setCasts', target, value));
+        }
+
+        const actionRow = new Container({ class: 'toolkit-row' });
+        if (info.lights.length) {
+            const aimHere = new Button({ text: info.subject ? 'Lights aim here' : 'Aim lights here', class: 'toolkit-button' });
+            aimHere.enabled = !info.subject;
+            aimHere.on('click', () => events.invoke('toolkit.studio.aimHere', target));
+            tooltips.register(aimHere, tips.aimHere, 'bottom');
+            actionRow.append(aimHere);
+        }
+        const openLighting = new Button({ text: 'Lighting panel…', class: 'toolkit-button' });
+        openLighting.on('click', () => events.invoke('toolkit.studio.openPanel'));
+        tooltips.register(openLighting, 'Open the studio lighting panel: add single lights, the environment and the bake quality.', 'bottom');
+        actionRow.append(openLighting);
+        lightBox.append(actionRow);
+    };
+
+    // what the inspector calls the selected mesh
+    const kindLabel = (p: MeshPrimitive) => {
+        if (p.generator) return { tree: 'Tree', grass: 'Grass', rocks: 'Rocks' }[p.generator.type] ?? 'Model';
+        if (p.kind === 'plane') return p.getState().rotation[0] !== 0 ? 'Wall' : 'Plane';
+        return p.kind[0].toUpperCase() + p.kind.slice(1);
+    };
+
     let uiUpdating = false;
     const updateEditor = () => {
-        editor.hidden = !selected;
-        if (!selected) return;
+        if (!selected) {
+            events.invoke('toolkit.inspector.hide', 'mesh');
+            return;
+        }
+        events.invoke('toolkit.inspector.show', 'mesh', { title: selected.name, kind: kindLabel(selected), content: editor });
         const state = selected.getState();
         // dragging a number field moves it one step per 100px, so the step has
         // to follow the size of the scene (a fixed step of 1 is useless on a
@@ -499,6 +706,13 @@ const init = (ctx: ToolkitContext) => {
         }
         farToggle.value = events.invoke('toolkit.backing') ?? true;
         updateFarHint();
+        density.value = state.detail ?? 300;
+        updateSplatInfo();
+        refreshLighting();
+        // title bar summaries, for when a group is folded
+        const c = state.color;
+        lookSwatch.dom.style.background = `rgb(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)})`;
+        surfaceSummary.text = surfaceSelect.options.find(o => o.v === surfaceSelect.value)?.t ?? '';
         uiUpdating = false;
     };
 
@@ -525,6 +739,7 @@ const init = (ctx: ToolkitContext) => {
         onModeChanged: updateModeButtons
     });
     updateModeButtons(gizmo.mode);
+    gizmo.setUniformScale(scaleLocked);
 
     // edits from the inputs apply live and are committed to history as one
     // operation once the input has been quiet for a moment (a colour drag would
@@ -614,9 +829,17 @@ const init = (ctx: ToolkitContext) => {
         }
         refreshList();
         updateEditor();
+        if (primitive) events.invoke('toolkit.inspector.reveal');
         events.fire('toolkit.primitive.selected', selected);
         scene.forceRender = true;
     };
+
+    // lights and settings change through the history: keep the groups current
+    events.on('edit.apply', () => {
+        if (!selected) return;
+        updateSplatInfo();
+        refreshLighting();
+    });
 
     toolManager.register(TOOL, {
         activate: () => {
@@ -654,7 +877,27 @@ const init = (ctx: ToolkitContext) => {
         if (!uiUpdating && selected) edit(selected, { rotation: [value[0], value[1], value[2]] });
     });
     size.input.on('change', (value: number[]) => {
-        if (!uiUpdating && selected) edit(selected, { scale: [value[0], value[1], value[2]] });
+        if (uiUpdating || !selected) return;
+        let next: [number, number, number] = [value[0], value[1], value[2]];
+        if (scaleLocked) {
+            // the size that was changed sets the factor for all three
+            const old = selected.getState().scale;
+            let axis = 0;
+            let most = -1;
+            for (let i = 0; i < 3; ++i) {
+                const change = Math.abs(value[i] - old[i]) / Math.max(Math.abs(old[i]), 1e-9);
+                if (change > most) {
+                    most = change;
+                    axis = i;
+                }
+            }
+            const factor = Math.abs(old[axis]) > 1e-9 ? value[axis] / old[axis] : 1;
+            next = old.map(v => Math.max(0.001, v * factor)) as [number, number, number];
+            uiUpdating = true;
+            size.input.value = next;
+            uiUpdating = false;
+        }
+        edit(selected, { scale: next });
     });
     colorPicker.on('change', (value: number[]) => {
         if (uiUpdating || !selected) return;
@@ -776,19 +1019,38 @@ const init = (ctx: ToolkitContext) => {
 
     // the conversion itself (sampling, studio lighting, import, hiding the
     // primitive) lives in the studio lighting module
-    const convertToSplat = async (primitive: MeshPrimitive, splatsAlongLongestSide: number) => {
+    const convertToSplat = async (primitive: MeshPrimitive, splatsAlongLongestSide?: number) => {
         flushPending();
         // the lights stay on while other meshes still need them
         const othersVisible = primitives().some(p => p !== primitive && p.entity.enabled);
         return await events.invoke('toolkit.convertPrimitives', [primitive], {
-            cell: cellForDensity(primitive, splatsAlongLongestSide),
+            // by default: the object's own detail
+            cell: splatsAlongLongestSide ? cellForDensity(primitive, splatsAlongLongestSide) : undefined,
             hideLights: othersVisible ? false : undefined
         }) as number;
     };
 
     events.function('toolkit.primitiveToSplat', convertToSplat);
 
-    density.on('change', () => updateFarHint());
+    density.on('change', (value: number) => {
+        if (uiUpdating || !selected) return;
+        edit(selected, { detail: Math.round(value) });
+        updateFarHint();
+        updateSplatInfo();
+    });
+    hideToggle.on('change', (value: boolean) => {
+        if (!uiUpdating) events.invoke('toolkit.studio.setHideAfter', value);
+    });
+    lockButton.on('click', () => {
+        scaleLocked = !scaleLocked;
+        try {
+            localStorage.setItem('supersplat.toolkit.scaleLock', String(scaleLocked));
+        } catch {
+            // storage unavailable
+        }
+        showLock();
+        gizmo.setUniformScale(scaleLocked);
+    });
     farToggle.on('change', (value: boolean) => {
         if (uiUpdating) return;
         events.invoke('toolkit.setBacking', value);
@@ -799,7 +1061,7 @@ const init = (ctx: ToolkitContext) => {
         if (!selected || !convert.enabled) return;
         convert.enabled = false;
         try {
-            await convertToSplat(selected, density.value);
+            await convertToSplat(selected);
         } finally {
             convert.enabled = true;
         }

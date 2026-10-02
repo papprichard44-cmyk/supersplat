@@ -26,7 +26,7 @@ import type { ToolkitContext, ToolkitModule } from './index';
 // eraser takes whole copies off again.
 
 const TOOL = 'toolkitStamp';
-const MAX_GAUSSIANS = 6_000_000;    // per stamp layer
+const MAX_GAUSSIANS = 15_000_000;   // per stamp layer
 const THUMB = 56;                   // px, drawn at half size
 const HOVER_INTERVAL = 70;          // ms between hover probes for the preview
 

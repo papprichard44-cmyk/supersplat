@@ -5,6 +5,7 @@ import type { Scene } from '../scene';
 import { exportCompareModule } from './export-compare';
 import { generatedLayersModule } from './generated-layers';
 import { generatorsModule } from './generators';
+import { inspectorModule } from './inspector';
 import { studioModule } from './lighting/studio';
 import { meshPrimitivesModule } from './mesh-primitives';
 import { stampBrushModule } from './stamp-brush';
@@ -37,6 +38,7 @@ interface ToolkitModule {
 }
 
 const modules: ToolkitModule[] = [
+    inspectorModule,
     meshPrimitivesModule,
     studioModule,
     vegetationModule,

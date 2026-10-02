@@ -43,6 +43,17 @@ class SampleBuffer {
     data = new Float32Array(STRIDE * 4096);
     count = 0;
 
+    // make room for `total` samples up front: growing by doubling would need
+    // the old and the new buffer at once, which hurts with millions of samples
+    reserveTotal(total: number) {
+        const needed = total * STRIDE;
+        if (needed > this.data.length) {
+            const grown = new Float32Array(needed);
+            grown.set(this.data.subarray(0, this.count * STRIDE));
+            this.data = grown;
+        }
+    }
+
     private reserve(extra: number) {
         const needed = (this.count + extra) * STRIDE;
         if (needed > this.data.length) {
@@ -166,38 +177,46 @@ const writeSplatPly = (samples: SampleBuffer, colors: SplatColors): Blob => {
         ''
     ].join('\n');
 
+    // written in slices, so a scene of millions of splats never needs one
+    // giant array on top of the samples and colours it is made from
     const n = props.length;
-    const out = new Float32Array(count * n);
     const rest = colors.rest;
-    for (let i = 0; i < count; ++i) {
-        const o = i * STRIDE;
-        let w = i * n;
-        out[w++] = -d[o + S_POS];
-        out[w++] = -d[o + S_POS + 1];
-        out[w++] = d[o + S_POS + 2];
-        out[w++] = colors.dc[i * 3];
-        out[w++] = colors.dc[i * 3 + 1];
-        out[w++] = colors.dc[i * 3 + 2];
-        // f_rest is channel-major in the file: all red coefficients, then green, then blue
-        for (let c = 0; c < 3; ++c) {
-            for (let k = 0; k < nRest; ++k) {
-                out[w++] = rest[(i * nRest + k) * 3 + c];
+    const SLICE = 1 << 18;
+    const parts: BlobPart[] = [header];
+    for (let first = 0; first < count; first += SLICE) {
+        const last = Math.min(count, first + SLICE);
+        const out = new Float32Array((last - first) * n);
+        let w = 0;
+        for (let i = first; i < last; ++i) {
+            const o = i * STRIDE;
+            out[w++] = -d[o + S_POS];
+            out[w++] = -d[o + S_POS + 1];
+            out[w++] = d[o + S_POS + 2];
+            out[w++] = colors.dc[i * 3];
+            out[w++] = colors.dc[i * 3 + 1];
+            out[w++] = colors.dc[i * 3 + 2];
+            // f_rest is channel-major in the file: all red coefficients, then green, then blue
+            for (let c = 0; c < 3; ++c) {
+                for (let k = 0; k < nRest; ++k) {
+                    out[w++] = rest[(i * nRest + k) * 3 + c];
+                }
             }
+            const alpha = Math.min(0.999, Math.max(0.001, d[o + S_ALPHA]));
+            out[w++] = Math.log(alpha / (1 - alpha));
+            out[w++] = Math.log(Math.max(1e-12, d[o + S_SCALE]));
+            out[w++] = Math.log(Math.max(1e-12, d[o + S_SCALE + 1]));
+            out[w++] = Math.log(Math.max(1e-12, d[o + S_SCALE + 2]));
+            // rotate the frame by 180 degrees about Z: q' = conj(qz180) * q
+            const qw = d[o + S_ROT], qx = d[o + S_ROT + 1], qy = d[o + S_ROT + 2], qz = d[o + S_ROT + 3];
+            out[w++] = qz;
+            out[w++] = qy;
+            out[w++] = -qx;
+            out[w++] = -qw;
         }
-        const alpha = Math.min(0.999, Math.max(0.001, d[o + S_ALPHA]));
-        out[w++] = Math.log(alpha / (1 - alpha));
-        out[w++] = Math.log(Math.max(1e-12, d[o + S_SCALE]));
-        out[w++] = Math.log(Math.max(1e-12, d[o + S_SCALE + 1]));
-        out[w++] = Math.log(Math.max(1e-12, d[o + S_SCALE + 2]));
-        // rotate the frame by 180 degrees about Z: q' = conj(qz180) * q
-        const qw = d[o + S_ROT], qx = d[o + S_ROT + 1], qy = d[o + S_ROT + 2], qz = d[o + S_ROT + 3];
-        out[w++] = qz;
-        out[w++] = qy;
-        out[w++] = -qx;
-        out[w++] = -qw;
+        parts.push(new Blob([out]));
     }
 
-    return new Blob([header, out], { type: 'application/ply' });
+    return new Blob(parts, { type: 'application/ply' });
 };
 
 export {

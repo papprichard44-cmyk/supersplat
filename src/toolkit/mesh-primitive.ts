@@ -54,6 +54,8 @@ type PrimitiveKind = 'plane' | 'box' | 'image' | 'model' | ShapeKind;
 // default surface response of primitives (models use their own materials)
 const DEFAULT_ROUGHNESS = 0.55;
 const DEFAULT_METALNESS = 0;
+// splats along a primitive's longest side when it is converted
+const DEFAULT_DETAIL = 300;
 
 type PrimitiveState = {
     position: [number, number, number];
@@ -71,6 +73,8 @@ type PrimitiveState = {
     opacity?: number;
     gradient?: PaintGradient | null;
     texture?: PaintTexture | null;
+    // splats along the longest side when converted
+    detail?: number;
 };
 
 // what generated a model (vegetation panel), kept so it can be regenerated or
@@ -382,6 +386,7 @@ class MeshPrimitive extends Element {
     private localBound = new BoundingBox();
     // surface paint (planes, boxes, shapes)
     opacity = 1;
+    detail = DEFAULT_DETAIL;
     gradient: PaintGradient | null = null;
     paintTexture: PaintTexture | null = null;
     private paintGpu: Texture | null = null;
@@ -773,6 +778,7 @@ class MeshPrimitive extends Element {
             color: [this.color[0], this.color[1], this.color[2]],
             visible: this.entity.enabled,
             alphaCutoff: this.alphaCutoff,
+            detail: this.detail,
             ...(this.roughness !== null ? { roughness: this.roughness } : {}),
             ...(this.metalness !== null ? { metalness: this.metalness } : {}),
             ...(this.paintable ? {
@@ -798,6 +804,7 @@ class MeshPrimitive extends Element {
         this.roughness = state.roughness ?? (ownMaterials ? null : DEFAULT_ROUGHNESS);
         this.metalness = state.metalness ?? (ownMaterials ? null : DEFAULT_METALNESS);
         this.opacity = state.opacity ?? 1;
+        this.detail = state.detail ?? DEFAULT_DETAIL;
         this.gradient = state.gradient ? { ...state.gradient, color: [...state.gradient.color] as [number, number, number] } : null;
         this.paintTexture = state.texture ? {
             ...state.texture,
@@ -848,4 +855,4 @@ const statesEqual = (a: PrimitiveState, b: PrimitiveState) => {
     return ka.text === kb.text && ka.images.every((image, i) => image === kb.images[i]);
 };
 
-export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, PrimitiveGenerator, statesEqual, DEFAULT_ROUGHNESS, DEFAULT_METALNESS };
+export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, PrimitiveGenerator, statesEqual, DEFAULT_ROUGHNESS, DEFAULT_METALNESS, DEFAULT_DETAIL };
