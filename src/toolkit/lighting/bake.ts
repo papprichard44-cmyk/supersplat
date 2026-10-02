@@ -1,5 +1,5 @@
 import { buildShadowScene } from './bvh';
-import { S_ALBEDO, S_ALPHA, S_METAL, S_NORMAL, S_OCCLUDER, S_POS, S_ROUGH, S_TWO_SIDED, STRIDE, SampleBuffer, SplatColors, restCount } from './samples';
+import { S_ALBEDO, S_ALPHA, S_LIGHTMASK, S_METAL, S_NORMAL, S_OCCLUDER, S_POS, S_ROUGH, S_TWO_SIDED, STRIDE, SampleBuffer, SplatColors, restCount } from './samples';
 import { KernelResult, KernelScene, shadeKernel } from './shade-kernel';
 import { LT_POINT, LT_RECT, LT_RING, LT_SPOT, LT_SUN } from './shading';
 import type { Occluder } from '../primitive-to-splat';
@@ -39,6 +39,8 @@ type BakeSettings = {
     ground: [number, number, number];      // ambient from below, linear
     sceneSize: number;                     // diagonal of everything that is baked
     cell: number;                          // typical spacing between samples
+    // relight existing splats: share of their own light that is kept
+    splatBase?: number;
 };
 
 const cross = (a: number[], b: number[]) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
@@ -245,7 +247,8 @@ const createKernelScene = (occluders: Occluder[], lights: LightParams[], setting
             rough: S_ROUGH,
             metal: S_METAL,
             twoSided: S_TWO_SIDED,
-            occluder: S_OCCLUDER
+            occluder: S_OCCLUDER,
+            mask: S_LIGHTMASK
         },
         ...shadow,
         lights: packed,
@@ -253,6 +256,8 @@ const createKernelScene = (occluders: Occluder[], lights: LightParams[], setting
         numLights: lights.length,
         exposure: settings.exposure,
         tonemap: settings.tonemap,
+        splatMode: settings.splatBase !== undefined,
+        splatBase: settings.splatBase ?? 1,
         sky: settings.sky,
         ground: settings.ground,
         degree,

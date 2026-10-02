@@ -55,6 +55,8 @@ import { projectedSplatProjector } from './shaders/projected-splat-projector-sha
 import { fragmentShader, vertexShader } from './shaders/projected-splat-shader';
 import { fragmentShader as centersFragmentShader, vertexShader as centersVertexShader } from './shaders/splat-centers-shader';
 import type { Splat } from './splat';
+import { LIGHT_VEC4S, MAX_PREVIEW_LIGHTS } from './toolkit/lighting/shading';
+import { splatLighting } from './toolkit/lighting/splat-lighting';
 
 const INSTANCE_SIZE = 128;
 const WORKGROUP_SIZE = 256;
@@ -490,7 +492,13 @@ class ProjectedSplatRenderer {
             new UniformFormat('occlusionBlocksX', UNIFORMTYPE_UINT),
             new UniformFormat('occlusionBlocksY', UNIFORMTYPE_UINT),
             new UniformFormat('occlusionBlock', UNIFORMTYPE_FLOAT),
-            new UniformFormat('occlusionEnabled', UNIFORMTYPE_UINT)
+            new UniformFormat('occlusionEnabled', UNIFORMTYPE_UINT),
+            // toolkit: studio lights on splat layers (see toolkit/lighting/splat-lighting.ts)
+            new UniformFormat('studioMask', UNIFORMTYPE_UINT),
+            new UniformFormat('studioCount', UNIFORMTYPE_UINT),
+            new UniformFormat('studioBase', UNIFORMTYPE_FLOAT),
+            new UniformFormat('studioExposure', UNIFORMTYPE_FLOAT),
+            new UniformFormat('studioLights', UNIFORMTYPE_VEC4, MAX_PREVIEW_LIGHTS * LIGHT_VEC4S)
         ]);
         const bindGroupFormat = new BindGroupFormat(this.device, [
             new BindStorageBufferFormat('sortKeys', SHADERSTAGE_COMPUTE),
@@ -995,6 +1003,12 @@ class ProjectedSplatRenderer {
             compute.setParameter('occlusionBlocksY', this.occlusionBlocks.y);
             compute.setParameter('occlusionBlock', OCCLUSION_BLOCK);
             compute.setParameter('occlusionEnabled', occlusion ? 1 : 0);
+            // toolkit: studio lights, for the layers they are set to reach
+            compute.setParameter('studioMask', splatLighting.count > 0 ? splat.studioMask : 0);
+            compute.setParameter('studioCount', splatLighting.count);
+            compute.setParameter('studioBase', splatLighting.base);
+            compute.setParameter('studioExposure', splatLighting.exposure);
+            compute.setParameter('studioLights[0]', splatLighting.lights);
 
             const workgroups = Math.ceil(placement.entryCapacity / WORKGROUP_SIZE);
             Compute.calcDispatchSize(workgroups, this.dispatchSize);

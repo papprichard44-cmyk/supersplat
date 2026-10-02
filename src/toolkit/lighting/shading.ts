@@ -33,6 +33,11 @@ const LT_RING = 5;      // ring light: an annulus emitting forwards
 //  16 cos outer cone, 17 cos inner cone, 18 emitter falloff exponent, 19 sun angular radius (rad)
 //  20 ring inner radius ratio, 21..23 spare
 
+// splat lighting: where added light starts to roll off, and the share of a
+// light that a round (not flat) gaussian receives
+const SPLAT_KNEE = 0.8;
+const SPLAT_OMNI = 0.5;
+
 const TONEMAP_NONE = 0;
 const TONEMAP_FILMIC = 1;
 const TONEMAP_NEUTRAL = 2;
@@ -67,57 +72,10 @@ const tonemapNeutral = (rgb: number[]) => {
     return [r * (1 - gm) + newPeak * gm, g * (1 - gm) + newPeak * gm, b * (1 - gm) + newPeak * gm];
 };
 
-// ---- WGSL, included by every mesh-primitive fragment shader
-
-const litChunkWGSL = /* wgsl */`
-uniform studioCount: f32;
-uniform studioLights: array<vec4f, ${MAX_PREVIEW_LIGHTS * LIGHT_VEC4S}>;
-uniform studioSky: vec3f;
-uniform studioGround: vec3f;
-uniform studioExposure: f32;
-uniform studioTonemap: f32;
-uniform studioMinAlpha: f32;
-uniform primRoughness: f32;
-uniform primMetalness: f32;
-
-fn studioSrgbToLinear(c: vec3f) -> vec3f {
-    let lo = c / 12.92;
-    let hi = pow((max(c, vec3f(0.0)) + 0.055) / 1.055, vec3f(2.4));
-    return select(hi, lo, c <= vec3f(0.04045));
-}
-
-fn studioLinearToSrgb(c: vec3f) -> vec3f {
-    let lo = c * 12.92;
-    let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
-    return select(hi, lo, c <= vec3f(0.0031308));
-}
-
-fn studioTonemapColor(x: vec3f) -> vec3f {
-    if (uniform.studioTonemap > 1.5) {
-        // Khronos PBR Neutral
-        var c = x;
-        let m = min(c.r, min(c.g, c.b));
-        let offset = select(0.04, m - 6.25 * m * m, m < 0.08);
-        c = c - vec3f(offset);
-        let peak = max(c.r, max(c.g, c.b));
-        let startCompression = 0.76;
-        if (peak < startCompression) {
-            return clamp(c, vec3f(0.0), vec3f(1.0));
-        }
-        let d = 1.0 - startCompression;
-        let newPeak = 1.0 - d * d / (peak + d - startCompression);
-        c = c * (newPeak / peak);
-        let g = 1.0 - 1.0 / (0.15 * (peak - newPeak) + 1.0);
-        return clamp(mix(c, vec3f(newPeak), g), vec3f(0.0), vec3f(1.0));
-    }
-    if (uniform.studioTonemap > 0.5) {
-        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
-    }
-    return clamp(x, vec3f(0.0), vec3f(1.0));
-}
-
+// access to the packed lights, for a given uniform array expression
+const lightFunctionsWGSL = (source: string) => /* wgsl */`
 fn studioLight(i: i32, k: i32) -> vec4f {
-    return uniform.studioLights[i * ${LIGHT_VEC4S} + k];
+    return ${source}[i * ${LIGHT_VEC4S} + k];
 }
 
 // emission of light i towards direction w (from the light to the point)
@@ -158,7 +116,60 @@ fn studioEmitterPoint(i: i32, u: f32, v: f32) -> vec3f {
     }
     return p0.xyz;
 }
+`;
 
+// ---- WGSL, included by every mesh-primitive fragment shader
+
+const litChunkWGSL = /* wgsl */`
+uniform studioCount: f32;
+uniform studioLights: array<vec4f, ${MAX_PREVIEW_LIGHTS * LIGHT_VEC4S}>;
+uniform studioSky: vec3f;
+uniform studioGround: vec3f;
+uniform studioExposure: f32;
+uniform studioTonemap: f32;
+uniform studioMinAlpha: f32;
+uniform primRoughness: f32;
+uniform primMetalness: f32;
+// bit i set = light i reaches this mesh (lights can be limited to chosen objects)
+uniform primStudioMask: f32;
+
+fn studioSrgbToLinear(c: vec3f) -> vec3f {
+    let lo = c / 12.92;
+    let hi = pow((max(c, vec3f(0.0)) + 0.055) / 1.055, vec3f(2.4));
+    return select(hi, lo, c <= vec3f(0.04045));
+}
+
+fn studioLinearToSrgb(c: vec3f) -> vec3f {
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, c <= vec3f(0.0031308));
+}
+
+fn studioTonemapColor(x: vec3f) -> vec3f {
+    if (uniform.studioTonemap > 1.5) {
+        // Khronos PBR Neutral
+        var c = x;
+        let m = min(c.r, min(c.g, c.b));
+        let offset = select(0.04, m - 6.25 * m * m, m < 0.08);
+        c = c - vec3f(offset);
+        let peak = max(c.r, max(c.g, c.b));
+        let startCompression = 0.76;
+        if (peak < startCompression) {
+            return clamp(c, vec3f(0.0), vec3f(1.0));
+        }
+        let d = 1.0 - startCompression;
+        let newPeak = 1.0 - d * d / (peak + d - startCompression);
+        c = c * (newPeak / peak);
+        let g = 1.0 - 1.0 / (0.15 * (peak - newPeak) + 1.0);
+        return clamp(mix(c, vec3f(newPeak), g), vec3f(0.0), vec3f(1.0));
+    }
+    if (uniform.studioTonemap > 0.5) {
+        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
+    }
+    return clamp(x, vec3f(0.0), vec3f(1.0));
+}
+
+${lightFunctionsWGSL('uniform.studioLights')}
 fn studioGgx(nIn: vec3f, v: vec3f, l: vec3f, alpha: f32, f0: vec3f) -> vec3f {
     let h = normalize(l + v);
     let nl = max(dot(nIn, l), 1e-4);
@@ -197,7 +208,11 @@ fn studioShade(displayColor: vec3f, nIn: vec3f, worldPos: vec3f, viewPos: vec3f,
     let f0 = mix(vec3f(0.04), albedo, metal);
 
     var radiance = vec3f(0.0);
+    let mask = u32(uniform.primStudioMask + 0.5);
     for (var i = 0; i < count; i++) {
+        if (((mask >> u32(i)) & 1u) == 0u) {
+            continue;
+        }
         let p0 = studioLight(i, 0);
         let p1 = studioLight(i, 1);
         let p3 = studioLight(i, 3);
@@ -259,7 +274,75 @@ fn studioShade(displayColor: vec3f, nIn: vec3f, worldPos: vec3f, viewPos: vec3f,
 }
 `;
 
+// Studio light on an existing gaussian splat (live in the projector compute
+// shader, and the same in the bake): the splat's colour is taken as its
+// surface colour, the original light is kept (scaled by the base factor) and
+// the lamps add diffuse light on top. The gaussian's shortest axis is its
+// normal, as much as it is flat; round gaussians take light from every side.
+const splatLightChunkWGSL = /* wgsl */`
+${lightFunctionsWGSL('uniforms.studioLights')}
+
+fn studioSplatSrgbToLinear(c: vec3f) -> vec3f {
+    let lo = c / 12.92;
+    let hi = pow((max(c, vec3f(0.0)) + 0.055) / 1.055, vec3f(2.4));
+    return select(hi, lo, c <= vec3f(0.04045));
+}
+
+fn studioSplatLinearToSrgb(c: vec3f) -> vec3f {
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, c <= vec3f(0.0031308));
+}
+
+// soft roll-off of light added above white
+fn studioSplatShoulder(x: vec3f) -> vec3f {
+    let over = max(x - vec3f(${SPLAT_KNEE}), vec3f(0.0));
+    return min(x, vec3f(${SPLAT_KNEE})) + (1.0 - ${SPLAT_KNEE}) * (vec3f(1.0) - exp(-over / (1.0 - ${SPLAT_KNEE})));
+}
+
+fn studioLightSplat(c: vec3f, p: vec3f, nIn: vec3f, flatness: f32, mask: u32) -> vec3f {
+    let count = i32(uniforms.studioCount);
+    let albedo = studioSplatSrgbToLinear(clamp(c, vec3f(0.0), vec3f(1.0)));
+    var n = normalize(nIn);
+    if (dot(n, uniforms.cameraPosition - p) < 0.0) {
+        n = -n;
+    }
+    var e = vec3f(0.0);
+    for (var i = 0; i < count; i++) {
+        if (((mask >> u32(i)) & 1u) == 0u) {
+            continue;
+        }
+        let p0 = studioLight(i, 0);
+        let p1 = studioLight(i, 1);
+        let p3 = studioLight(i, 3);
+        let t = i32(p0.w + 0.5);
+        if (t == ${LT_SUN}) {
+            let l = -p1.xyz;
+            e += p3.xyz * mix(${SPLAT_OMNI}, max(dot(n, l), 0.0), flatness);
+            continue;
+        }
+        var irradiance = 0.0;
+        let grid = select(1, 3, t == ${LT_RECT} || t == ${LT_DISK} || t == ${LT_RING});
+        for (var gy = 0; gy < grid; gy++) {
+            for (var gx = 0; gx < grid; gx++) {
+                let u = select(0.0, (f32(gx) + 0.5) / f32(grid) * 2.0 - 1.0, grid > 1);
+                let w = select(0.0, (f32(gy) + 0.5) / f32(grid) * 2.0 - 1.0, grid > 1);
+                let q = studioEmitterPoint(i, u, w);
+                let d = q - p;
+                let d2 = max(dot(d, d), 1e-6);
+                let l = d * inverseSqrt(d2);
+                irradiance += studioEmit(i, -l) * mix(${SPLAT_OMNI}, max(dot(n, l), 0.0), flatness) / d2;
+            }
+        }
+        e += p3.xyz * irradiance / f32(grid * grid);
+    }
+    let lit = albedo * (uniforms.studioBase + e * uniforms.studioExposure);
+    return studioSplatLinearToSrgb(studioSplatShoulder(lit));
+}
+`;
+
 export {
+    SPLAT_KNEE, SPLAT_OMNI, splatLightChunkWGSL,
     MAX_PREVIEW_LIGHTS, LIGHT_VEC4S, LIGHT_FLOATS,
     LT_POINT, LT_SPOT, LT_RECT, LT_DISK, LT_SUN, LT_RING,
     TONEMAP_NONE, TONEMAP_FILMIC, TONEMAP_NEUTRAL,

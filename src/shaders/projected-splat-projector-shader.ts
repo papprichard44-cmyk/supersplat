@@ -2,6 +2,7 @@ import { applyColorGradeWGSL, paletteGradeWGSL } from './color-grade-chunk';
 import { indexToUvWGSL, paletteMatrixWGSL } from './palette-chunk';
 import { compactTailWGSL, overlayEligibleWGSL } from './projected-splat-chunk';
 import { stochasticWarpWGSL } from './stochastic-warp-chunk';
+import { LIGHT_VEC4S, MAX_PREVIEW_LIGHTS, splatLightChunkWGSL } from '../toolkit/lighting/shading';
 
 const shCode = (bands: number) => {
     if (bands === 0) {
@@ -145,7 +146,14 @@ struct ProjectorUniforms {
     occlusionBlocksX: u32,
     occlusionBlocksY: u32,
     occlusionBlock: f32,
-    occlusionEnabled: u32
+    occlusionEnabled: u32,
+    // toolkit: studio lights reaching this layer (bit per light), see
+    // toolkit/lighting/splat-lighting.ts
+    studioMask: u32,
+    studioCount: u32,
+    studioBase: f32,
+    studioExposure: f32,
+    studioLights: array<vec4f, ${MAX_PREVIEW_LIGHTS * LIGHT_VEC4S}>
 }
 
 // compaction output: surviving splats are appended to a dense list, so the sort
@@ -186,6 +194,7 @@ ${paletteGradeWGSL}
 ${overlayEligibleWGSL}
 ${compactTailWGSL}
 ${stochasticWarpWGSL}
+${splatLightChunkWGSL}
 
 fn rotationMatrix(qIn: vec4f) -> mat3x3f {
     let q = normalize(qIn);
@@ -443,6 +452,23 @@ fn main(
         graded = applyColorGrade(graded, uniforms.colorRow0, uniforms.colorRow1, uniforms.colorRow2);
     }
     color = vec4f(graded, gradedAlpha);
+
+    // toolkit: studio lights. The gaussian's shortest axis is its normal
+    if (uniforms.studioMask != 0u) {
+        let axes = rotationMatrix(rotation);
+        let smax = max(b.x, max(b.y, b.z));
+        let smin = min(b.x, min(b.y, b.z));
+        let smid = b.x + b.y + b.z - smax - smin;
+        var axis = axes[2];
+        if (b.x <= b.y && b.x <= b.z) {
+            axis = axes[0];
+        } else if (b.y <= b.z) {
+            axis = axes[1];
+        }
+        let worldNormal = mat3x3f(model[0].xyz, model[1].xyz, model[2].xyz) * axis;
+        let flatness = clamp(1.0 - smin / max(smid, 1e-12), 0.0, 1.0);
+        color = vec4f(studioLightSplat(color.rgb, worldCenter.xyz, worldNormal, flatness, uniforms.studioMask), color.a);
+    }
 
     let selected = (state & 1u) != 0u && uniforms.selectionEnabled != 0u;
     let locked = (state & 2u) != 0u;

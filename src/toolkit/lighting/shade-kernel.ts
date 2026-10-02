@@ -23,7 +23,7 @@
 
 type KernelScene = {
     // layout of a sample (see samples.ts)
-    layout: { stride: number, pos: number, albedo: number, alpha: number, normal: number, rough: number, metal: number, twoSided: number, occluder: number };
+    layout: { stride: number, pos: number, albedo: number, alpha: number, normal: number, rough: number, metal: number, twoSided: number, occluder: number, mask: number };
     // shadow casters (see bvh.ts)
     nodeBounds: Float32Array;
     nodeInfo: Int32Array;
@@ -48,6 +48,11 @@ type KernelScene = {
     aoSamples: number;
     aoRange: number;
     eps: number;
+    // relighting existing splats instead of mesh samples: the albedo is the
+    // splat's colour, `rough` holds its flatness, and only f_dc is produced
+    // (base = share of the splat's own light that is kept)
+    splatMode: boolean;
+    splatBase: number;
     // fit directions (PLY frame, camera -> splat) and the least-squares matrix
     // for the requested degree: (degree + 1)^2 rows of K
     dirs: Float32Array;
@@ -310,6 +315,82 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
     const eAmb = new Float64Array(6);
     const ao = new Float64Array(2);
 
+    // ---- relighting existing splats (diffuse light added to their colour)
+    if (scene.splatMode) {
+        const KNEE = 0.8;
+        const OMNI = 0.5;
+        for (let i = 0; i < job.count; ++i) {
+            const o = i * S;
+            const sample = job.base + i;
+            const px = job.samples[o + L.pos], py = job.samples[o + L.pos + 1], pz = job.samples[o + L.pos + 2];
+            const nx = job.samples[o + L.normal], ny = job.samples[o + L.normal + 1], nz = job.samples[o + L.normal + 2];
+            const flat = job.samples[o + L.rough];
+            const mask = job.samples[o + L.mask] | 0;
+            let er = 0, eg = 0, eb = 0;
+            for (let li = 0; li < numLights; ++li) {
+                if (((mask >> li) & 1) === 0) continue;
+                const lo = li * LF;
+                const type = lights[lo + 3];
+                let irr = 0;
+                let lx = 0, ly = 0, lz = 0;
+                if (type === 4) {
+                    lx = -lights[lo + 4]; ly = -lights[lo + 5]; lz = -lights[lo + 6];
+                    irr = flat * Math.max(0, nx * lx + ny * ly + nz * lz) + (1 - flat) * OMNI;
+                } else {
+                    const ng = lights[lo + 25];
+                    for (let g = 0; g < ng; ++g) {
+                        const gk = (li * 16 + g) * 3;
+                        const qx = grid[gk] - px, qy = grid[gk + 1] - py, qz = grid[gk + 2] - pz;
+                        const d2 = Math.max(1e-10, qx * qx + qy * qy + qz * qz);
+                        const inv = 1 / Math.sqrt(d2);
+                        const cosr = flat * Math.max(0, (nx * qx + ny * qy + nz * qz) * inv) + (1 - flat) * OMNI;
+                        irr += emit(lo, -qx * inv, -qy * inv, -qz * inv) * cosr / d2;
+                    }
+                    irr /= ng;
+                }
+                if (irr <= 0) continue;
+                // shadows cast by the meshes, from the splat's centre
+                if (lights[lo + 15] > 0.5 && scene.shadowSamples > 0 && hasCasters) {
+                    const n = scene.shadowSamples;
+                    const cols = Math.ceil(Math.sqrt(n));
+                    const rows = Math.ceil(n / cols);
+                    let blocked = 0;
+                    for (let s = 0; s < n; ++s) {
+                        const su = ((s % cols) + 0.5 + (rand(sample, li * 64 + s, 0) - 0.5) * 0.35) / cols * 2 - 1;
+                        const sv = (Math.floor(s / cols) + 0.5 + (rand(sample, li * 64 + s, 1) - 0.5) * 0.35) / rows * 2 - 1;
+                        let dx: number, dy: number, dz: number, tmax: number;
+                        if (type === 4) {
+                            dx = lx; dy = ly; dz = lz;
+                            tmax = 1e30;
+                        } else {
+                            emitterPoint(lo, Math.max(-1, Math.min(1, su)), Math.max(-1, Math.min(1, sv)));
+                            dx = ep[0] - px; dy = ep[1] - py; dz = ep[2] - pz;
+                            tmax = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                        }
+                        const dl = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+                        dx /= dl; dy /= dl; dz /= dl;
+                        if (type !== 4) tmax *= 1 - 1e-4;
+                        if (occluded(px + dx * eps, py + dy * eps, pz + dz * eps, dx, dy, dz, tmax, -1)) blocked++;
+                    }
+                    irr *= 1 - blocked / n;
+                }
+                er += lights[lo + 12] * irr;
+                eg += lights[lo + 13] * irr;
+                eb += lights[lo + 14] * irr;
+            }
+            const e = [er, eg, eb];
+            for (let c = 0; c < 3; ++c) {
+                const albedo = job.samples[o + L.albedo + c];
+                let x = albedo * (scene.splatBase + e[c] * scene.exposure);
+                // a degenerate gaussian (zero scale, broken rotation) keeps its colour
+                if (!Number.isFinite(x)) x = albedo;
+                const shaped = x <= KNEE ? x : KNEE + (1 - KNEE) * (1 - Math.exp(-(x - KNEE) / (1 - KNEE)));
+                dc[i * 3 + c] = (srgb(Math.max(0, shaped)) - 0.5) / C0;
+            }
+        }
+        return { dc, rest };
+    }
+
     for (let i = 0; i < job.count; ++i) {
         const o = i * S;
         const sample = job.base + i;
@@ -322,6 +403,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
         const metal = Math.min(1, Math.max(0, job.samples[o + L.metal]));
         const twoSided = job.samples[o + L.twoSided] > 0.5;
         const skip = job.samples[o + L.occluder];
+        const lightMask = job.samples[o + L.mask] | 0;
         const alpha = rough * rough;
         const dr = ar * (1 - metal), dg = ag * (1 - metal), db = ab * (1 - metal);
         const f0r = 0.04 + (ar - 0.04) * metal, f0g = 0.04 + (ag - 0.04) * metal, f0b = 0.04 + (ab - 0.04) * metal;
@@ -338,6 +420,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
 
             // ---- direct light
             for (let li = 0; li < numLights; ++li) {
+                if (((lightMask >> li) & 1) === 0) continue;
                 const lo = li * LF;
                 const type = lights[lo + 3];
                 const ir = lights[lo + 12], ig = lights[lo + 13], ib = lights[lo + 14];

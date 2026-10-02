@@ -45,6 +45,9 @@ type LightState = {
     spread: number;                 // area lights: emission falloff exponent (1 = diffuser)
     shadows: boolean;
     visible: boolean;
+    // limit the light to chosen objects ('mesh:<name>' / 'splat:<name>')
+    only?: boolean;
+    targets?: string[];
 };
 
 // what the light needs to know about the studio around it
@@ -304,12 +307,13 @@ class StudioLight extends Element {
             position: [...this.state.position] as Vec3Tuple,
             rotation: [...this.state.rotation] as Vec3Tuple,
             target: this.state.target ? [...this.state.target] as Vec3Tuple : null,
-            gel: [...this.state.gel] as Vec3Tuple
+            gel: [...this.state.gel] as Vec3Tuple,
+            targets: [...(this.state.targets ?? [])]
         };
     }
 
     setState(state: LightState) {
-        this.state = { ...state, target: state.target ? [...state.target] as Vec3Tuple : null };
+        this.state = { ...state, target: state.target ? [...state.target] as Vec3Tuple : null, targets: [...(state.targets ?? [])] };
         this.applyTransform();
         this.entity.name = `studioLight:${state.name}`;
         this.dirty = true;

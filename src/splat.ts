@@ -44,6 +44,9 @@ class Splat extends Element {
     // the renderer's size cull would drop all of them at once as the camera
     // moves away, so such layers opt out of it
     noSizeCull = false;
+    // toolkit: which studio lights reach this layer (bit per light, 0 = none),
+    // set by the studio lighting module every frame
+    studioMask = 0;
     numDeleted = 0;
     numLocked = 0;
     numSelected = 0;

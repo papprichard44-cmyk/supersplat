@@ -1,5 +1,6 @@
 import { LightState, StudioLight } from './studio-light';
 import { Scene } from '../../scene';
+import type { Splat } from '../../splat';
 
 // undo / redo operations of the studio, plugged into the editor's history
 // through 'edit.add' (combine several with the editor's MultiOp)
@@ -62,4 +63,18 @@ class StudioSettingsOp<T> {
     }
 }
 
-export { AddLightOp, RemoveLightOp, LightStateOp, StudioSettingsOp };
+// show / hide a splat layer (the original of a relit layer is hidden, not deleted)
+class SplatVisibleOp {
+    name = 'toolkitSplatVisible';
+    constructor(private splat: Splat, private visible: boolean) {}
+
+    do() {
+        this.splat.visible = this.visible;
+    }
+
+    undo() {
+        this.splat.visible = !this.visible;
+    }
+}
+
+export { AddLightOp, RemoveLightOp, LightStateOp, StudioSettingsOp, SplatVisibleOp };

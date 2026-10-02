@@ -4,10 +4,12 @@ import { BoundingBox, Ray, Vec3 } from 'playcanvas';
 import { bakeSamples, BakeCancelled, LightParams, packLight } from './bake';
 import { kelvinPresets, kelvinToLinear } from './color';
 import { FixtureKind, fixtureKinds, fixtures } from './fixtures';
-import { AddLightOp, LightStateOp, RemoveLightOp, StudioSettingsOp } from './light-ops';
+import { AddLightOp, LightStateOp, RemoveLightOp, SplatVisibleOp, StudioSettingsOp } from './light-ops';
 import { Preset, presets } from './presets';
 import { SampleBuffer, SplatColors, srgbToLinear, unlitColors, writeSplatPly } from './samples';
 import { LIGHT_FLOATS, MAX_PREVIEW_LIGHTS, minAlphaForDegree, TONEMAP_FILMIC, TONEMAP_NEUTRAL, TONEMAP_NONE } from './shading';
+import { splatLighting } from './splat-lighting';
+import { readPlyLayout, splatSamples, writeDc } from './splat-relight';
 import { LightState, StudioLight, Vec3Tuple } from './studio-light';
 import { MultiOp } from '../../edit-ops';
 import { Element, ElementType } from '../../element';
@@ -18,6 +20,7 @@ import hiddenSvg from '../../ui/svg/hidden.svg';
 import shownSvg from '../../ui/svg/shown.svg';
 import lightingSvg from '../icons/lighting.svg';
 import type { ToolkitContext, ToolkitModule } from '../index';
+import { MemorySink } from '../memory-sink';
 import { MeshPrimitive, PrimitiveState } from '../mesh-primitive';
 import { headerIcon, registerPanel } from '../panels';
 import { PrimitiveStateOp } from '../primitive-ops';
@@ -47,6 +50,8 @@ type StudioSettings = {
     density: number;                        // splats along the longest side of everything converted
     hideAfter: boolean;                     // hide the converted meshes and the lights afterwards
     showBeams: boolean;
+    lightSplats: boolean;                   // the lights also reach the splat layers
+    splatBase: number;                      // share of the splats' own light that is kept
 };
 
 const defaultSettings = (): StudioSettings => ({
@@ -61,7 +66,9 @@ const defaultSettings = (): StudioSettings => ({
     shadows: 2,
     density: 400,
     hideAfter: true,
-    showBeams: true
+    showBeams: true,
+    lightSplats: false,
+    splatBase: 1
 });
 
 const shadowRays = [0, 1, 16, 36];
@@ -100,7 +107,11 @@ const tips = {
     shadowQuality: 'Shadow quality of the bake. Soft and very soft trace more rays for smooth shadow edges from big lights, and take longer.',
     hideAfter: 'After converting, hide the meshes and the lights (they are kept, not deleted) so you see only the splats.',
     convert: 'Turn every visible primitive and model into one splat layer, with the studio lighting baked in.',
-    estimate: 'Approximate size of the result.'
+    estimate: 'Approximate size of the result.',
+    lightSplats: 'Let the lights reach the splat layers too: they light up live in the viewport, and "Bake & convert" writes the light into a lit copy of each layer (the original is hidden, not deleted). Off: the lights only reach the meshes.',
+    splatBase: 'How much of the splats\' own, captured light is kept under the lamps: 1 = all of it (the lamps add light on top), lower values darken the original so the lamps dominate.',
+    only: 'Limit this light to the objects ticked below. Off: it reaches everything.',
+    targets: 'The objects this light reaches. Splat layers appear here when "Light splats" is on.'
 };
 
 const createSvg = (svgString: string) => {
@@ -151,6 +162,8 @@ const init = (ctx: ToolkitContext) => {
     let updateEstimate: () => void = () => {};
     let flushPending: () => void = () => {};
     let select: (light: StudioLight | null) => void = () => {};
+    let updateEditor: () => void = () => {};
+    let refreshTargets: () => void = () => {};
 
     const primitives = () => scene.getElementsByType(ElementType.model).filter(isPrimitive);
     const visiblePrimitives = () => primitives().filter(p => p.entity.enabled);
@@ -233,11 +246,50 @@ const init = (ctx: ToolkitContext) => {
         return { sky, ground };
     };
 
+    // ---- which lights reach which object
+
+    const splatLayers = () => scene.getElementsByType(ElementType.splat) as Splat[];
+    const targetKey = (element: MeshPrimitive | Splat) => (isPrimitive(element) ? `mesh:${element.name}` : `splat:${element.name}`);
+    const reaches = (light: StudioLight, element: MeshPrimitive | Splat) => {
+        if (!isPrimitive(element) && !settings.lightSplats) return false;
+        return !light.state.only || (light.state.targets ?? []).includes(targetKey(element));
+    };
+    // bit i set = light i of `list` reaches the element
+    const maskFor = (element: MeshPrimitive | Splat, list: StudioLight[]) => {
+        let mask = 0;
+        list.forEach((light, i) => {
+            if (reaches(light, element)) mask |= 1 << i;
+        });
+        return mask;
+    };
+
     events.on('update', () => {
         const device = scene.graphicsDevice;
         const active = activeLights().slice(0, MAX_PREVIEW_LIGHTS);
         lightData.fill(0);
         active.forEach((light, i) => packLight(light.params(), lightData, i * LIGHT_FLOATS, false));
+
+        // masks of the meshes and splat layers, redrawn when they change
+        let changed = false;
+        primitives().forEach((p) => {
+            const mask = maskFor(p, active);
+            if (mask !== p.studioMask) {
+                p.setStudioMask(mask);
+                changed = true;
+            }
+        });
+        splatLayers().forEach((splat) => {
+            const mask = maskFor(splat, active);
+            if (mask !== splat.studioMask) {
+                splat.studioMask = mask;
+                changed = true;
+            }
+        });
+        splatLighting.lights.set(lightData);
+        splatLighting.count = active.length;
+        splatLighting.base = settings.splatBase;
+        splatLighting.exposure = Math.pow(2, settings.exposure);
+        if (changed) scene.forceRender = true;
         const { sky, ground } = ambientLinear();
         const scope = device.scope;
         scope.resolve('studioCount').setValue(active.length);
@@ -406,7 +458,23 @@ const init = (ctx: ToolkitContext) => {
     shadowsRow.append(shadowsToggle);
     editor.append(shadowsRow);
 
+    const onlyRow = row('Only selected', tips.only);
+    const onlyToggle = new BooleanInput({ type: 'toggle', value: false });
+    onlyRow.append(onlyToggle);
+    editor.append(onlyRow);
+    const targetList = new Container({ class: 'toolkit-checklist' });
+    editor.append(targetList);
+    tooltips.register(targetList, tips.targets, 'left');
+
     // environment and look
+    section('What the lights reach');
+    const splatsRow = row('Light splats', tips.lightSplats);
+    const splatsToggle = new BooleanInput({ type: 'toggle', value: false });
+    splatsRow.append(splatsToggle);
+    body.append(splatsRow);
+    const splatBase = sliderRow('Keep own', tips.splatBase, 0, 1, 2, 0.01);
+    body.append(splatBase.row);
+
     section('Environment & camera');
     const ambient = sliderRow('Ambient', tips.ambient, 0, 1, 2, 0.01);
     const ambientPicker = new ColorPicker({ class: 'toolkit-color-small', value: [1, 1, 1] });
@@ -576,6 +644,9 @@ const init = (ctx: ToolkitContext) => {
         shadowSelect.value = settings.shadows;
         aoToggle.value = settings.occlusion;
         hideToggle.value = settings.hideAfter;
+        splatsToggle.value = settings.lightSplats;
+        splatBase.slider.value = settings.splatBase;
+        splatBase.row.hidden = !settings.lightSplats;
         uiUpdating = false;
     };
 
@@ -590,6 +661,11 @@ const init = (ctx: ToolkitContext) => {
     shadowSelect.on('change', (value: number) => editSettings({ shadows: value }));
     aoToggle.on('change', (value: boolean) => editSettings({ occlusion: value }));
     hideToggle.on('change', (value: boolean) => editSettings({ hideAfter: value }));
+    splatsToggle.on('change', (value: boolean) => {
+        editSettings({ lightSplats: value });
+        updateEditor();
+    });
+    splatBase.slider.on('change', (value: number) => editSettings({ splatBase: value }));
 
     // irradiance at the subject, facing the camera, from the current lights
     const subjectIrradiance = () => {
@@ -825,7 +901,7 @@ const init = (ctx: ToolkitContext) => {
         });
     };
 
-    const updateEditor = () => {
+    updateEditor = () => {
         editor.hidden = !selected;
         if (!selected) return;
         const s = selected.state;
@@ -851,10 +927,66 @@ const init = (ctx: ToolkitContext) => {
         spread.row.hidden = !(info.lightType === 2 || info.lightType === 3 || info.lightType === 5);
         spread.slider.value = s.spread;
         shadowsToggle.value = s.shadows;
+        onlyToggle.value = !!s.only;
+        refreshTargets();
         aimButton.class[s.target ? 'add' : 'remove']('active');
         aimButton.text = s.target ? 'Aiming at subject' : 'Aim at subject';
         uiUpdating = false;
     };
+
+    // the checklist of objects a light is limited to
+    refreshTargets = () => {
+        targetList.clear();
+        targetList.hidden = !selected?.state.only;
+        if (!selected || !selected.state.only) return;
+        const light = selected;
+        const chosen = new Set(light.state.targets ?? []);
+        const items: { key: string, name: string, kind: string, shown: boolean }[] = [
+            ...primitives().map(p => ({ key: targetKey(p), name: p.name, kind: 'mesh', shown: p.entity.enabled })),
+            ...(settings.lightSplats ? splatLayers().map(sp => ({ key: targetKey(sp), name: sp.name, kind: 'splat', shown: sp.visible })) : [])
+        ];
+        if (items.length === 0) {
+            targetList.append(hint('Nothing in the scene yet.'));
+            return;
+        }
+        items.forEach((item) => {
+            const r = new Container({ class: 'toolkit-check-row' });
+            if (!item.shown) r.class.add('dimmed');
+            const box = new BooleanInput({ type: 'checkbox', value: chosen.has(item.key) });
+            const name = new Label({ text: item.name, class: 'toolkit-check-name' });
+            const kind = new Label({ text: item.kind, class: 'toolkit-check-kind' });
+            r.append(box);
+            r.append(name);
+            r.append(kind);
+            const flip = (value: boolean) => {
+                const next = new Set(light.state.targets ?? []);
+                if (value) next.add(item.key); else next.delete(item.key);
+                editLight(light, { targets: [...next] });
+            };
+            box.on('change', (value: boolean) => {
+                if (!uiUpdating) flip(value);
+            });
+            name.dom.addEventListener('click', () => {
+                box.value = !box.value;
+            });
+            targetList.append(r);
+        });
+        // ticked objects that are no longer in the scene (e.g. renamed)
+        const known = new Set(items.map(i => i.key));
+        const stale = (light.state.targets ?? []).filter(k => !known.has(k) && !(k.startsWith('splat:') && !settings.lightSplats));
+        if (stale.length) {
+            targetList.append(hint(`Also ticked, but not in the scene: ${stale.map(k => k.slice(k.indexOf(':') + 1)).join(', ')}`));
+        }
+    };
+
+    onlyToggle.on('change', (value: boolean) => {
+        if (uiUpdating || !selected) return;
+        // starting a selection: begin with the subject (the selected mesh, or everything visible)
+        const targets = selected.state.targets?.length ? selected.state.targets :
+            (selectedPrimitive ? [targetKey(selectedPrimitive)] : visiblePrimitives().map(targetKey));
+        editLight(selected, { only: value, targets });
+        refreshTargets();
+    });
 
     power.slider.on('change', (value: number) => selected && editLight(selected, { intensity: powerToIntensity(selected.state.kind, value) }));
     kelvinSlider.on('change', (value: number) => selected && editLight(selected, { kelvin: value }));
@@ -1027,6 +1159,14 @@ const init = (ctx: ToolkitContext) => {
 
     // ---- conversion
 
+    // the bake gives masks of up to 24 lights (they ride in a float)
+    const MAX_BAKE_LIGHTS = 24;
+    const bakeLights = () => activeLights().slice(0, MAX_BAKE_LIGHTS);
+
+    // splat layers the lights will relight when baking
+    const splatTargets = (lit: StudioLight[]) => (settings.lightSplats && lit.length ?
+        splatLayers().filter(sp => sp.visible && sp.numSplats > 0 && maskFor(sp, lit) !== 0) : []);
+
     const estimateFor = (prims: MeshPrimitive[]) => {
         if (prims.length === 0) return null;
         const bound = subjectBound(prims);
@@ -1043,29 +1183,67 @@ const init = (ctx: ToolkitContext) => {
 
     updateEstimate = () => {
         const prims = visiblePrimitives();
+        const relit = splatTargets(bakeLights());
         const e = estimateFor(prims);
-        if (!e) {
-            estimate.text = 'Nothing to convert: add or show a primitive or model first.';
+        if (!e && relit.length === 0) {
+            estimate.text = settings.lightSplats ?
+                'Nothing to bake: add or show a mesh, or let a light reach a visible splat layer.' :
+                'Nothing to convert: add or show a primitive or model first.';
             convertButton.enabled = false;
             return;
         }
         convertButton.enabled = true;
-        const lightsText = e.lit ? `${activeLights().length} light${activeLights().length === 1 ? '' : 's'}` : 'no lights (unlit colours)';
-        estimate.text = `${prims.length} mesh${prims.length === 1 ? '' : 'es'}, ${lightsText} → about ${formatCount(e.count)} splats, ${Math.max(1, Math.round(e.bytes / 1048576))} MB as PLY.`;
-        if (e.count > MAX_SPLATS) {
+        const n = activeLights().length;
+        const lightsText = n ? `${n} light${n === 1 ? '' : 's'}` : 'no lights (unlit colours)';
+        const parts: string[] = [];
+        if (e) {
+            parts.push(`${prims.length} mesh${prims.length === 1 ? '' : 'es'} → about ${formatCount(e.count)} splats, ${Math.max(1, Math.round(e.bytes / 1048576))} MB as PLY`);
+        }
+        if (relit.length) {
+            parts.push(`${relit.length} splat layer${relit.length === 1 ? '' : 's'} relit (${formatCount(relit.reduce((sum, sp) => sum + sp.numSplats, 0))} splats)`);
+        }
+        estimate.text = `${lightsText}: ${parts.join('; ')}.`;
+        if (e && e.count > MAX_SPLATS) {
             estimate.text += ' Too many: lower the detail.';
         }
     };
 
-    // Convert primitives into one splat layer. `cell` is the spacing between
-    // splats; by default it follows the panel's detail setting.
-    const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean } = {}) => {
+    const reportError = async (error: unknown, header: string) => {
+        if (error instanceof BakeCancelled) return;
+        await events.invoke('showPopup', {
+            type: 'error',
+            header,
+            message: (error as Error).message ?? String(error)
+        });
+    };
+
+    // load a PLY as a new layer and return it
+    const importLayer = async (filename: string, data: BlobPart) => {
+        let created: Splat | null = null;
+        const onAdded = (element: Element) => {
+            if (element.type === ElementType.splat) created = element as Splat;
+        };
+        const handle = events.on('scene.elementAdded', onAdded);
+        try {
+            await events.invoke('import', [{ filename, contents: new File([data], filename) }]);
+        } finally {
+            handle.off();
+        }
+        return created as Splat | null;
+    };
+
+    // Convert primitives into one splat layer and, when the lights reach
+    // splat layers, relight those into lit copies. `cell` is the spacing
+    // between splats; by default it follows the panel's detail setting.
+    const convertPrimitives = async (prims: MeshPrimitive[], options: { cell?: number, name?: string, hideLights?: boolean, relightSplats?: boolean } = {}) => {
         const targets = prims.filter(p => p.entity.enabled);
-        if (targets.length === 0) return 0;
+        const lit = bakeLights();
+        const relit = options.relightSplats ? splatTargets(lit) : [];
+        if (targets.length === 0 && relit.length === 0) return 0;
         flushPending();
         flushSettings();
 
-        const bound = subjectBound(targets);
+        const bound = subjectBound(targets.length ? targets : undefined);
         const longest = Math.max(bound.halfExtents.x, bound.halfExtents.y, bound.halfExtents.z) * 2;
         const cell = options.cell ?? longest / Math.max(1, settings.density);
         const estimated = targets.reduce((sum, p) => sum + approxArea(p), 0) / (cell * cell);
@@ -1078,23 +1256,39 @@ const init = (ctx: ToolkitContext) => {
             return 0;
         }
 
-        const lit = activeLights();
         const control = { cancelled: false };
         const cancelHandle = events.on('progressCancel', () => {
             control.cancelled = true;
         });
-        events.fire('progressStart', lit.length ? 'Baking studio lighting' : 'Converting to splats', true);
-        events.fire('progressUpdate', { text: 'Sampling surfaces', progress: 0 });
+        const startProgress = (header: string) => {
+            events.fire('progressStart', header, true);
+        };
+        startProgress(lit.length ? 'Baking studio lighting' : 'Converting to splats');
+        events.fire('progressUpdate', { text: 'Preparing', progress: 0 });
         await new Promise((resolve) => {
             setTimeout(resolve, 30);
         });
 
-        let colors: SplatColors;
-        const samples = new SampleBuffer();
+        const { sky, ground: g } = ambientLinear();
+        const casters = lit.length ? visiblePrimitives() : [];
+        const sceneSize = Math.max(longest, subjectSize(subjectBound(casters.length ? casters : undefined)));
+        const bakeSettings = {
+            degree: settings.degree,
+            shadowSamples: shadowRays[settings.shadows] ?? 0,
+            aoSamples: settings.occlusion ? 12 : 0,
+            exposure: Math.pow(2, settings.exposure),
+            tonemap: settings.tonemap,
+            sky,
+            ground: g,
+            sceneSize,
+            cell
+        };
+        const ops: any[] = [];
+        let count = 0;
+
         try {
-            const meshes = new Map();
             // everything visible casts shadows, also what is not converted
-            const casters = lit.length ? visiblePrimitives() : [];
+            const meshes = new Map();
             const occluders: Occluder[] = [];
             const occluderIds = new Map<MeshPrimitive, number>();
             for (const p of casters) {
@@ -1105,90 +1299,107 @@ const init = (ctx: ToolkitContext) => {
                 }
             }
 
-            for (let i = 0; i < targets.length; ++i) {
-                if (control.cancelled) throw new BakeCancelled();
-                const p = targets[i];
-                const start = samples.count;
-                await samplePrimitive(p, cell, samples, meshes);
-                const id = occluderIds.get(p);
-                if (id !== undefined && occluders[id].convex) samples.setOccluder(start, id);
-                events.fire('progressUpdate', { text: `Sampling surfaces (${formatCount(samples.count)} splats)`, progress: 10 * (i + 1) / targets.length });
-                if (samples.count > MAX_SPLATS) {
-                    throw new Error(`More than ${formatCount(MAX_SPLATS)} splats. Lower the detail and try again.`);
+            // ---- meshes -> one new splat layer
+            if (targets.length) {
+                const samples = new SampleBuffer();
+                for (let i = 0; i < targets.length; ++i) {
+                    if (control.cancelled) throw new BakeCancelled();
+                    const p = targets[i];
+                    const start = samples.count;
+                    await samplePrimitive(p, cell, samples, meshes);
+                    const id = occluderIds.get(p);
+                    if (id !== undefined && occluders[id].convex) samples.setOccluder(start, id);
+                    samples.setLightMask(start, maskFor(p, lit));
+                    events.fire('progressUpdate', { text: `Sampling surfaces (${formatCount(samples.count)} splats)`, progress: 10 * (i + 1) / targets.length });
+                    if (samples.count > MAX_SPLATS) {
+                        throw new Error(`More than ${formatCount(MAX_SPLATS)} splats. Lower the detail and try again.`);
+                    }
                 }
-            }
-            if (samples.count === 0) {
-                throw new Error('Nothing to convert: the meshes produced no splats.');
+                if (samples.count === 0) {
+                    throw new Error('Nothing to convert: the meshes produced no splats.');
+                }
+
+                let colors: SplatColors;
+                if (lit.length) {
+                    colors = await bakeSamples(samples, occluders, lit.map(l => l.params()), bakeSettings, (fraction) => {
+                        events.fire('progressUpdate', { text: `Lighting ${formatCount(samples.count)} splats`, progress: 10 + (relit.length ? 45 : 85) * fraction });
+                    }, control);
+                } else {
+                    colors = unlitColors(samples);
+                }
+
+                events.fire('progressUpdate', { text: 'Loading splats', progress: relit.length ? 55 : 97 });
+                const baseName = options.name ?? (targets.length === 1 ? targets[0].name : `Lit scene ${++counter}`);
+                const created = await importLayer(`${baseName.replace(/[^\w\- ]+/g, '_')}.ply`, writeSplatPly(samples, colors));
+                if (created) {
+                    created.noSizeCull = true;
+                    created.studioMask = 0;
+                }
+                count += samples.count;
+
+                // hide (never delete) what was converted
+                targets.forEach((p) => {
+                    const old = p.getState();
+                    ops.push(new PrimitiveStateOp(p, old, { ...old, visible: false } as PrimitiveState));
+                });
             }
 
-            if (lit.length) {
-                const { sky, ground: g } = ambientLinear();
-                colors = await bakeSamples(samples, occluders, lit.map(l => l.params()), {
-                    degree: settings.degree,
-                    shadowSamples: shadowRays[settings.shadows] ?? 0,
-                    aoSamples: settings.occlusion ? 12 : 0,
-                    exposure: Math.pow(2, settings.exposure),
-                    tonemap: settings.tonemap,
-                    sky,
-                    ground: g,
-                    sceneSize: Math.max(longest, subjectSize(subjectBound(casters))),
-                    cell
+            // ---- splat layers -> lit copies
+            const camera = scene.camera.mainCamera.getPosition();
+            for (let k = 0; k < relit.length; ++k) {
+                if (control.cancelled) throw new BakeCancelled();
+                const splat = relit[k];
+                const progress0 = targets.length ? 55 : 0;
+                const span = (100 - progress0) / relit.length;
+                startProgress('Baking studio lighting');
+                events.fire('progressUpdate', { text: `Reading ${splat.name}`, progress: progress0 + span * k });
+
+                const index = (events.invoke('scene.splats') as Splat[]).indexOf(splat);
+                const sink = new MemorySink();
+                const written = await events.invoke('scene.write', 'ply', {
+                    filename: 'relight.ply',
+                    splatIdx: index,
+                    serializeSettings: {}
+                }, sink);
+                if (!written) continue;
+                const buffer = await sink.blob().arrayBuffer();
+                const layout = readPlyLayout(buffer);
+                const samples = splatSamples(buffer, layout, maskFor(splat, lit), camera);
+                const colors = await bakeSamples(samples, occluders, lit.map(l => l.params()), {
+                    ...bakeSettings,
+                    degree: 0,
+                    aoSamples: 0,
+                    splatBase: settings.splatBase
                 }, (fraction) => {
-                    events.fire('progressUpdate', { text: `Lighting ${formatCount(samples.count)} splats`, progress: 10 + 85 * fraction });
+                    events.fire('progressUpdate', { text: `Lighting ${splat.name} (${formatCount(samples.count)} splats)`, progress: progress0 + span * (k + fraction * 0.9) });
                 }, control);
-            } else {
-                colors = unlitColors(samples);
+                const name = `${splat.name.replace(/\.(compressed\.)?ply$/i, '').replace(/[^\w\- ]+/g, '_')} lit.ply`;
+                const created = await importLayer(name, writeDc(buffer, layout, colors.dc));
+                if (created) created.studioMask = 0;
+                count += layout.count;
+                ops.push(new SplatVisibleOp(splat, false));
             }
         } catch (error) {
             cancelHandle.off();
             events.fire('progressEnd');
-            if (!(error instanceof BakeCancelled)) {
-                await events.invoke('showPopup', {
-                    type: 'error',
-                    header: 'Conversion failed',
-                    message: (error as Error).message ?? String(error)
-                });
-            }
+            if (ops.length) events.fire('edit.add', new MultiOp(ops));
+            await reportError(error, 'Baking failed');
             return 0;
         }
         cancelHandle.off();
-        events.fire('progressUpdate', { text: 'Loading splats', progress: 97 });
-
-        const ply = writeSplatPly(samples, colors);
-        const count = samples.count;
-        const baseName = options.name ?? (targets.length === 1 ? targets[0].name : `Lit scene ${++counter}`);
-        const filename = `${baseName.replace(/[^\w\- ]+/g, '_')}.ply`;
         events.fire('progressEnd');
 
-        let created: Splat | null = null;
-        const onAdded = (element: Element) => {
-            if (element.type === ElementType.splat) created = element as Splat;
-        };
-        const handle = events.on('scene.elementAdded', onAdded);
-        try {
-            await events.invoke('import', [{ filename, contents: new File([ply], filename) }]);
-        } finally {
-            handle.off();
-        }
-        if (created) {
-            (created as Splat).noSizeCull = true;
-            scene.forceRender = true;
-        }
-
-        // hide (never delete) what was converted, and the lights if asked
-        const ops: any[] = targets.map((p) => {
-            const old = p.getState();
-            return new PrimitiveStateOp(p, old, { ...old, visible: false } as PrimitiveState);
-        });
+        // and the lights, if asked
         const hideLights = options.hideLights ?? settings.hideAfter;
         if (hideLights && lit.length) {
-            lit.forEach((light) => {
+            activeLights().forEach((light) => {
                 const old = light.getState();
                 ops.push(new LightStateOp(light, old, { ...old, visible: false }));
             });
             select(null);
         }
-        events.fire('edit.add', new MultiOp(ops));
+        if (ops.length) events.fire('edit.add', new MultiOp(ops));
+        scene.forceRender = true;
         return count;
     };
 
@@ -1199,7 +1410,7 @@ const init = (ctx: ToolkitContext) => {
         if (!convertButton.enabled) return;
         convertButton.enabled = false;
         try {
-            await convertPrimitives(visiblePrimitives());
+            await convertPrimitives(visiblePrimitives(), { relightSplats: true });
         } finally {
             updateEstimate();
         }
@@ -1225,6 +1436,9 @@ const init = (ctx: ToolkitContext) => {
         } else if (isPrimitive(element)) {
             invalidateLights();
             refreshAll();
+        } else if (element.type === ElementType.splat) {
+            updateEditor();
+            updateEstimate();
         }
     });
 
@@ -1237,6 +1451,9 @@ const init = (ctx: ToolkitContext) => {
             if (element === selectedPrimitive) selectedPrimitive = null;
             invalidateLights();
             refreshAll();
+        } else if (element.type === ElementType.splat) {
+            updateEditor();
+            updateEstimate();
         }
     });
 

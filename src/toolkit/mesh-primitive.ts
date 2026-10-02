@@ -251,6 +251,8 @@ class MeshPrimitive extends Element {
     private builtCutoff = -1;
     alphaCutoff = 0.5;
     color: [number, number, number] = [0.8, 0.8, 0.8];
+    // bit per studio light: which lights reach this mesh (set by the studio)
+    studioMask = 0xffff;
     // null on a model = the model's own materials
     roughness: number | null = DEFAULT_ROUGHNESS;
     metalness: number | null = DEFAULT_METALNESS;
@@ -504,6 +506,12 @@ class MeshPrimitive extends Element {
         return this.bound;
     }
 
+    setStudioMask(mask: number) {
+        if (mask === this.studioMask) return;
+        this.studioMask = mask;
+        this.applyColor();
+    }
+
     private applyColor() {
         if (this.kind === 'model') {
             // the picked colour tints the model's own base colours
@@ -511,6 +519,7 @@ class MeshPrimitive extends Element {
                 meshInstance.setParameter('primColor', [baseColor[0] * this.color[0], baseColor[1] * this.color[1], baseColor[2] * this.color[2]]);
                 meshInstance.setParameter('primRoughness', this.roughness ?? roughness);
                 meshInstance.setParameter('primMetalness', this.metalness ?? metalness);
+                meshInstance.setParameter('primStudioMask', this.studioMask);
             });
             return;
         }
@@ -519,6 +528,7 @@ class MeshPrimitive extends Element {
         meshInstance.setParameter('primColor', this.color);
         meshInstance.setParameter('primRoughness', this.roughness ?? DEFAULT_ROUGHNESS);
         meshInstance.setParameter('primMetalness', this.metalness ?? DEFAULT_METALNESS);
+        meshInstance.setParameter('primStudioMask', this.studioMask);
         if (this.texture) {
             meshInstance.setParameter('primTex', this.texture);
             meshInstance.setParameter('primAlphaCutoff', this.alphaCutoff);
