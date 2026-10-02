@@ -270,8 +270,6 @@
     top: 24px;
     right: 102px;
     width: 340px;
-    // above the toolkit's left-anchored panels on narrower screens
-    z-index: 2;
     max-height: calc(100vh - 140px);
     display: flex;
     flex-direction: column;
@@ -282,14 +280,6 @@
 
     & > .panel-header {
         flex-shrink: 0;
-
-        .panel-header-icon > svg {
-            display: block;
-            width: 24px;
-            height: 24px;
-            margin: -4px 0;
-            color: $clr-hilight;
-        }
     }
 }
 
@@ -409,4 +399,27 @@
 // room for four digits (colour temperature) in the slider's number field
 .toolkit-lighting-body .toolkit-slider.pcui-slider > .pcui-numeric-input {
     flex: 0 0 56px;
+}
+
+// ---- floating toolkit panels (see panels.ts): dragged by the title bar
+.toolkit-floating > .toolkit-drag-handle {
+    cursor: grab;
+    user-select: none;
+    padding-right: 4px;
+
+    &.dragging {
+        cursor: grabbing;
+    }
+}
+
+.toolkit-floating.pcui-hidden {
+    display: none !important;
+}
+
+.toolkit-header-icon > svg {
+    display: block;
+    width: 26px;
+    height: 26px;
+    margin: -6px -2px -6px -4px;
+    color: $clr-hilight;
 }

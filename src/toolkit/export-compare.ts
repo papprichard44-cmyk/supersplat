@@ -2,7 +2,9 @@ import { Button, Container, Label } from '@playcanvas/pcui';
 
 import { Element, ElementType } from '../element';
 import { Splat } from '../splat';
+import compareSvg from './icons/compare.svg';
 import { MemorySink } from './memory-sink';
+import { headerIcon, registerPanel } from './panels';
 
 import type { ToolkitContext, ToolkitModule } from './index';
 
@@ -48,7 +50,7 @@ const init = (ctx: ToolkitContext) => {
     });
 
     const header = new Container({ class: 'panel-header' });
-    header.append(new Label({ text: '\uE228', class: 'panel-header-icon' }));
+    header.append(headerIcon(compareSvg));
     header.append(new Label({ text: 'Export compare', class: 'panel-header-label' }));
 
     const runRow = new Container({ class: 'toolkit-row' });
@@ -88,6 +90,18 @@ const init = (ctx: ToolkitContext) => {
         original.hidden = true;
         scene.forceRender = true;
     };
+
+    registerPanel(ctx, {
+        id: 'compare',
+        panel,
+        header,
+        icon: compareSvg,
+        title: 'Export compare',
+        tooltip: 'Export compare: file sizes of PLY, compressed PLY, SOG and SPZ side by side, with a quality preview.',
+        order: 5,
+        // the preview layer only makes sense while the panel is open
+        onHide: endPreview
+    });
 
     const startPreview = async (preset: Preset, blob: Blob, row: Container) => {
         endPreview();

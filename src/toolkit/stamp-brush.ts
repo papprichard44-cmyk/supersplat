@@ -3,7 +3,9 @@ import { Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
 import { Splat } from '../splat';
+import stampSvg from './icons/stamp.svg';
 import { MemorySink } from './memory-sink';
+import { headerIcon, registerPanel } from './panels';
 import {
     FLOATS, Quat, Stamp, Vec,
     cross, dot, makeStamp, normalize, parsePly, placeStamp, quatAxisAngle, quatBetween, quatMul, writePly
@@ -58,7 +60,7 @@ const init = (ctx: ToolkitContext) => {
     });
 
     const header = new Container({ class: 'panel-header' });
-    header.append(new Label({ text: '', class: 'panel-header-icon' }));
+    header.append(headerIcon(stampSvg));
     header.append(new Label({ text: 'Stamp brush', class: 'panel-header-label' }));
 
     const buttons = new Container({ class: 'toolkit-row' });
@@ -103,6 +105,20 @@ const init = (ctx: ToolkitContext) => {
     panel.append(lastRow);
 
     canvasContainer.append(panel);
+
+    registerPanel(ctx, {
+        id: 'stamp',
+        panel,
+        header,
+        icon: stampSvg,
+        title: 'Stamp brush',
+        tooltip: 'Stamp brush: capture selected splats as a stamp and paint copies of it onto surfaces.',
+        order: 3,
+        // painting needs the panel's controls
+        onHide: () => {
+            if (toolManager.active === TOOL) toolManager.activate(null);
+        }
+    });
 
     tooltips.register(capture, tips.capture, 'bottom');
     tooltips.register(paintButton, tips.paint, 'bottom');

@@ -1,11 +1,10 @@
-import { BooleanInput, Button, ColorPicker, Container, Element as PcuiElement, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
+import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
 import { BoundingBox, Ray, Vec3 } from 'playcanvas';
 
 import { bakeSamples, BakeCancelled, LightParams, packLight } from './bake';
 import { kelvinPresets, kelvinToLinear } from './color';
 import { FixtureKind, fixtureKinds, fixtures } from './fixtures';
 import { AddLightOp, LightStateOp, RemoveLightOp, StudioSettingsOp } from './light-ops';
-import lightingSvg from './lighting.svg';
 import { Preset, presets } from './presets';
 import { SampleBuffer, SplatColors, srgbToLinear, unlitColors, writeSplatPly } from './samples';
 import { LIGHT_FLOATS, MAX_PREVIEW_LIGHTS, minAlphaForDegree, TONEMAP_FILMIC, TONEMAP_NEUTRAL, TONEMAP_NONE } from './shading';
@@ -17,8 +16,10 @@ import { ShapeGizmoMode, ShapeTransformGizmo } from '../../tools/shape-transform
 import deleteSvg from '../../ui/svg/delete.svg';
 import hiddenSvg from '../../ui/svg/hidden.svg';
 import shownSvg from '../../ui/svg/shown.svg';
+import lightingSvg from '../icons/lighting.svg';
 import type { ToolkitContext, ToolkitModule } from '../index';
 import { MeshPrimitive, PrimitiveState } from '../mesh-primitive';
+import { headerIcon, registerPanel } from '../panels';
 import { PrimitiveStateOp } from '../primitive-ops';
 import { Occluder, primitiveOccluder, samplePrimitive } from '../primitive-to-splat';
 
@@ -256,12 +257,8 @@ const init = (ctx: ToolkitContext) => {
     });
 
     const header = new Container({ class: 'panel-header' });
-    const headerIcon = new Label({ class: 'panel-header-icon' });
-    headerIcon.dom.appendChild(createSvg(lightingSvg));
-    header.append(headerIcon);
+    header.append(headerIcon(lightingSvg));
     header.append(new Label({ text: 'Studio lighting', class: 'panel-header-label' }));
-    const close = new Button({ class: 'panel-header-button', icon: 'E389' });
-    header.append(close);
     panel.append(header);
 
     const body = new Container({ class: 'toolkit-lighting-body' });
@@ -502,39 +499,37 @@ const init = (ctx: ToolkitContext) => {
 
     canvasContainer.append(panel);
 
-    // ---- right toolbar toggle, in its own group
+    // ---- toolbar toggle, close button and dragging come from the panel manager
 
-    const toolbar = document.getElementById('right-toolbar');
-    const toggle = new Button({ id: 'right-toolbar-studio-lighting', class: 'right-toolbar-toggle' });
-    toggle.dom.appendChild(createSvg(lightingSvg));
-    toggle.dom.setAttribute('aria-label', 'Studio lighting');
-    if (toolbar) {
-        toolbar.appendChild(new PcuiElement({ class: 'right-toolbar-separator' }).dom);
-        toolbar.appendChild(toggle.dom);
-    }
-    tooltips.register(toggle, tips.toggle, 'left');
+    const panelHandle = registerPanel(ctx, {
+        id: 'lighting',
+        panel,
+        header,
+        icon: lightingSvg,
+        title: 'Studio lighting',
+        tooltip: tips.toggle,
+        order: 2
+    });
 
-    const setPanelVisible = (visible: boolean) => {
-        if (visible === !panel.hidden) return;
-        panel.hidden = !visible;
-        toggle.class[visible ? 'add' : 'remove']('active');
-        if (visible) {
-            // share the space left of the toolbar with the editor's own popups
+    const setPanelVisible = (visible: boolean) => panelHandle.setVisible(visible);
+
+    events.on('toolkit.panel.lighting.visible', (visible: boolean) => {
+        if (!visible) return;
+        // at its default place the panel shares the space left of the toolbar
+        // with the editor's own popups; once dragged away it can stay open
+        if (panelHandle.docked) {
             events.fire('appearancePanel.setVisible', false);
             events.fire('settingsPanel.setVisible', false);
             if (events.invoke('overlaysPanel.visible')) events.fire('overlaysPanel.toggleVisible');
-            refreshAll();
         }
-        events.fire('toolkit.lightingPanel.visible', visible);
-    };
-    toggle.on('click', () => setPanelVisible(panel.hidden));
-    close.on('click', () => setPanelVisible(false));
+        refreshAll();
+    });
     ['appearancePanel.visible', 'settingsPanel.visible', 'overlaysPanel.visible'].forEach((name) => {
         events.on(name, (visible: boolean) => {
-            if (visible) setPanelVisible(false);
+            if (visible && panelHandle.docked) setPanelVisible(false);
         });
     });
-    events.function('toolkit.lightingPanel.visible', () => !panel.hidden);
+    events.function('toolkit.lightingPanel.visible', () => panelHandle.visible);
     events.on('toolkit.lightingPanel.setVisible', setPanelVisible);
 
     // ---- settings editing (debounced into one undo step)

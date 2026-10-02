@@ -1,5 +1,7 @@
 import { Button, Container, Label } from '@playcanvas/pcui';
 
+import generateSvg from './icons/generate.svg';
+import { headerIcon, registerPanel } from './panels';
 import { callTool, serviceTools } from './service';
 
 import type { ToolkitContext, ToolkitModule } from './index';
@@ -21,7 +23,7 @@ const init = (ctx: ToolkitContext) => {
     });
 
     const header = new Container({ class: 'panel-header' });
-    header.append(new Label({ text: '\uE195', class: 'panel-header-icon' }));
+    header.append(headerIcon(generateSvg));
     header.append(new Label({ text: 'Generate', class: 'panel-header-label' }));
     const status = new Label({ text: '…', class: 'toolkit-status' });
     header.append(status);
@@ -39,6 +41,16 @@ const init = (ctx: ToolkitContext) => {
     panel.append(header);
     panel.append(row);
     canvasContainer.append(panel);
+
+    registerPanel(ctx, {
+        id: 'generators',
+        panel,
+        header,
+        icon: generateSvg,
+        title: 'Generate',
+        tooltip: 'Generate: create a splat from a photo with the local helper service.',
+        order: 4
+    });
 
     tooltips.register(sharp, tips.sharp, 'bottom');
     tooltips.register(status, tips.status, 'bottom');

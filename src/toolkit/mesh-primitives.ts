@@ -2,7 +2,9 @@ import { Button, ColorPicker, Container, Label, SelectInput, SliderInput, Vector
 import { OrientedBox, Ray, Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
+import primitivesSvg from './icons/primitives.svg';
 import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
+import { headerIcon, registerPanel } from './panels';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
 import { cellForDensity } from './primitive-to-splat';
 import { ShapeKind } from './shapes';
@@ -69,7 +71,7 @@ const init = (ctx: ToolkitContext) => {
     });
 
     const header = new Container({ class: 'panel-header' });
-    header.append(new Label({ text: '\uE187', class: 'panel-header-icon' }));
+    header.append(headerIcon(primitivesSvg));
     header.append(new Label({ text: 'Primitives & images', class: 'panel-header-label' }));
 
     const addRow = new Container({ class: 'toolkit-row' });
@@ -211,6 +213,16 @@ const init = (ctx: ToolkitContext) => {
     panel.append(list);
     panel.append(editor);
     canvasContainer.append(panel);
+
+    registerPanel(ctx, {
+        id: 'primitives',
+        panel,
+        header,
+        icon: primitivesSvg,
+        title: 'Primitives & models',
+        tooltip: 'Primitives & models: planes, walls, boxes, spheres and other shapes, pictures and .glb models, and turning them into splats.',
+        order: 1
+    });
 
     tooltips.register(addPlane, tips.addPlane, 'top');
     tooltips.register(addWall, tips.addWall, 'top');
