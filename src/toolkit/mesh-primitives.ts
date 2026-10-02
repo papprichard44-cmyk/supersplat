@@ -7,6 +7,7 @@ import primitivesSvg from './icons/primitives.svg';
 import { collapsible } from './inspector';
 import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, PrimitiveData, PrimitiveGenerator, PrimitiveKind, PrimitiveState, statesEqual } from './mesh-primitive';
 import { headerIcon, registerPanel } from './panels';
+import { primitiveIcon } from './primitive-icons';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
 import { cellForDensity } from './primitive-to-splat';
 import { ShapeKind } from './shapes';
@@ -80,6 +81,17 @@ const createSvg = (svgString: string) => {
 
 const isPrimitive = (element: Element): element is MeshPrimitive => element instanceof MeshPrimitive;
 
+// the glyph and the name of a mesh's kind
+const glyphOf = (p: MeshPrimitive) => {
+    if (p.generator) return p.generator.type;
+    if (p.kind === 'plane' && Math.abs(p.getState().rotation[0]) > 1e-3) return 'wall';
+    return p.kind;
+};
+const kindName = (p: MeshPrimitive) => {
+    const glyph = glyphOf(p);
+    return ({ image: 'Picture', model: '3D model', rocks: 'Rocks' } as Record<string, string>)[glyph] ?? glyph[0].toUpperCase() + glyph.slice(1);
+};
+
 let getPrimitives: () => MeshPrimitive[] = () => [];
 let loadPrimitives: (data: PrimitiveData[]) => Promise<void> = async () => {};
 
@@ -103,27 +115,45 @@ const init = (ctx: ToolkitContext) => {
     header.append(headerIcon(primitivesSvg));
     header.append(new Label({ text: 'Meshes', class: 'panel-header-label' }));
 
-    const addRow = new Container({ class: 'toolkit-row' });
-    const addPlane = new Button({ text: '+ Plane', class: 'toolkit-button' });
-    const addWall = new Button({ text: '+ Wall', class: 'toolkit-button' });
-    const addBox = new Button({ text: '+ Box', class: 'toolkit-button' });
-    addRow.append(addPlane);
-    addRow.append(addWall);
-    const addImage = new Button({ text: '+ Image', class: 'toolkit-button' });
-    addRow.append(addBox);
-    addRow.append(addImage);
+    const countBadge = new Label({ text: '', class: 'toolkit-count-badge' });
+    header.append(countBadge);
 
-    const addModel = new Button({ text: '+ GLB', class: 'toolkit-button' });
-    addRow.append(addModel);
+    // add tiles: a glyph and a name, like the create menus of 3D tools
+    const tile = (kind: string, label: string, wide?: string) => {
+        const b = new Button({ class: ['toolkit-tile', ...(wide ? ['toolkit-tile-wide'] : [])] });
+        b.dom.innerHTML = wide ?
+            `${primitiveIcon(kind, 26)}<span class="toolkit-tile-text"><span class="toolkit-tile-label">${label}</span><span class="toolkit-tile-sub">${wide}</span></span>` :
+            `${primitiveIcon(kind, 26)}<span class="toolkit-tile-label">${label}</span>`;
+        return b;
+    };
+    const caption = (text: string) => new Label({ text, class: 'toolkit-caption' });
 
-    const shapeRow = new Container({ class: 'toolkit-row' });
+    const shapeGrid = new Container({ class: 'toolkit-tile-grid' });
+    const addPlane = tile('plane', 'Plane');
+    const addWall = tile('wall', 'Wall');
+    const addBox = tile('box', 'Box');
+    shapeGrid.append(addPlane);
+    shapeGrid.append(addWall);
+    shapeGrid.append(addBox);
     const shapeButtons: [ShapeKind, string, Button][] = ([
         ['sphere', 'Sphere'], ['cylinder', 'Cylinder'], ['cone', 'Cone'], ['torus', 'Torus'], ['backdrop', 'Backdrop']
     ] as [ShapeKind, string][]).map(([kind, label]) => {
-        const button = new Button({ text: `+ ${label}`, class: 'toolkit-button' });
-        shapeRow.append(button);
+        const button = tile(kind, label);
+        shapeGrid.append(button);
         return [kind, label, button];
     });
+
+    const importGrid = new Container({ class: ['toolkit-tile-grid', 'toolkit-tile-grid-wide'] });
+    const addImage = tile('image', 'Picture', 'PNG cut-out');
+    const addModel = tile('model', '3D model', '.glb file');
+    importGrid.append(addImage);
+    importGrid.append(addModel);
+
+    const listHead = new Container({ class: 'toolkit-caption-row' });
+    listHead.append(caption('In the scene'));
+    const listCount = new Label({ text: '', class: 'toolkit-caption-count' });
+    listHead.append(listCount);
+    const emptyList = new Label({ text: 'Nothing yet. Add a shape above, or drop a .glb or a picture onto the viewport.', class: ['toolkit-hint', 'toolkit-list-empty'] });
 
     const modelInput = document.createElement('input');
     modelInput.type = 'file';
@@ -137,7 +167,7 @@ const init = (ctx: ToolkitContext) => {
     fileInput.style.display = 'none';
     panel.dom.appendChild(fileInput);
 
-    const list = new Container({ class: 'toolkit-list' });
+    const list = new Container({ class: ['toolkit-list', 'toolkit-outliner'] });
 
     const editor = new Container({ class: 'toolkit-editor', hidden: true });
 
@@ -459,9 +489,16 @@ const init = (ctx: ToolkitContext) => {
     tooltips.register(hideToggle, tips.hideAfter, 'bottom');
 
     panel.append(header);
-    panel.append(addRow);
-    panel.append(shapeRow);
-    panel.append(list);
+    const panelBody = new Container({ class: 'toolkit-meshes-body' });
+    panelBody.append(caption('Shapes'));
+    panelBody.append(shapeGrid);
+    panelBody.append(caption('Import'));
+    panelBody.append(importGrid);
+    panelBody.append(listHead);
+    panelBody.append(list);
+    panelBody.append(emptyList);
+    panel.append(panelBody);
+    list.hidden = true;
     canvasContainer.append(panel);
 
     registerPanel(ctx, {
@@ -632,12 +669,6 @@ const init = (ctx: ToolkitContext) => {
         lightBox.append(actionRow);
     };
 
-    // what the inspector calls the selected mesh
-    const kindLabel = (p: MeshPrimitive) => {
-        if (p.generator) return { tree: 'Tree', grass: 'Grass', rocks: 'Rocks' }[p.generator.type] ?? 'Model';
-        if (p.kind === 'plane') return p.getState().rotation[0] !== 0 ? 'Wall' : 'Plane';
-        return p.kind[0].toUpperCase() + p.kind.slice(1);
-    };
 
     let uiUpdating = false;
     const updateEditor = () => {
@@ -645,7 +676,7 @@ const init = (ctx: ToolkitContext) => {
             events.invoke('toolkit.inspector.hide', 'mesh');
             return;
         }
-        events.invoke('toolkit.inspector.show', 'mesh', { title: selected.name, kind: kindLabel(selected), content: editor });
+        events.invoke('toolkit.inspector.show', 'mesh', { title: selected.name, kind: kindName(selected), content: editor });
         const state = selected.getState();
         // dragging a number field moves it one step per 100px, so the step has
         // to follow the size of the scene (a fixed step of 1 is useless on a
@@ -773,18 +804,28 @@ const init = (ctx: ToolkitContext) => {
 
     const refreshList = () => {
         list.clear();
-        primitives().forEach((primitive) => {
+        const all = primitives();
+        const hidden = all.filter(p => !p.entity.enabled).length;
+        countBadge.text = all.length ? String(all.length) : '';
+        listCount.text = all.length ? `${all.length}${hidden ? ` · ${hidden} hidden` : ''}` : '';
+        emptyList.hidden = all.length > 0;
+        list.hidden = all.length === 0;
+        all.forEach((primitive) => {
             const row = new Container({ class: 'toolkit-list-row' });
-            if (primitive === selected) {
-                row.class.add('selected');
-            }
+            if (primitive === selected) row.class.add('selected');
+            if (!primitive.entity.enabled) row.class.add('hidden-item');
 
+            const icon = new Container({ class: 'toolkit-list-icon' });
+            icon.dom.innerHTML = primitiveIcon(glyphOf(primitive), 16);
             const name = new Label({ text: primitive.name, class: 'toolkit-list-name' });
+            // the kind, unless the name already says it
+            const kindText = kindName(primitive);
+            const kind = new Label({ text: primitive.name.toLowerCase().startsWith(kindText.toLowerCase()) ? '' : kindText, class: 'toolkit-list-kind' });
 
-            const visible = new Container({ class: 'toolkit-list-button' });
+            const visible = new Container({ class: ['toolkit-list-button', 'toolkit-list-eye'] });
             visible.dom.appendChild(createSvg(primitive.entity.enabled ? shownSvg : hiddenSvg));
 
-            const remove = new Container({ class: 'toolkit-list-button' });
+            const remove = new Container({ class: ['toolkit-list-button', 'toolkit-list-remove'] });
             remove.dom.appendChild(createSvg(deleteSvg));
 
             row.on('click', () => select(primitive === selected ? null : primitive));
@@ -806,7 +847,9 @@ const init = (ctx: ToolkitContext) => {
             tooltips.register(visible, tips.visible, 'top');
             tooltips.register(remove, tips.remove, 'top');
 
+            row.append(icon);
             row.append(name);
+            row.append(kind);
             row.append(visible);
             row.append(remove);
             list.append(row);
