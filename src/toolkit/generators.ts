@@ -1,7 +1,8 @@
 import { Button, Container, Label } from '@playcanvas/pcui';
 
-import type { ToolkitContext, ToolkitModule } from './index';
 import { callTool, serviceTools } from './service';
+
+import type { ToolkitContext, ToolkitModule } from './index';
 
 // Generators: tools that create a new splat layer from something else. They
 // run in the local helper service; this module is only the ui around them.

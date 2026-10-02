@@ -1,6 +1,7 @@
 import { ElementType } from '../element';
 import type { Scene } from '../scene';
 import { Splat } from '../splat';
+
 import type { ToolkitContext, ToolkitModule } from './index';
 
 // Splat layers generated from meshes opt out of the renderer's size cull (see

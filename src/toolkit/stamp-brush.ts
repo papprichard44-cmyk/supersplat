@@ -3,12 +3,13 @@ import { Vec3 } from 'playcanvas';
 
 import { Element, ElementType } from '../element';
 import { Splat } from '../splat';
-import type { ToolkitContext, ToolkitModule } from './index';
 import { MemorySink } from './memory-sink';
 import {
     FLOATS, Quat, Stamp, Vec,
     cross, dot, makeStamp, normalize, parsePly, placeStamp, quatAxisAngle, quatBetween, quatMul, writePly
 } from './stamp-math';
+
+import type { ToolkitContext, ToolkitModule } from './index';
 
 // Stamp brush: capture a patch of selected gaussians as a stamp, then paint
 // copies of it onto the surfaces of the scene. Each copy sits on the surface

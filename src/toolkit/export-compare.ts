@@ -2,8 +2,9 @@ import { Button, Container, Label } from '@playcanvas/pcui';
 
 import { Element, ElementType } from '../element';
 import { Splat } from '../splat';
-import type { ToolkitContext, ToolkitModule } from './index';
 import { MemorySink } from './memory-sink';
+
+import type { ToolkitContext, ToolkitModule } from './index';
 
 // Compression-aware export: writes the scene in several formats / settings into
 // memory with the editor's own exporters (which are splat-transform running in
