@@ -41,7 +41,8 @@ type GrassParams = {
     // amounts relative to the blade size, so small blades fill a big stroke
     // and big blades leave just a few in it
     area?: GrassArea;
-    fullness?: number;          // 0..1: how close the blades stand, relative to their size
+    fill?: number;              // 0..1: how close the blades stand, relative to their size
+    fullness?: number;          // the same on an older (quadratic) scale
     thickness?: number;         // blade width as a share of its height
     flowerAmount?: number;      // 0..1: share of flowers among the blades (up to 15%)
 };
@@ -67,7 +68,7 @@ const defaultGrass = (size: number): GrassParams => ({
     height: size * 0.04,
     heightVariance: 0.4,
     bladeWidth: size * 0.04 * 0.035,
-    fullness: 0.45,
+    fill: 0.68,
     thickness: 0.035,
     flowerAmount: 0,
     bend: 0.45,
@@ -105,11 +106,20 @@ type Blade = {
 
 // blade width and blades per square unit, from either way of setting them
 const bladeWidthOf = (p: GrassParams) => (p.thickness !== undefined ? p.height * p.thickness : p.bladeWidth);
+// fill 0..1 on an even (exponential) scale: every step of the slider adds the
+// same share of blades, from a few a blade-height apart (0) to a dense lawn (1)
+const FILL_MIN = 0.4;
+const FILL_RANGE = 400;
+const fillToPerArea = (fill: number, height: number) => FILL_MIN * Math.pow(FILL_RANGE, Math.min(1, Math.max(0, fill))) / Math.max(1e-12, height * height);
+const perAreaToFill = (perArea: number, height: number) => Math.min(1, Math.max(0, Math.log(Math.max(1e-12, perArea * height * height) / FILL_MIN) / Math.log(FILL_RANGE)));
+
 const bladesPerArea = (p: GrassParams) => {
-    if (p.fullness === undefined) return p.density;
-    const f = Math.min(1, Math.max(0, p.fullness));
-    // from a few blades a blade-height apart to a dense lawn
-    return (0.3 + 160 * f * f) / Math.max(1e-6, p.height * p.height);
+    if (p.fill !== undefined) return fillToPerArea(p.fill, p.height);
+    if (p.fullness !== undefined) {
+        const f = Math.min(1, Math.max(0, p.fullness));
+        return (0.3 + 160 * f * f) / Math.max(1e-6, p.height * p.height);
+    }
+    return p.density;
 };
 
 // ---- the area of a brushed patch: within `radius` of the stroke
@@ -554,4 +564,4 @@ const grassSamples = (p: GrassParams, transform: Mat4, out: SampleBuffer, tint: 
     return out.count - start;
 };
 
-export { GrassParams, GrassArea, defaultGrass, grassGlb, grassSamples, bladeCount, grassSplatCount, bladesPerArea, flowerPalettes, MAX_BLADES };
+export { GrassParams, GrassArea, defaultGrass, grassGlb, grassSamples, bladeCount, grassSplatCount, bladesPerArea, perAreaToFill, flowerPalettes, MAX_BLADES };

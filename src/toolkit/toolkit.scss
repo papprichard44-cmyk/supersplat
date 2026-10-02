@@ -1135,3 +1135,27 @@
         aspect-ratio: 2 / 1;
     }
 }
+
+// ---- logarithmic slider (log-slider.ts): the number, then a bare track
+.toolkit-log-slider {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-grow: 1;
+    min-width: 0;
+
+    & > .toolkit-log-number.pcui-numeric-input {
+        flex: 0 0 56px;
+        margin: 0 6px 0 0;
+    }
+
+    & > .toolkit-log-track.pcui-slider {
+        margin: 0;
+        flex-grow: 1;
+        min-width: 0;
+
+        & > .pcui-numeric-input {
+            display: none;
+        }
+    }
+}

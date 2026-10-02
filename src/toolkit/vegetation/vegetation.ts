@@ -1,13 +1,14 @@
 import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
 import { BoundingBox, Vec3 } from 'playcanvas';
 
-import { bladeCount, bladesPerArea, defaultGrass, flowerPalettes, GrassParams, grassGlb, MAX_BLADES } from './grass';
+import { bladeCount, bladesPerArea, defaultGrass, flowerPalettes, GrassParams, grassGlb, MAX_BLADES, perAreaToFill } from './grass';
 import { defaultRocks, RockParams, rocksGlb, speciesNames } from './rocks';
 import { barkTypes, defaultTree, leafTypes, presetInfo, TreeParams, treeGlb, treePresets } from './tree';
 import { ElementType } from '../../element';
 import vegetationSvg from '../icons/vegetation.svg';
 import type { ToolkitContext, ToolkitModule } from '../index';
 import { collapsible } from '../inspector';
+import { LogSlider } from '../log-slider';
 import { MeshPrimitive } from '../mesh-primitive';
 import { MeshRaycaster } from '../mesh-raycast';
 import { headerIcon, registerPanel } from '../panels';
@@ -157,6 +158,14 @@ const init = (ctx: ToolkitContext) => {
         tooltips.register(s, tip, 'bottom');
         return s;
     };
+    // sizes and distances: a logarithmic track, its range set from the scene
+    const logSlider = (labelText: string, tip: string, min: number, max: number) => {
+        const r = row(labelText, tip);
+        const s = new LogSlider(min, max, min);
+        r.append(s);
+        tooltips.register(s, tip, 'bottom');
+        return s;
+    };
     const select = (labelText: string, tip: string, options: { v: string, t: string }[]) => {
         const r = row(labelText, tip);
         const s = new SelectInput({ class: 'toolkit-select', type: 'string', options, value: options[0].v });
@@ -210,11 +219,11 @@ const init = (ctx: ToolkitContext) => {
     const grassBrush = new Container();
     body.append(grassBrush);
     target = grassBrush;
-    const brush = slider('Brush radius', tips.brushRadius, 0.001, 100, 3, 0.001);
+    const brush = logSlider('Brush radius', tips.brushRadius, 0.01, 2);
     const placeOptions = new Container();
     body.append(placeOptions);
     target = placeOptions;
-    const spacing = slider('Spacing', tips.spacing, 0.01, 20, 2, 0.01);
+    const spacing = logSlider('Spacing', tips.spacing, 0.01, 4);
     const scaleVariation = slider('Size var.', tips.scaleVariation, 0, 0.8, 2, 0.01);
     const varyRow = row('New shapes', tips.varyShape);
     const varyShape = new BooleanInput({ type: 'toggle', value: true });
@@ -241,7 +250,7 @@ const init = (ctx: ToolkitContext) => {
     section('Tree');
     const preset = select('Kind', tips.preset, treePresets.map(p => ({ v: p, t: p })));
     const treeSeed = seedRow(tips.seed);
-    const height = slider('Height', tips.treeHeight, 0.05, 50, 2, 0.01);
+    const height = logSlider('Height', tips.treeHeight, 0.05, 10);
     const levels = slider('Branches', tips.levels, 0, 3, 0, 1);
     const branching = slider('Branching', tips.branching, 0.3, 2, 2, 0.01);
     const gnarliness = slider('Crooked', tips.gnarliness, 0, 3, 2, 0.01);
@@ -258,11 +267,11 @@ const init = (ctx: ToolkitContext) => {
     // grass: the main controls, then folding groups for the rest
     target = grassPage;
     section('Grass');
-    const grassSize = slider('Size', tips.grassSize, 0.0005, 100, 3, 0.001);
+    const grassSize = logSlider('Size', tips.grassSize, 0.004, 0.5);
     const fullness = slider('Density', tips.fullness, 0, 1, 2, 0.01);
     const heightVariance = slider('Variance', tips.heightVariance, 0, 1, 2, 0.01);
     const bend = slider('Bend', tips.bend, 0, 1, 2, 0.01);
-    const thickness = slider('Thickness', tips.thickness, 0.005, 0.2, 3, 0.001);
+    const thickness = logSlider('Thickness', tips.thickness, 0.008, 0.25);
     const clumping = slider('Tufts', tips.clumping, 0, 1, 2, 0.01);
     const grassSeed = seedRow(tips.seed);
     const grassGroup = (title: string, id: string, open: boolean) => {
@@ -299,7 +308,7 @@ const init = (ctx: ToolkitContext) => {
     const rockKind = select('Kind', tips.rockKind, speciesNames.map(n => ({ v: n.key, t: n.name })));
     const rockSeed = seedRow(tips.seed);
     const rockCount = slider('Count', tips.rockCount, 1, 50, 0, 1);
-    const rockSize = slider('Size', tips.rockSize, 0.01, 20, 2, 0.01);
+    const rockSize = logSlider('Size', tips.rockSize, 0.005, 2);
     const rockSizeVariation = slider('Size var.', tips.rockSizeVariation, 0, 1, 2, 0.01);
     const spread = slider('Spread', tips.spread, 0.5, 8, 2, 0.01);
     const turn = slider('Turn', tips.turn, 0, 1, 2, 0.01);
@@ -350,7 +359,7 @@ const init = (ctx: ToolkitContext) => {
 
         grassSeed.s.value = grass.seed;
         grassSize.value = grass.height;
-        fullness.value = grass.fullness ?? 0.45;
+        fullness.value = grass.fill ?? 0.68;
         heightVariance.value = grass.heightVariance;
         thickness.value = grass.thickness ?? 0.035;
         bend.value = grass.bend;
@@ -450,7 +459,7 @@ const init = (ctx: ToolkitContext) => {
         grassChanged();
     });
     grassSize.on('change', (v: number) => onGrass({ height: v, bladeWidth: v * (grass.thickness ?? 0.035) }));
-    fullness.on('change', (v: number) => onGrass({ fullness: v }));
+    fullness.on('change', (v: number) => onGrass({ fill: v }));
     heightVariance.on('change', (v: number) => onGrass({ heightVariance: v }));
     thickness.on('change', (v: number) => onGrass({ thickness: v, bladeWidth: grass.height * v }));
     bend.on('change', (v: number) => onGrass({ bend: v }));
@@ -571,7 +580,7 @@ const init = (ctx: ToolkitContext) => {
     // grass made before brushing: its absolute amounts as the relative ones
     function normalizeGrass(p: GrassParams): GrassParams {
         const out = { ...p };
-        if (out.fullness === undefined) out.fullness = Math.min(1, Math.sqrt(Math.max(0, (p.density * p.height * p.height - 0.3) / 160)));
+        if (out.fill === undefined) out.fill = perAreaToFill(bladesPerArea(p), p.height);
         if (out.thickness === undefined) out.thickness = p.bladeWidth / Math.max(1e-9, p.height);
         if (out.flowerAmount === undefined) out.flowerAmount = Math.min(1, p.flowers * p.width * p.depth / Math.max(1, bladeCount(p)) / 0.15);
         return out;
@@ -1003,6 +1012,14 @@ const init = (ctx: ToolkitContext) => {
 
     // sizes follow the scene when the panel opens on a new scene
     let sizedFor = -1;
+    // slider tracks span what makes sense for a scene of this size
+    const applyRanges = (size: number) => {
+        brush.setRange(size * 0.004, size * 1.5);
+        spacing.setRange(size * 0.005, size * 2);
+        height.setRange(size * 0.02, size * 4);
+        grassSize.setRange(size * 0.002, size * 0.25);
+        rockSize.setRange(size * 0.002, size);
+    };
     events.on('toolkit.panel.vegetation.visible', (visible: boolean) => {
         if (!visible) return;
         const size = sceneSize();
@@ -1011,11 +1028,11 @@ const init = (ctx: ToolkitContext) => {
             treeHeight = size * 0.9;
             grass = { ...defaultGrass(size), seed: grass.seed, direct: grass.direct };
             brushRadius = Math.max(0.001, size * 0.08);
-            grassSize.sliderMax = Math.max(0.01, size * 0.25);
-            brush.sliderMax = Math.max(0.05, size);
+
             rocks = { ...rocks, size: Math.max(0.01, size * 0.12) };
             placeSpacing = defaultSpacing();
         }
+        applyRanges(size);
         updateUI();
     });
 
