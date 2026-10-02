@@ -1,7 +1,7 @@
 import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput } from '@playcanvas/pcui';
 import { BoundingBox, Ray, Vec3 } from 'playcanvas';
 
-import { bakeSamples, BakeCancelled, LightParams, packLight } from './bake';
+import { bakeSamples, BakeCancelled, BakeSettings, LightParams, packLight } from './bake';
 import { kelvinPresets, kelvinToLinear } from './color';
 import { FixtureKind, fixtureKinds, fixtures } from './fixtures';
 import { AddLightOp, LightStateOp, RemoveLightOp, SplatVisibleOp, StudioSettingsOp } from './light-ops';
@@ -9,7 +9,7 @@ import { Preset, presets } from './presets';
 import { SampleBuffer, SplatColors, srgbToLinear, unlitColors, writeSplatPly } from './samples';
 import { LIGHT_FLOATS, MAX_PREVIEW_LIGHTS, minAlphaForDegree, TONEMAP_FILMIC, TONEMAP_NEUTRAL, TONEMAP_NONE } from './shading';
 import { splatLighting } from './splat-lighting';
-import { readPlyLayout, splatSamples, writeDc } from './splat-relight';
+import { buildShadowGrid, PlyLayout, readPlyLayout, ShadowGrid, splatSamples, writeDc } from './splat-relight';
 import { LightState, StudioLight, Vec3Tuple } from './studio-light';
 import { MultiOp } from '../../edit-ops';
 import { Element, ElementType } from '../../element';
@@ -51,6 +51,7 @@ type StudioSettings = {
     hideAfter: boolean;                     // hide the converted meshes and the lights afterwards
     showBeams: boolean;
     lightSplats: boolean;                   // the lights also reach the splat layers
+    noShadow: string[];                     // objects that cast no shadows in the bake
     splatBase: number;                      // share of the splats' own light that is kept
 };
 
@@ -68,6 +69,7 @@ const defaultSettings = (): StudioSettings => ({
     hideAfter: true,
     showBeams: true,
     lightSplats: false,
+    noShadow: [],
     splatBase: 1
 });
 
@@ -111,6 +113,7 @@ const tips = {
     lightSplats: 'Let the lights reach the splat layers too: they light up live in the viewport, and "Bake & convert" writes the light into a lit copy of each layer (the original is hidden, not deleted). Off: the lights only reach the meshes.',
     splatBase: 'How much of the splats\' own, captured light is kept under the lamps: 1 = all of it (the lamps add light on top), lower values darken the original so the lamps dominate.',
     only: 'Limit this light to the objects ticked below. Off: it reaches everything.',
+    casters: 'Which objects cast shadows when baking. A splat layer (e.g. a scanned statue on a mesh podium) shadows the meshes and the other splat layers, never itself: its own captured shadows are already in its colours. Shadows fall on everything the lights reach.',
     targets: 'The objects this light reaches. Splat layers appear here when "Light splats" is on.'
 };
 
@@ -164,6 +167,7 @@ const init = (ctx: ToolkitContext) => {
     let select: (light: StudioLight | null) => void = () => {};
     let updateEditor: () => void = () => {};
     let refreshTargets: () => void = () => {};
+    let refreshCasters: () => void = () => {};
 
     const primitives = () => scene.getElementsByType(ElementType.model).filter(isPrimitive);
     const visiblePrimitives = () => primitives().filter(p => p.entity.enabled);
@@ -474,6 +478,12 @@ const init = (ctx: ToolkitContext) => {
     body.append(splatsRow);
     const splatBase = sliderRow('Keep own', tips.splatBase, 0, 1, 2, 0.01);
     body.append(splatBase.row);
+    const castersTitle = hint('Casts shadows (when baking):');
+    castersTitle.class.add('toolkit-subtitle');
+    body.append(castersTitle);
+    tooltips.register(castersTitle, tips.casters, 'left');
+    const castersList = new Container({ class: 'toolkit-checklist' });
+    body.append(castersList);
 
     section('Environment & camera');
     const ambient = sliderRow('Ambient', tips.ambient, 0, 1, 2, 0.01);
@@ -648,6 +658,7 @@ const init = (ctx: ToolkitContext) => {
         splatBase.slider.value = settings.splatBase;
         splatBase.row.hidden = !settings.lightSplats;
         uiUpdating = false;
+        refreshCasters();
     };
 
     ambient.slider.on('change', (value: number) => editSettings({ ambient: value }));
@@ -979,6 +990,40 @@ const init = (ctx: ToolkitContext) => {
         }
     };
 
+    // objects casting shadows in the bake
+    refreshCasters = () => {
+        castersList.clear();
+        const items = [
+            ...primitives().map(p => ({ key: targetKey(p), name: p.name, kind: 'mesh', shown: p.entity.enabled })),
+            ...splatLayers().map(sp => ({ key: targetKey(sp), name: sp.name, kind: 'splat', shown: sp.visible }))
+        ];
+        if (items.length === 0) {
+            castersList.append(hint('Nothing in the scene yet.'));
+            return;
+        }
+        const off = new Set(settings.noShadow);
+        items.forEach((item) => {
+            const r = new Container({ class: 'toolkit-check-row' });
+            if (!item.shown) r.class.add('dimmed');
+            const box = new BooleanInput({ type: 'checkbox', value: !off.has(item.key) });
+            const name = new Label({ text: item.name, class: 'toolkit-check-name' });
+            const kind = new Label({ text: item.kind, class: 'toolkit-check-kind' });
+            r.append(box);
+            r.append(name);
+            r.append(kind);
+            box.on('change', (value: boolean) => {
+                if (uiUpdating) return;
+                const next = new Set(settings.noShadow);
+                if (value) next.delete(item.key); else next.add(item.key);
+                editSettings({ noShadow: [...next] });
+            });
+            name.dom.addEventListener('click', () => {
+                box.value = !box.value;
+            });
+            castersList.append(r);
+        });
+    };
+
     onlyToggle.on('change', (value: boolean) => {
         if (uiUpdating || !selected) return;
         // starting a selection: begin with the subject (the selected mesh, or everything visible)
@@ -1270,9 +1315,10 @@ const init = (ctx: ToolkitContext) => {
         });
 
         const { sky, ground: g } = ambientLinear();
-        const casters = lit.length ? visiblePrimitives() : [];
+        const casts = (element: MeshPrimitive | Splat) => !settings.noShadow.includes(targetKey(element));
+        const casters = lit.length ? visiblePrimitives().filter(casts) : [];
         const sceneSize = Math.max(longest, subjectSize(subjectBound(casters.length ? casters : undefined)));
-        const bakeSettings = {
+        const bakeSettings: BakeSettings = {
             degree: settings.degree,
             shadowSamples: shadowRays[settings.shadows] ?? 0,
             aoSamples: settings.occlusion ? 12 : 0,
@@ -1281,7 +1327,8 @@ const init = (ctx: ToolkitContext) => {
             sky,
             ground: g,
             sceneSize,
-            cell
+            cell,
+            grids: []
         };
         const ops: any[] = [];
         let count = 0;
@@ -1298,6 +1345,43 @@ const init = (ctx: ToolkitContext) => {
                     occluders.push(occluder);
                 }
             }
+
+            // splat layers casting shadows: density grids, built from the
+            // layers as they are now (before anything new is added)
+            const exports = new Map<Splat, { buffer: ArrayBuffer, layout: PlyLayout }>();
+            const exportLayer = async (splat: Splat) => {
+                let entry = exports.get(splat);
+                if (!entry) {
+                    const sink = new MemorySink();
+                    const written = await events.invoke('scene.write', 'ply', {
+                        filename: 'studio.ply',
+                        splatIdx: (events.invoke('scene.splats') as Splat[]).indexOf(splat),
+                        serializeSettings: {}
+                    }, sink);
+                    if (!written) return null;
+                    const buffer = await sink.blob().arrayBuffer();
+                    entry = { buffer, layout: readPlyLayout(buffer) };
+                    exports.set(splat, entry);
+                }
+                return entry;
+            };
+            const shadowsUsed = (bakeSettings.shadowSamples > 0 && lit.some(l => l.state.shadows)) || bakeSettings.aoSamples > 0;
+            const splatCasters = lit.length && shadowsUsed ?
+                splatLayers().filter(sp => sp.visible && sp.numSplats > 0 && casts(sp)) : [];
+            const grids: ShadowGrid[] = [];
+            const gridIndex = new Map<Splat, number>();
+            for (const splat of splatCasters) {
+                if (control.cancelled) throw new BakeCancelled();
+                startProgress('Baking studio lighting');
+                events.fire('progressUpdate', { text: `Shadows of ${splat.name}`, progress: 2 });
+                const entry = await exportLayer(splat);
+                const grid = entry && buildShadowGrid(entry.buffer, entry.layout);
+                if (grid) {
+                    gridIndex.set(splat, grids.length);
+                    grids.push(grid);
+                }
+            }
+            bakeSettings.grids = grids;
 
             // ---- meshes -> one new splat layer
             if (targets.length) {
@@ -1354,17 +1438,10 @@ const init = (ctx: ToolkitContext) => {
                 startProgress('Baking studio lighting');
                 events.fire('progressUpdate', { text: `Reading ${splat.name}`, progress: progress0 + span * k });
 
-                const index = (events.invoke('scene.splats') as Splat[]).indexOf(splat);
-                const sink = new MemorySink();
-                const written = await events.invoke('scene.write', 'ply', {
-                    filename: 'relight.ply',
-                    splatIdx: index,
-                    serializeSettings: {}
-                }, sink);
-                if (!written) continue;
-                const buffer = await sink.blob().arrayBuffer();
-                const layout = readPlyLayout(buffer);
-                const samples = splatSamples(buffer, layout, maskFor(splat, lit), camera);
+                const entry = await exportLayer(splat);
+                if (!entry) continue;
+                const { buffer, layout } = entry;
+                const samples = splatSamples(buffer, layout, maskFor(splat, lit), camera, gridIndex.get(splat) ?? -1);
                 const colors = await bakeSamples(samples, occluders, lit.map(l => l.params()), {
                     ...bakeSettings,
                     degree: 0,
@@ -1439,6 +1516,7 @@ const init = (ctx: ToolkitContext) => {
         } else if (element.type === ElementType.splat) {
             updateEditor();
             updateEstimate();
+            refreshCasters();
         }
     });
 
@@ -1454,6 +1532,7 @@ const init = (ctx: ToolkitContext) => {
         } else if (element.type === ElementType.splat) {
             updateEditor();
             updateEstimate();
+            refreshCasters();
         }
     });
 
@@ -1467,6 +1546,7 @@ const init = (ctx: ToolkitContext) => {
     events.on('toolkit.primitive.changed', () => {
         invalidateLights();
         updateEstimate();
+        refreshCasters();
     });
 
     // new document / document load

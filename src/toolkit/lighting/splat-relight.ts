@@ -1,4 +1,4 @@
-import { S_LIGHTMASK, S_ROUGH, STRIDE, SampleBuffer, srgbToLinear } from './samples';
+import { S_LAYER, S_LIGHTMASK, S_ROUGH, STRIDE, SampleBuffer, srgbToLinear } from './samples';
 
 // Relighting an existing splat layer: the layer is exported to a PLY in
 // memory, every gaussian becomes a sample for the bake (its colour as the
@@ -71,7 +71,7 @@ const readPlyLayout = (buffer: ArrayBuffer): PlyLayout => {
 
 // the gaussians as bake samples, in world space (the PLY convention is
 // rotated 180 degrees about Z). Normals face the camera, as in the preview.
-const splatSamples = (buffer: ArrayBuffer, layout: PlyLayout, mask: number, camera: { x: number, y: number, z: number }) => {
+const splatSamples = (buffer: ArrayBuffer, layout: PlyLayout, mask: number, camera: { x: number, y: number, z: number }, ownGrid = -1) => {
     const view = new DataView(buffer, layout.dataStart);
     const o = layout.offsets;
     const samples = new SampleBuffer();
@@ -110,6 +110,7 @@ const splatSamples = (buffer: ArrayBuffer, layout: PlyLayout, mask: number, came
         const k = (samples.count - 1) * STRIDE;
         samples.data[k + S_ROUGH] = flatness;
         samples.data[k + S_LIGHTMASK] = mask;
+        samples.data[k + S_LAYER] = ownGrid;
     }
     return samples;
 };
@@ -128,4 +129,97 @@ const writeDc = (buffer: ArrayBuffer, layout: PlyLayout, dc: Float32Array) => {
     return copy;
 };
 
-export { readPlyLayout, splatSamples, writeDc, PlyLayout };
+type ShadowGrid = { min: number[], voxel: number, nx: number, ny: number, nz: number, data: Float32Array };
+
+// A splat layer as a shadow caster: its gaussians deposited on a voxel grid
+// as extinction (optical depth per unit length), so a shadow ray passing
+// through the layer is dimmed by what it crosses. Each gaussian is a blob of
+// radius r (two standard deviations of its in-plane size) whose cross-section
+// absorbs -ln(1 - alpha) of the light, spread over the voxels it covers.
+const buildShadowGrid = (buffer: ArrayBuffer, layout: PlyLayout, maxRes = 128): ShadowGrid | null => {
+    const view = new DataView(buffer, layout.dataStart);
+    const o = layout.offsets;
+    const n = layout.count;
+    if (n === 0) return null;
+    const hasOpacity = o.opacity !== undefined;
+
+    // centres (world) and their bound; robust to a few far away floaters
+    const centres = new Float32Array(n * 3);
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const zs: number[] = [];
+    for (let i = 0; i < n; ++i) {
+        const base = i * layout.stride;
+        const x = -view.getFloat32(base + o.x, true), y = -view.getFloat32(base + o.y, true), z = view.getFloat32(base + o.z, true);
+        centres[i * 3] = x; centres[i * 3 + 1] = y; centres[i * 3 + 2] = z;
+        if (i % Math.max(1, Math.floor(n / 20000)) === 0) {
+            xs.push(x); ys.push(y); zs.push(z);
+        }
+    }
+    const range = (values: number[]) => {
+        values.sort((a, b) => a - b);
+        const lo = values[Math.floor(values.length * 0.002)];
+        const hi = values[Math.min(values.length - 1, Math.ceil(values.length * 0.998))];
+        return [lo, hi];
+    };
+    const [x0, x1] = range(xs);
+    const [y0, y1] = range(ys);
+    const [z0, z1] = range(zs);
+    const extent = Math.max(x1 - x0, y1 - y0, z1 - z0, 1e-6);
+    const voxel = extent / (maxRes - 4);
+    const min = [x0 - 2 * voxel, y0 - 2 * voxel, z0 - 2 * voxel];
+    const nx = Math.ceil((x1 - x0) / voxel) + 4;
+    const ny = Math.ceil((y1 - y0) / voxel) + 4;
+    const nz = Math.ceil((z1 - z0) / voxel) + 4;
+    const data = new Float32Array(nx * ny * nz);
+    const volume = voxel * voxel * voxel;
+    const maxSpan = 6;
+
+    for (let i = 0; i < n; ++i) {
+        const base = i * layout.stride;
+        const alpha = hasOpacity ? 1 / (1 + Math.exp(-view.getFloat32(base + o.opacity, true))) : 1;
+        if (!(alpha > 0.02)) continue;
+        const s0 = Math.exp(view.getFloat32(base + o.scale_0, true));
+        const s1 = Math.exp(view.getFloat32(base + o.scale_1, true));
+        const s2 = Math.exp(view.getFloat32(base + o.scale_2, true));
+        const smax = Math.max(s0, s1, s2);
+        const smid = s0 + s1 + s2 - smax - Math.min(s0, s1, s2);
+        const r = Math.min(2 * Math.sqrt(smax * smid), maxSpan * voxel);
+        if (!(r > 0)) continue;
+        const absorb = Math.PI * r * r * -Math.log(1 - Math.min(alpha, 0.995));
+        const cx = (centres[i * 3] - min[0]) / voxel - 0.5;
+        const cy = (centres[i * 3 + 1] - min[1]) / voxel - 0.5;
+        const cz = (centres[i * 3 + 2] - min[2]) / voxel - 0.5;
+        const rv = Math.max(0.5, r / voxel);
+        const ix0 = Math.max(0, Math.floor(cx - rv)), ix1 = Math.min(nx - 1, Math.ceil(cx + rv));
+        const iy0 = Math.max(0, Math.floor(cy - rv)), iy1 = Math.min(ny - 1, Math.ceil(cy + rv));
+        const iz0 = Math.max(0, Math.floor(cz - rv)), iz1 = Math.min(nz - 1, Math.ceil(cz + rv));
+        if (ix0 > ix1 || iy0 > iy1 || iz0 > iz1) continue;
+        // gaussian weights over the covered voxels, normalised
+        const k = 2 / (rv * rv);
+        let sum = 0;
+        for (let z = iz0; z <= iz1; ++z) {
+            for (let y = iy0; y <= iy1; ++y) {
+                for (let x = ix0; x <= ix1; ++x) {
+                    const dx = x - cx, dy = y - cy, dz = z - cz;
+                    sum += Math.exp(-k * (dx * dx + dy * dy + dz * dz));
+                }
+            }
+        }
+        if (!(sum > 0)) continue;
+        const scale = absorb / (sum * volume);
+        for (let z = iz0; z <= iz1; ++z) {
+            for (let y = iy0; y <= iy1; ++y) {
+                const row = nx * (y + ny * z);
+                for (let x = ix0; x <= ix1; ++x) {
+                    const dx = x - cx, dy = y - cy, dz = z - cz;
+                    data[row + x] += scale * Math.exp(-k * (dx * dx + dy * dy + dz * dz));
+                }
+            }
+        }
+    }
+
+    return { min, voxel, nx, ny, nz, data };
+};
+
+export { readPlyLayout, splatSamples, writeDc, buildShadowGrid, PlyLayout, ShadowGrid };

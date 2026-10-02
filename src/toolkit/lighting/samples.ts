@@ -8,7 +8,7 @@
 // undoes), so a generated layer behaves like any imported file.
 
 // floats per sample
-const STRIDE = 23;
+const STRIDE = 24;
 
 // offsets into a sample
 const S_POS = 0;        // x y z
@@ -23,6 +23,7 @@ const S_TWO_SIDED = 19; // 1 = thin surface seen from both sides, 0 = closed
 const S_SHADE = 20;     // brightness factor applied only when written unlit
 const S_OCCLUDER = 21;  // occluder the sample lies on (skipped by its own shadow rays), -1 none
 const S_LIGHTMASK = 22; // bit per light: which lights reach the sample
+const S_LAYER = 23;     // shadow grid of the splat layer the sample belongs to, -1 none
 
 // every light (masks fit 24 bits exactly in a float)
 const ALL_LIGHTS = 0xffffff;
@@ -61,6 +62,7 @@ class SampleBuffer {
         this.data[o + S_OCCLUDER] = -1;
         this.data[o + S_SHADE] = 1;
         this.data[o + S_LIGHTMASK] = ALL_LIGHTS;
+        this.data[o + S_LAYER] = -1;
         this.count++;
         return o;
     }
@@ -199,7 +201,7 @@ const writeSplatPly = (samples: SampleBuffer, colors: SplatColors): Blob => {
 };
 
 export {
-    STRIDE, S_POS, S_ROT, S_SCALE, S_ALBEDO, S_ALPHA, S_NORMAL, S_ROUGH, S_METAL, S_TWO_SIDED, S_SHADE, S_OCCLUDER, S_LIGHTMASK, ALL_LIGHTS,
+    STRIDE, S_POS, S_ROT, S_SCALE, S_ALBEDO, S_ALPHA, S_NORMAL, S_ROUGH, S_METAL, S_TWO_SIDED, S_SHADE, S_OCCLUDER, S_LIGHTMASK, S_LAYER, ALL_LIGHTS,
     SampleBuffer, SplatColors, SurfaceMaterial,
     restCount, unlitColors, writeSplatPly, srgbToLinear, linearToSrgb
 };

@@ -23,7 +23,7 @@
 
 type KernelScene = {
     // layout of a sample (see samples.ts)
-    layout: { stride: number, pos: number, albedo: number, alpha: number, normal: number, rough: number, metal: number, twoSided: number, occluder: number, mask: number };
+    layout: { stride: number, pos: number, albedo: number, alpha: number, normal: number, rough: number, metal: number, twoSided: number, occluder: number, mask: number, layer: number };
     // shadow casters (see bvh.ts)
     nodeBounds: Float32Array;
     nodeInfo: Int32Array;
@@ -33,6 +33,10 @@ type KernelScene = {
     triUv: Float32Array;
     masks: { width: number, height: number, alpha: Float32Array, cutoff: number }[];
     numTris: number;
+    // splat layers casting shadows: extinction per unit length on a voxel grid
+    // (see splat-relight.ts). A sample never shadows itself through its own
+    // layer's grid (`layer` of the sample = index of that grid)
+    grids: { min: number[], voxel: number, nx: number, ny: number, nz: number, data: Float32Array }[];
     // lights: BAKE_LIGHT_FLOATS each, plus up to 16 grid points (xyz) each
     lights: Float32Array;
     grid: Float32Array;
@@ -95,7 +99,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
     const grid = scene.grid;
     const numLights = scene.numLights;
     const eps = scene.eps;
-    const hasCasters = scene.numTris > 0;
+    const hasCasters = scene.numTris > 0 || (scene.grids?.length ?? 0) > 0;
     // mild windowing of the higher bands against ringing
     const win = [1, 0.92, 0.74, 0.5];
     const band = [0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3];
@@ -209,7 +213,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
 
     // any hit along o + t d, t in (0, tmax), ignoring triangles of occluder `skip`
     function occluded(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tmax: number, skip: number) {
-        if (!hasCasters) return false;
+        if (scene.numTris === 0) return false;
         const ix = 1 / dx, iy = 1 / dy, iz = 1 / dz;
         let sp = 0;
         stack[sp++] = 0;
@@ -264,6 +268,58 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
             }
         }
         return false;
+    }
+
+    // fraction of light passing the splat layers' density grids along o + t d
+    const grids = scene.grids ?? [];
+    function transmit(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tmax: number, own: number, jitter: number) {
+        let tau = 0;
+        for (let gi = 0; gi < grids.length; ++gi) {
+            if (gi === own) continue;
+            const g = grids[gi];
+            const v = g.voxel;
+            const minX = g.min[0], minY = g.min[1], minZ = g.min[2];
+            // ray / box
+            let tn = 0, tf = tmax;
+            const lo = [minX, minY, minZ];
+            const hi = [minX + g.nx * v, minY + g.ny * v, minZ + g.nz * v];
+            const o = [ox, oy, oz];
+            const d = [dx, dy, dz];
+            let miss = false;
+            for (let a = 0; a < 3 && !miss; ++a) {
+                if (Math.abs(d[a]) < 1e-12) {
+                    if (o[a] < lo[a] || o[a] > hi[a]) miss = true;
+                    continue;
+                }
+                let t1 = (lo[a] - o[a]) / d[a], t2 = (hi[a] - o[a]) / d[a];
+                if (t1 > t2) {
+                    const t = t1; t1 = t2; t2 = t;
+                }
+                tn = Math.max(tn, t1);
+                tf = Math.min(tf, t2);
+                if (tn >= tf) miss = true;
+            }
+            if (miss) continue;
+            const step = v * 0.75;
+            const data = g.data;
+            const nx = g.nx, ny = g.ny, nz = g.nz;
+            for (let t = tn + step * jitter; t < tf; t += step) {
+                const ix = Math.floor((ox + dx * t - minX) / v);
+                const iy = Math.floor((oy + dy * t - minY) / v);
+                const iz = Math.floor((oz + dz * t - minZ) / v);
+                if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) continue;
+                tau += data[ix + nx * (iy + ny * iz)] * step;
+                if (tau > 6) return 0;
+            }
+        }
+        return Math.exp(-tau);
+    }
+
+    // 1 = the ray reaches its end, 0 = fully blocked (meshes block, splat
+    // layers let a share of the light through)
+    function visibility(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tmax: number, skip: number, own: number, jitter: number) {
+        if (occluded(ox, oy, oz, dx, dy, dz, tmax, skip)) return 0;
+        return grids.length ? transmit(ox, oy, oz, dx, dy, dz, tmax, own, jitter) : 1;
     }
 
     // point on the emitter of light `o` (offset into lights) for (u, v) in -1..1
@@ -326,6 +382,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
             const nx = job.samples[o + L.normal], ny = job.samples[o + L.normal + 1], nz = job.samples[o + L.normal + 2];
             const flat = job.samples[o + L.rough];
             const mask = job.samples[o + L.mask] | 0;
+            const ownLayer = job.samples[o + L.layer];
             let er = 0, eg = 0, eb = 0;
             for (let li = 0; li < numLights; ++li) {
                 if (((mask >> li) & 1) === 0) continue;
@@ -370,7 +427,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
                         const dl = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
                         dx /= dl; dy /= dl; dz /= dl;
                         if (type !== 4) tmax *= 1 - 1e-4;
-                        if (occluded(px + dx * eps, py + dy * eps, pz + dz * eps, dx, dy, dz, tmax, -1)) blocked++;
+                        blocked += 1 - visibility(px + dx * eps, py + dy * eps, pz + dz * eps, dx, dy, dz, tmax, -1, ownLayer, rand(sample, li * 64 + s, 5));
                     }
                     irr *= 1 - blocked / n;
                 }
@@ -404,6 +461,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
         const twoSided = job.samples[o + L.twoSided] > 0.5;
         const skip = job.samples[o + L.occluder];
         const lightMask = job.samples[o + L.mask] | 0;
+        const ownLayer = job.samples[o + L.layer];
         const alpha = rough * rough;
         const dr = ar * (1 - metal), dg = ag * (1 - metal), db = ab * (1 - metal);
         const f0r = 0.04 + (ar - 0.04) * metal, f0g = 0.04 + (ag - 0.04) * metal, f0b = 0.04 + (ab - 0.04) * metal;
@@ -490,7 +548,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
                             blocked++;
                             continue;
                         }
-                        if (occluded(ox, oy, oz, dx, dy, dz, tmax, skip)) blocked++;
+                        blocked += 1 - visibility(ox, oy, oz, dx, dy, dz, tmax, skip, ownLayer, rand(sample, li * 64 + s, 5));
                     }
                     vis = 1 - blocked / n;
                     if (vis <= 0) continue;
@@ -545,7 +603,7 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
                     const dx = tx * cx + bx * cy + snx * cz;
                     const dy = ty * cx + by * cy + sny * cz;
                     const dz = tz * cx + bz * cy + snz * cz;
-                    if (occluded(ox, oy, oz, dx, dy, dz, scene.aoRange, skip)) hits++;
+                    hits += 1 - visibility(ox, oy, oz, dx, dy, dz, scene.aoRange, skip, ownLayer, rand(sample, 16384 + s, side));
                 }
                 occ = 1 - hits / scene.aoSamples;
             }
