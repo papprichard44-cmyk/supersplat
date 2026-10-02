@@ -291,6 +291,7 @@ const main = async () => {
         scene,
         toolManager,
         canvasContainer: editorUI.canvasContainer,
+        toolsContainer: editorUI.toolsContainer,
         tooltips: editorUI.tooltips
     });
 

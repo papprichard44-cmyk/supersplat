@@ -222,3 +222,44 @@
     padding: 0 6px;
     flex-shrink: 0;
 }
+
+// to the right of the export compare panel
+#toolkit-stamp-panel {
+    top: 102px;
+    left: 1080px;
+    width: 280px;
+}
+
+.collapsed #toolkit-stamp-panel {
+    display: none;
+}
+
+.toolkit-button.pcui-button.active {
+    background-color: $clr-hilight;
+    color: $clr-active;
+}
+
+.toolkit-label-wide {
+    width: auto;
+}
+
+.toolkit-toggle.pcui-boolean-input {
+    margin: 0;
+}
+
+#toolkit-stamp-svg {
+    > circle {
+        fill: rgba(255, 102, 0, 0.2);
+        stroke: #f60;
+        stroke-width: 1;
+    }
+
+    > polyline {
+        fill: none;
+        stroke: #f60;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-dasharray: 5, 5;
+    }
+}

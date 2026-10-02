@@ -3,6 +3,7 @@ import { Button, Container, Label } from '@playcanvas/pcui';
 import { Element, ElementType } from '../element';
 import { Splat } from '../splat';
 import type { ToolkitContext, ToolkitModule } from './index';
+import { MemorySink } from './memory-sink';
 
 // Compression-aware export: writes the scene in several formats / settings into
 // memory with the editor's own exporters (which are splat-transform running in
@@ -34,41 +35,6 @@ const tips = {
     original: 'Remove the preview and show the original layers again.',
     save: 'Save this result to a file.'
 };
-
-// stands in for a FileSystemWritableFileStream and keeps the bytes in memory
-class MemorySink {
-    chunks: Uint8Array[] = [];
-    size = 0;
-
-    seek() {
-        return Promise.resolve();
-    }
-
-    write(data: Uint8Array) {
-        // the exporters reuse their buffers, so keep a copy
-        this.chunks.push(data.slice());
-        this.size += data.byteLength;
-        return Promise.resolve();
-    }
-
-    truncate() {
-        return Promise.resolve();
-    }
-
-    close() {
-        return Promise.resolve();
-    }
-
-    abort() {
-        this.chunks = [];
-        this.size = 0;
-        return Promise.resolve();
-    }
-
-    blob() {
-        return new Blob(this.chunks as BlobPart[], { type: 'application/octet-stream' });
-    }
-}
 
 const megabytes = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 2 : 1)} MB`;
 

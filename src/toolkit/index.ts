@@ -8,6 +8,7 @@ import { exportCompareModule } from './export-compare';
 import { generatedLayersModule } from './generated-layers';
 import { generatorsModule } from './generators';
 import { meshPrimitivesModule } from './mesh-primitives';
+import { stampBrushModule } from './stamp-brush';
 
 // Everything the toolkit adds on top of upstream SuperSplat lives in this
 // directory. Upstream files only gain the hooks that call into it (main.ts,
@@ -18,6 +19,8 @@ type ToolkitContext = {
     scene: Scene;
     toolManager: ToolManager;
     canvasContainer: Container;
+    // overlay the viewport tools draw into and take their pointer input from
+    toolsContainer: Container;
     tooltips: Tooltips;
 };
 
@@ -35,7 +38,8 @@ const modules: ToolkitModule[] = [
     meshPrimitivesModule,
     generatorsModule,
     generatedLayersModule,
-    exportCompareModule
+    exportCompareModule,
+    stampBrushModule
 ];
 
 const initToolkit = (ctx: ToolkitContext) => {
