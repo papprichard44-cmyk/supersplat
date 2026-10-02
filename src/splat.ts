@@ -434,7 +434,12 @@ class Splat extends Element {
         // amended by the user-defined local frame (identity by default, so
         // the pivot then lands exactly on the entity transform)
         quat.mul2(entity.getLocalRotation(), this.localFrame);
-        entity.getLocalTransform().transformPoint(this.localFrameOrigin, vec);
+        // toolkit: without a user-defined local frame the pivot sits at the
+        // centre of the layer's gaussians rather than at the data's origin,
+        // which can be far away from the model (a layer generated from a mesh
+        // has its origin at the world origin, wherever the mesh stood)
+        const origin = this.hasLocalFrame ? this.localFrameOrigin : this.localBoundStorage.center;
+        entity.getLocalTransform().transformPoint(origin, vec);
         result.set(vec, quat, entity.getLocalScale());
     }
 
