@@ -69,6 +69,9 @@ const tips = {
     tiling: 'How many times the picture repeats across the surface, horizontally and vertically.',
     offset: 'Shift the picture across the surface, in picture widths and heights.',
     turn: 'Turn the picture on the surface, in degrees.',
+    relief: 'Depth: brings the picture alive - its bright parts are lifted and its dark parts (joints, cracks) sunk, so it catches the light like a real surface, in the preview and in the splats. 0 = flat (off).',
+    reliefDetail: 'What the relief follows: fine grain (low) or whole stones, bricks and planks (high).',
+    reliefInvert: 'Turn the relief over: for pictures whose joints or cracks are lighter than the rest.',
     wrap: 'Beyond its edges the picture repeats, repeats mirrored, stretches its edge pixels, or (decal) is laid once over the colour - with its transparent parts showing the colour underneath.',
     position: 'Position of the primitive centre in world units (X, Y, Z).',
     rotation: 'Rotation in degrees around the X, Y and Z axes.',
@@ -348,6 +351,18 @@ const init = (ctx: ToolkitContext) => {
     wrapRow.append(wrap);
     tooltips.register(wrap, tips.wrap, 'bottom');
     pictureBox.append(wrapRow);
+    // relief: optional depth from the picture's own height map
+    const reliefRow = paintRow('Relief', tips.relief);
+    const relief = paintSlider(reliefRow, tips.relief, { min: 0, max: 1, precision: 2, step: 0.01, value: 0 });
+    pictureBox.append(reliefRow);
+    const reliefDetailRow = paintRow('Follows', tips.reliefDetail);
+    const reliefDetail = paintSlider(reliefDetailRow, tips.reliefDetail, { min: 0, max: 1, precision: 2, step: 0.01, value: 0.4 });
+    pictureBox.append(reliefDetailRow);
+    const reliefInvertRow = paintRow('Invert', tips.reliefInvert);
+    const reliefInvert = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: false });
+    reliefInvertRow.append(reliefInvert);
+    tooltips.register(reliefInvert, tips.reliefInvert, 'bottom');
+    pictureBox.append(reliefInvertRow);
 
     const pictureInput = document.createElement('input');
     pictureInput.type = 'file';
@@ -694,6 +709,12 @@ const init = (ctx: ToolkitContext) => {
             offset.value = pic.offset;
             turn.value = pic.rotation;
             wrap.value = pic.wrap;
+            relief.value = pic.relief ?? 0;
+            reliefDetail.value = pic.reliefDetail ?? 0.4;
+            reliefInvert.value = !!pic.reliefInvert;
+            // the relief's own settings only matter once there is relief
+            reliefDetailRow.hidden = !(pic.relief > 0);
+            reliefInvertRow.hidden = !(pic.relief > 0);
         }
         farToggle.value = events.invoke('toolkit.backing') ?? true;
         updateFarHint();
@@ -1011,6 +1032,9 @@ const init = (ctx: ToolkitContext) => {
     offset.on('change', (value: number[]) => editTexture({ offset: [value[0], value[1]] }));
     turn.on('change', (value: number) => editTexture({ rotation: value }));
     wrap.on('change', (value: string) => editTexture({ wrap: value as PaintWrap }));
+    relief.on('change', (value: number) => editTexture({ relief: value }));
+    reliefDetail.on('change', (value: number) => editTexture({ reliefDetail: value }));
+    reliefInvert.on('change', (value: boolean) => editTexture({ reliefInvert: value }));
 
     // scripted access (and tests)
     events.function('toolkit.primitivePaint', (primitive: MeshPrimitive, change: Partial<PrimitiveState>) => {

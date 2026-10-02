@@ -23,6 +23,7 @@ import {
 
 import { Element, ElementType } from '../element';
 import { Serializer } from '../serializer';
+import { heightMapOf } from './height-map';
 import { AlphaGrid, buildExtrudeGeometry, makeAlphaGrid } from './image-extrude';
 import { litChunkWGSL } from './lighting/shading';
 import { flatGeometry, isShapeKind, shapeGeometry, ShapeGeometry, ShapeKind } from './shapes';
@@ -263,6 +264,13 @@ ${paintChunkWGSL}
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     var output: FragmentOutput;
     let paint = paintColor(input.vUv, input.vLocal);
+    // relief: the height's slope on screen tilts the normal (bump mapping
+    // without tangents, from screen-space derivatives)
+    let height = paintHeight(input.vUv) * uniform.primRelief.x;
+    let dhx = dpdx(height);
+    let dhy = dpdy(height);
+    let dpx = dpdx(input.vWorldPos);
+    let dpy = dpdy(input.vWorldPos);
     if (uniform.primPass < 0.5) {
         if (paint.a < 0.998) {
             discard;
@@ -270,7 +278,25 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     } else if (paint.a >= 0.998 || paint.a < 0.002) {
         discard;
     }
-    let n = normalize(input.vNormal);
+    var n = normalize(input.vNormal);
+    if (uniform.primRelief.z > 0.5) {
+        let r1 = cross(dpy, n);
+        let r2 = cross(n, dpx);
+        let det = dot(dpx, r1);
+        if (abs(det) > 1e-20) {
+            // the tilt, limited (steep joint edges would turn the normal
+            // sideways and sparkle) and faded out at grazing angles, where
+            // the screen derivatives are unreliable
+            var tilt = sign(det) * (dhx * r1 + dhy * r2) / abs(det);
+            tilt = tilt - n * dot(tilt, n);
+            let len = length(tilt);
+            if (len > 0.7) {
+                tilt = tilt * (0.7 / len);
+            }
+            let facing = abs(dot(n, normalize(uniform.view_position - input.vWorldPos)));
+            n = normalize(n - tilt * smoothstep(0.1, 0.35, facing));
+        }
+    }
     let v = normalize(uniform.view_position - input.vWorldPos);
     let shade = 0.6 + 0.4 * abs(dot(n, v));
     let color = studioShade(paint.rgb, n, input.vWorldPos, uniform.view_position, paint.rgb * shade);
@@ -393,6 +419,9 @@ class MeshPrimitive extends Element {
     private paintGpuUrl: string | null = null;
     private paintLoading: string | null = null;
     private paintCpu: { url: string, pixels: Promise<PaintPixels> } | null = null;
+    // the picture's relief height map on the gpu (r = height), and what it was made for
+    private heightGpu: Texture | null = null;
+    private heightKey: string | null = null;
     private blendMaterial: ShaderMaterial | null = null;
     private paintRevision = 0;
 
@@ -570,6 +599,7 @@ class MeshPrimitive extends Element {
             this.entity.render.meshInstances = [opaque, seeThrough];
             this.mesh = mesh;
             this.updatePaintTexture();
+            this.updateHeightTexture();
         }
         this.entity.render.layers = [this.scene.worldLayer.id];
         this.entity.render.castShadows = false;
@@ -590,6 +620,9 @@ class MeshPrimitive extends Element {
         this.paintGpu?.destroy();
         this.paintGpu = null;
         this.paintGpuUrl = null;
+        this.heightGpu?.destroy();
+        this.heightGpu = null;
+        this.heightKey = null;
         this.paintLoading = null;
         if (this.mesh) {
             this.entity.render.meshInstances = [];
@@ -689,6 +722,55 @@ class MeshPrimitive extends Element {
         });
     }
 
+    // the relief's height map, made from the picture (only while relief is on)
+    private updateHeightTexture() {
+        const t = this.paintable ? this.paintTexture : null;
+        const on = !!t?.image && t.relief > 0;
+        const key = on ? `${t.image.length}:${t.image.slice(-64)}:${(t.reliefDetail ?? 0.4).toFixed(3)}:${!!t.reliefInvert}` : null;
+        if (key === this.heightKey || !this.scene) return;
+        this.heightKey = key;
+        if (!on) {
+            this.heightGpu?.destroy();
+            this.heightGpu = null;
+            this.applyColor();
+            return;
+        }
+        this.paintPixels().then((pixels) => {
+            if (!pixels || this.heightKey !== key || !this.scene) return;
+            const map = heightMapOf(pixels, t.reliefDetail ?? 0.4, !!t.reliefInvert, 1024);
+            const data = new Uint8Array(map.width * map.height * 4);
+            for (let i = 0; i < map.data.length; ++i) {
+                const v = Math.round(map.data[i] * 255);
+                data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = v;
+                data[i * 4 + 3] = 255;
+            }
+            this.heightGpu?.destroy();
+            this.heightGpu = new Texture(this.scene.graphicsDevice, {
+                name: `toolkitHeight:${this.name}`,
+                width: map.width,
+                height: map.height,
+                format: PIXELFORMAT_RGBA8,
+                mipmaps: true,
+                minFilter: FILTER_LINEAR_MIPMAP_LINEAR,
+                magFilter: FILTER_LINEAR,
+                addressU: ADDRESS_REPEAT,
+                addressV: ADDRESS_REPEAT,
+                levels: [data]
+            });
+            this.applyColor();
+            this.scene.forceRender = true;
+        }).catch((e) => {
+            console.warn(e);
+        });
+    }
+
+    // the longest side in world units (the relief's depth scales with it)
+    get worldLongest() {
+        const s = this.entity.getLocalScale();
+        const h = this.geometry?.half ?? [0.5, 0.5, 0.5];
+        return 2 * Math.max(Math.abs(h[0] * s.x), Math.abs(h[1] * s.y), Math.abs(h[2] * s.z));
+    }
+
     // (re)build the extruded picture mesh for the current alpha cutoff
     private rebuildMesh() {
         if (!this.alphaGrid || !this.material || this.builtCutoff === this.alphaCutoff) {
@@ -742,8 +824,9 @@ class MeshPrimitive extends Element {
         if (this.paintable) {
             const instances = this.entity.render?.meshInstances ?? [];
             if (!instances.length || !this.scene) return;
-            const uniforms = paintUniforms(this.paint, this.geometry.half, !!this.paintGpu);
+            const uniforms = paintUniforms(this.paint, this.geometry.half, !!this.paintGpu, this.worldLongest, !!this.heightGpu);
             const texture = this.paintGpu ?? whiteTexture(this.scene.graphicsDevice);
+            const height = this.heightGpu ?? whiteTexture(this.scene.graphicsDevice);
             instances.forEach((meshInstance, pass) => {
                 meshInstance.setParameter('primColor', this.color);
                 meshInstance.setParameter('primPass', pass);
@@ -751,6 +834,7 @@ class MeshPrimitive extends Element {
                 meshInstance.setParameter('primMetalness', this.metalness ?? DEFAULT_METALNESS);
                 meshInstance.setParameter('primStudioMask', this.studioMask);
                 meshInstance.setParameter('primPaintTex', texture);
+                meshInstance.setParameter('primHeightTex', height);
                 Object.entries(uniforms).forEach(([name, value]) => meshInstance.setParameter(name, value as any));
             });
             return;
@@ -814,6 +898,7 @@ class MeshPrimitive extends Element {
         this.paintRevision++;
         if (this.paintable && this.scene) {
             this.updatePaintTexture();
+            this.updateHeightTexture();
         }
         if (this.kind === 'image' && this.scene) {
             this.rebuildMesh();

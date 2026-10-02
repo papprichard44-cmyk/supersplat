@@ -1,4 +1,5 @@
 import type { PaverPattern, RoadParams, RoadStyle } from './road-params';
+import { blurWrap, heightFromPicture } from '../height-map';
 
 // Procedural, tileable textures for the road styles. A main texture tiles in
 // world units along and across the road (so stones keep their size whatever
@@ -343,56 +344,6 @@ const makeSeamless = (rgba: Uint8ClampedArray, size: number) => {
     return out;
 };
 
-// box blur that wraps around the tile (two passes per direction, near gaussian)
-const blurWrap = (src: Float32Array, size: number, radius: number) => {
-    const r = Math.max(1, Math.round(radius));
-    let a = Float32Array.from(src);
-    let b = new Float32Array(src.length);
-    const norm = 1 / (2 * r + 1);
-    for (let pass = 0; pass < 4; ++pass) {
-        const horizontal = pass % 2 === 0;
-        for (let line = 0; line < size; ++line) {
-            const at = (i: number) => {
-                const w = ((i % size) + size) % size;
-                return horizontal ? line * size + w : w * size + line;
-            };
-            let sum = 0;
-            for (let i = -r; i <= r; ++i) sum += a[at(i)];
-            for (let i = 0; i < size; ++i) {
-                b[at(i)] = sum * norm;
-                sum += a[at(i + r + 1)] - a[at(i - r)];
-            }
-        }
-        [a, b] = [b, a];
-    }
-    return a;
-};
-
-// height from brightness, as material tools do it: fine detail of the
-// luminance against its blurred surroundings (so a darker region doesn't
-// sink as a whole), normalised. Dark joints come out low, bright stone tops
-// high; `detail` 0 picks up fine grain, 1 whole stones.
-const heightFromPicture = (rgba: Uint8ClampedArray, size: number, detail: number, invert: boolean) => {
-    const lum = new Float32Array(size * size);
-    for (let i = 0; i < lum.length; ++i) {
-        lum[i] = (0.2126 * rgba[i * 4] + 0.7152 * rgba[i * 4 + 1] + 0.0722 * rgba[i * 4 + 2]) / 255;
-    }
-    const fine = blurWrap(lum, size, 1 + detail * 3);
-    const coarse = blurWrap(lum, size, 4 + detail * size * 0.12);
-    let mean = 0;
-    for (let i = 0; i < lum.length; ++i) mean += fine[i] - coarse[i];
-    mean /= lum.length;
-    let variance = 0;
-    for (let i = 0; i < lum.length; ++i) variance += (fine[i] - coarse[i] - mean) ** 2;
-    const std = Math.sqrt(variance / lum.length) || 1;
-    const h = new Float32Array(lum.length);
-    for (let i = 0; i < lum.length; ++i) {
-        const v = Math.min(1, Math.max(0, 0.5 + (fine[i] - coarse[i] - mean) / (4 * std)));
-        h[i] = invert ? 1 - v : v;
-    }
-    return h;
-};
-
 // a quick hash of a long string (a picture's data url), for the cache key
 const textHash = (text: string) => {
     let h = 2166136261;
@@ -443,7 +394,7 @@ const roadTextures = (p: RoadParams): Promise<RoadTextures> => {
                     // no picture yet: plain grey
                     rgba = new Uint8ClampedArray(SIZE * SIZE * 4).fill(150);
                 }
-                height = heightFromPicture(rgba, SIZE, p.reliefDetail, p.reliefInvert);
+                height = heightFromPicture(rgba, SIZE, SIZE, p.reliefDetail, p.reliefInvert);
                 // a little cavity shading: the deep parts darker, the tops
                 // lighter, so it reads as relief even without lights
                 const shade = 0.25 + 0.5 * p.relief;
@@ -464,7 +415,7 @@ const roadTextures = (p: RoadParams): Promise<RoadTextures> => {
                 }));
                 main = await toPng(rendered);
                 // smooth the procedural heights a touch: no stair steps
-                height = blurWrap(rendered.heights, SIZE, 1);
+                height = blurWrap(rendered.heights, SIZE, SIZE, 1);
             }
 
             let strip: Uint8Array | null = null;

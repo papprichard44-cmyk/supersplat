@@ -9,6 +9,8 @@
 // premultiplied alpha, so the colour of a fully transparent stop never bleeds
 // into the visible one.
 
+import { heightMapOf, sampleHeight } from './height-map';
+
 type Rgb = [number, number, number];
 
 type PaintGradient = {
@@ -35,6 +37,11 @@ type PaintTexture = {
     offset: [number, number];   // in repeats
     rotation: number;           // degrees
     wrap: PaintWrap;
+    // relief from the picture (height-map.ts): 0 = flat (off); what it
+    // follows (fine grain 0 .. whole stones 1); dark = high instead of low
+    relief?: number;
+    reliefDetail?: number;
+    reliefInvert?: boolean;
 };
 
 const defaultGradient = (): PaintGradient => ({
@@ -109,6 +116,15 @@ const paintAlphaUsesObjectSpace = (p: PaintState) => !!p.gradient && p.gradient.
 
 const frac = (x: number) => x - Math.floor(x);
 
+// how deep a picture's relief is, in world units, on a primitive whose
+// longest side is `worldLongest`: a share of one repeat of the picture
+const reliefDepthOf = (t: PaintTexture | null, worldLongest: number) => {
+    if (!t || !(t.relief > 0)) return 0;
+    return t.relief * 0.04 * worldLongest / Math.max(1, t.tiling[0], t.tiling[1]);
+};
+// how much the deep parts darken (and the tops lighten) in the colour
+const cavityOf = (t: PaintTexture | null) => (t && t.relief > 0 ? 0.6 * t.relief : 0);
+
 const toLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
 const toDisplay = (c: number) => (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
 
@@ -158,6 +174,8 @@ const mipChainOf = (pixels: PaintPixels) => {
  * straight alpha into `out`.
  */
 const createPaint = (p: PaintState, half: Rgb, pixels: PaintPixels | null) => {
+    const relief = p.texture && pixels && p.texture.relief > 0 ? heightMapOf(pixels, p.texture.reliefDetail ?? 0.4, !!p.texture.reliefInvert) : null;
+    const cavity = relief ? cavityOf(p.texture) : 0;
     const g = p.gradient;
     const angle = (g?.angle ?? 0) * Math.PI / 180;
     const ca = Math.cos(angle);
@@ -270,6 +288,13 @@ const createPaint = (p: PaintState, half: Rgb, pixels: PaintPixels | null) => {
                 tb = pixels.data[o + 2] / 255;
                 ta = pixels.data[o + 3] / 255;
             }
+            if (relief) {
+                // the deep parts a little darker, the tops a little lighter
+                const k = 1 + cavity * (sampleHeight(relief, wu, wv) - 0.5);
+                tr = Math.min(1, tr * k);
+                tg = Math.min(1, tg * k);
+                tb = Math.min(1, tb * k);
+            }
             if (wrap === 3) {
                 const inside = tu >= 0 && tu <= 1 && tv >= 0 && tv <= 1;
                 const kk = inside ? ta : 0;
@@ -285,7 +310,27 @@ const createPaint = (p: PaintState, half: Rgb, pixels: PaintPixels | null) => {
         out[2] = b;
         out[3] = a;
     };
-    return paint;
+
+    // the relief's height (0 deep .. 1 high) at a surface uv, or 0.5 without
+    // relief (decal: only inside the picture)
+    const heightAt = (u: number, v: number) => {
+        if (!relief) return 0.5;
+        const tu = m[0] * u + m[1] * v + m[2];
+        const tv = m[3] * u + m[4] * v + m[5];
+        if (wrap === 3 && (tu < 0 || tu > 1 || tv < 0 || tv > 1)) return 0.5;
+        let wu: number, wv: number;
+        if (wrap === 0) {
+            wu = frac(tu); wv = frac(tv);
+        } else if (wrap === 1) {
+            wu = 1 - Math.abs(frac(tu * 0.5) * 2 - 1);
+            wv = 1 - Math.abs(frac(tv * 0.5) * 2 - 1);
+        } else {
+            wu = Math.min(1, Math.max(0, tu));
+            wv = Math.min(1, Math.max(0, tv));
+        }
+        return sampleHeight(relief, wu, wv);
+    };
+    return Object.assign(paint, { heightAt, hasRelief: !!relief });
 };
 
 type PaintFunction = ReturnType<typeof createPaint>;
@@ -366,6 +411,33 @@ uniform primTexRow0: vec3f;
 uniform primTexRow1: vec3f;
 var primPaintTex: texture_2d<f32>;
 var primPaintTex_sampler: sampler;
+// relief: x depth (world units), y cavity shading, z on
+uniform primRelief: vec4f;
+var primHeightTex: texture_2d<f32>;
+var primHeightTex_sampler: sampler;
+
+// the picture's coordinates at a surface uv: unwrapped and wrapped
+fn paintTexCoords(uv: vec2f) -> vec4f {
+    let tuv = vec2f(dot(uniform.primTexRow0, vec3f(uv, 1.0)), dot(uniform.primTexRow1, vec3f(uv, 1.0)));
+    let mode = uniform.primTexMode;
+    var w: vec2f;
+    if (mode < 1.5) {
+        w = fract(tuv);
+    } else if (mode < 2.5) {
+        w = vec2f(1.0) - abs(fract(tuv * 0.5) * 2.0 - vec2f(1.0));
+    } else {
+        w = clamp(tuv, vec2f(0.0), vec2f(1.0));
+    }
+    return vec4f(w, tuv);
+}
+
+// the relief's height (0 deep .. 1 high), 0.5 where there is none
+fn paintHeight(uv: vec2f) -> f32 {
+    let c = paintTexCoords(uv);
+    let h = textureSampleGrad(primHeightTex, primHeightTex_sampler, c.xy, dpdx(c.zw), dpdy(c.zw)).r;
+    let inside = uniform.primTexMode < 4.5 || (all(c.zw >= vec2f(0.0)) && all(c.zw <= vec2f(1.0)));
+    return select(0.5, h, uniform.primRelief.z > 0.5 && uniform.primTexMode > 0.5 && inside);
+}
 
 fn paintColor(uv: vec2f, local: vec3f) -> vec4f {
     var c = vec4f(uniform.primColor, uniform.primAlpha);
@@ -418,7 +490,12 @@ fn paintColor(uv: vec2f, local: vec3f) -> vec4f {
         }
         // derivatives of the unwrapped coordinates: no seams where the
         // picture repeats
-        let texel = textureSampleGrad(primPaintTex, primPaintTex_sampler, w, dpdx(tuv), dpdy(tuv));
+        var texel = textureSampleGrad(primPaintTex, primPaintTex_sampler, w, dpdx(tuv), dpdy(tuv));
+        if (uniform.primRelief.z > 0.5) {
+            // cavity: the deep parts a little darker, the tops lighter
+            let h = textureSampleGrad(primHeightTex, primHeightTex_sampler, w, dpdx(tuv), dpdy(tuv)).r;
+            texel = vec4f(min(texel.rgb * (1.0 + uniform.primRelief.y * (h - 0.5)), vec3f(1.0)), texel.a);
+        }
         if (mode > 3.5) {
             let inside = all(tuv >= vec2f(0.0)) && all(tuv <= vec2f(1.0));
             let kk = select(0.0, texel.a, inside);
@@ -432,9 +509,10 @@ fn paintColor(uv: vec2f, local: vec3f) -> vec4f {
 `;
 
 // the uniforms paintChunkWGSL reads, for a mesh instance
-const paintUniforms = (p: PaintState, half: Rgb, hasTexture: boolean) => {
+const paintUniforms = (p: PaintState, half: Rgb, hasTexture: boolean, worldLongest = 1, hasHeight = false) => {
     const g = p.gradient;
     const t = p.texture && hasTexture ? p.texture : null;
+    const depth = hasHeight ? reliefDepthOf(t, worldLongest) : 0;
     const m = t ? textureMatrix(t) : [1, 0, 0, 0, 1, 0];
     return {
         primAlpha: p.opacity,
@@ -444,7 +522,9 @@ const paintUniforms = (p: PaintState, half: Rgb, hasTexture: boolean) => {
         primHalf: half,
         primTexMode: t ? wrapModes.indexOf(t.wrap) + 1 : 0,
         primTexRow0: [m[0], m[1], m[2]],
-        primTexRow1: [m[3], m[4], m[5]]
+        primTexRow1: [m[3], m[4], m[5]],
+        // x: depth (world units), y: cavity shading, z: on
+        primRelief: [depth, depth > 0 ? cavityOf(t) : 0, depth > 0 ? 1 : 0, 0]
     };
 };
 
@@ -471,5 +551,6 @@ const gradientCss = (p: PaintState) => {
 export {
     PaintGradient, PaintTexture, PaintWrap, PaintState, PaintPixels, PaintFunction,
     defaultGradient, defaultTexture, wrapModes, textureMatrix, balanceExponent,
-    createPaint, coverageOpacity, paintHasAlpha, paintAlphaUsesObjectSpace, paintChunkWGSL, paintUniforms, gradientCss
+    createPaint, coverageOpacity, paintHasAlpha, paintAlphaUsesObjectSpace, paintChunkWGSL, paintUniforms, gradientCss,
+    reliefDepthOf, cavityOf
 };

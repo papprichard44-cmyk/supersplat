@@ -5,7 +5,7 @@ import { SampleBuffer, srgbToLinear, SurfaceMaterial } from './lighting/samples'
 import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, loadImage } from './mesh-primitive';
 import { modelWorldMesh } from './model-to-splat';
 import { boxFaces, Face, isShapeKind, planeFaces, shapeGeometry } from './shapes';
-import { coverageOpacity, createPaint, PaintPixels, paintAlphaUsesObjectSpace, paintHasAlpha } from './surface-paint';
+import { coverageOpacity, createPaint, PaintPixels, paintAlphaUsesObjectSpace, paintHasAlpha, reliefDepthOf } from './surface-paint';
 import { MeshData, sampleMeshSurface, triangleArea } from '../mesh-to-splat';
 import { grassSamples } from './vegetation/grass';
 
@@ -73,6 +73,10 @@ const addSample = (out: SampleBuffer, position: Vec3, color: Color, alpha: numbe
     );
 };
 
+const tilted = new Vec3();
+const slopeU = new Vec3();
+const slopeV = new Vec3();
+
 // sample a parallelogram face: origin + s * axisU + t * axisV (local space), s,t in 0..1.
 // the shading normal points away from `center` (world), which makes closed
 // solids face outwards; a flat plane through its own centre keeps u x v.
@@ -85,7 +89,9 @@ const sampleFace = (
     axisV: Vec3,
     cell: number,
     material: SurfaceMaterial,
-    colorAt: (s: number, t: number, footprint: number) => Color | null
+    colorAt: (s: number, t: number, footprint: number) => Color | null,
+    // relief of the paint's picture: height (0..1) at s, t, depth in world units
+    relief: { height: (s: number, t: number) => number, depth: number } | null = null
 ) => {
     transform.transformVector(axisU, worldU);
     transform.transformVector(axisV, worldV);
@@ -120,6 +126,21 @@ const sampleFace = (
                 origin.z + axisU.z * s + axisV.z * t
             );
             transform.transformPoint(local, world);
+            if (relief) {
+                // along the normal by the height, the normal tilted by its slope
+                const ds = 0.5 / nu;
+                const dt = 0.5 / nv;
+                const h = relief.height(s, t);
+                const hs = (relief.height(s + ds, t) - relief.height(s - ds, t)) / (2 * ds) / lengthU;
+                const ht = (relief.height(s, t + dt) - relief.height(s, t - dt)) / (2 * dt) / lengthV;
+                world.add(tilted.copy(n).mulScalar((h - 0.5) * relief.depth));
+                tilted.copy(n)
+                .sub(slopeU.copy(worldU).mulScalar(relief.depth * hs / lengthU))
+                .sub(slopeV.copy(worldV).mulScalar(relief.depth * ht / lengthV))
+                .normalize();
+                addSample(out, world, color, alpha, tilted, su, sv, Math.min(su, sv) * FLATNESS, material);
+                continue;
+            }
             addSample(out, world, color, alpha, n, su, sv, Math.min(su, sv) * FLATNESS, material);
         }
     }
@@ -152,6 +173,7 @@ const shapeWorldMesh = (primitive: MeshPrimitive, pixels: PaintPixels | null): M
     for (let t = 0; t < geometry.indices.length; t += 3) {
         surfaceArea += triangleArea(positions, geometry.indices[t], geometry.indices[t + 1], geometry.indices[t + 2]);
     }
+    const paint = createPaint(primitive.paint, geometry.half, pixels);
     return {
         batches: [{
             positions,
@@ -171,7 +193,9 @@ const shapeWorldMesh = (primitive: MeshPrimitive, pixels: PaintPixels | null): M
                 metalness: primitive.metalness ?? DEFAULT_METALNESS,
                 mrTexture: null,
                 doubleSided: geometry.twoSided,
-                paint: createPaint(primitive.paint, geometry.half, pixels),
+                paint,
+                // a picture with relief: samples lifted and tilted by its height map
+                relief: paint.hasRelief ? { height: paint.heightAt, depth: reliefDepthOf(primitive.paint.texture, primitive.worldLongest) } : null,
                 // mesh samples are spread ~1 spacing apart, 0.85 spacing wide
                 coverage: (alpha: number) => coverageOpacity(alpha, 0.85)
             }
@@ -220,6 +244,7 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
         const material = surfaceOf(primitive, plane);
         const paint = createPaint(primitive.paint, primitive.geometry.half, await primitive.paintPixels());
         const rgba = new Float32Array(4);
+        const depth = paint.hasRelief ? reliefDepthOf(primitive.paint.texture, primitive.worldLongest) : 0;
         (plane ? planeFaceVectors : boxFaceVectors).forEach(({ origin, u, v }) => {
             sampleFace(out, transform, center, origin, u, v, cell, material, (s, t, footprint) => {
                 paint(s, t,
@@ -228,7 +253,7 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
                     origin.z + u.z * s + v.z * t,
                     rgba, footprint);
                 return [rgba[0], rgba[1], rgba[2], rgba[3]];
-            });
+            }, depth > 0 ? { height: paint.heightAt, depth } : null);
         });
         return out.count - start;
     }

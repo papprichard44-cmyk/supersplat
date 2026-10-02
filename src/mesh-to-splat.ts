@@ -57,6 +57,10 @@ type Material = {
     // toolkit: procedural surface paint (display-space rgb, straight alpha) of
     // a point given its uv and its position in the object's own space
     paint?: ((u: number, v: number, lx: number, ly: number, lz: number, out: Float32Array, footprint?: number) => void) | null;
+    // toolkit: relief of the paint's picture: height (0..1) at a uv and its
+    // depth in world units; samples move along the normal and their normal
+    // follows the slope
+    relief?: { height: (u: number, v: number) => number, depth: number } | null;
     // toolkit: maps the paint's coverage to a per-gaussian opacity
     coverage?: ((alpha: number) => number) | null;
 };
@@ -726,9 +730,14 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
     const painted = new Float32Array(4);
     const surface = { roughness: 1, metalness: 0, twoSided: false };
 
+    const gradU = [0, 0, 0];
+    const gradV = [0, 0, 0];
+    let reliefStep = 1e-3;
+
     batches.forEach((batch, bi) => {
         const { positions: p, normals: vn, uvs, mrUvs, colors, indices, material, local } = batch;
         const paint = material.paint ?? null;
+        const relief = uvs && material.relief && material.relief.depth > 0 ? material.relief : null;
         const batchCounts = counts[bi];
         const [fr, fg, fb, fa] = material.baseColor;
         const texture = uvs ? material.texture : null;
@@ -753,6 +762,19 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                 const du2 = uvs[ic * 2] - uvs[ia * 2], dv2 = uvs[ic * 2 + 1] - uvs[ia * 2 + 1];
                 const area = 0.5 * Math.hypot(e1y * e2z - e1z * e2y, e1z * e2x - e1x * e2z, e1x * e2y - e1y * e2x);
                 if (area > 0) footprint = Math.abs(du1 * dv2 - du2 * dv1) * 0.5 / area * spacing * spacing;
+                // gradients of u and v over the triangle (world), for the relief's slope
+                if (relief) {
+                    const cx = e1y * e2z - e1z * e2y, cy = e1z * e2x - e1x * e2z, cz = e1x * e2y - e1y * e2x;
+                    const c2 = cx * cx + cy * cy + cz * cz;
+                    if (c2 > 0) {
+                        // e2 x n and n x e1
+                        const ax = e2y * cz - e2z * cy, ay = e2z * cx - e2x * cz, az = e2x * cy - e2y * cx;
+                        const bx2 = cy * e1z - cz * e1y, by2 = cz * e1x - cx * e1z, bz2 = cx * e1y - cy * e1x;
+                        gradU[0] = (du1 * ax + du2 * bx2) / c2; gradU[1] = (du1 * ay + du2 * by2) / c2; gradU[2] = (du1 * az + du2 * bz2) / c2;
+                        gradV[0] = (dv1 * ax + dv2 * bx2) / c2; gradV[1] = (dv1 * ay + dv2 * by2) / c2; gradV[2] = (dv1 * az + dv2 * bz2) / c2;
+                    }
+                    reliefStep = Math.max(1e-4, Math.sqrt(footprint) * 0.5);
+                }
             }
             if (texture && uvs) {
                 const du1 = uvs[ib * 2] - uvs[ia * 2], dv1 = uvs[ib * 2 + 1] - uvs[ia * 2 + 1];
@@ -865,6 +887,25 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                     }
                 }
 
+                // relief: along the normal by the height, the normal tilted by its slope
+                let px = ax + e1x * r1 + e2x * r2, py = ay + e1y * r1 + e2y * r2, pz = az + e1z * r1 + e2z * r2;
+                if (relief) {
+                    const u = uvs[ia * 2] * w0 + uvs[ib * 2] * r1 + uvs[ic * 2] * r2;
+                    const v = uvs[ia * 2 + 1] * w0 + uvs[ib * 2 + 1] * r1 + uvs[ic * 2 + 1] * r2;
+                    const d = relief.depth;
+                    const h = relief.height(u, v);
+                    const hu = (relief.height(u + reliefStep, v) - relief.height(u - reliefStep, v)) / (2 * reliefStep);
+                    const hv = (relief.height(u, v + reliefStep) - relief.height(u, v - reliefStep)) / (2 * reliefStep);
+                    px += sx * (h - 0.5) * d;
+                    py += sy * (h - 0.5) * d;
+                    pz += sz * (h - 0.5) * d;
+                    sx -= d * (hu * gradU[0] + hv * gradV[0]);
+                    sy -= d * (hu * gradU[1] + hv * gradV[1]);
+                    sz -= d * (hu * gradU[2] + hv * gradV[2]);
+                    const sl = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
+                    sx /= sl; sy /= sl; sz /= sl;
+                }
+
                 // random spin about the normal so the discs don't line up in streaks
                 const angle = Math.random() * Math.PI * 2;
                 const ca = Math.cos(angle), sa = Math.sin(angle);
@@ -903,7 +944,7 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                 }
 
                 out.add(
-                    ax + e1x * r1 + e2x * r2, ay + e1y * r1 + e2y * r2, az + e1z * r1 + e2z * r2,
+                    px, py, pz,
                     qw, qx, qy, qz,
                     scaleT, scaleT, scaleN,
                     Math.max(0, r), Math.max(0, g), Math.max(0, b), a,
