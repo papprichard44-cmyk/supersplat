@@ -300,6 +300,11 @@ function shadeKernel(scene: KernelScene, job: KernelJob): KernelResult {
                 if (tn >= tf) miss = true;
             }
             if (miss) continue;
+            // start past the voxels around the origin: a surface resting on a
+            // splat layer (a road, a box on the ground) lies inside that
+            // layer's coarse voxels and would otherwise shadow itself
+            tn = Math.max(tn, v * 1.5);
+            if (tn >= tf) continue;
             const step = v * 0.75;
             const data = g.data;
             const nx = g.nx, ny = g.ny, nz = g.nz;

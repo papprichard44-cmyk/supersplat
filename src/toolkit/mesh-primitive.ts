@@ -79,7 +79,7 @@ type PrimitiveState = {
 
 // what generated a model (vegetation panel), kept so it can be regenerated or
 // converted in its own way (grass becomes blade-shaped splats)
-type PrimitiveGenerator = { type: 'grass' | 'tree' | 'rocks', params: any };
+type PrimitiveGenerator = { type: 'grass' | 'tree' | 'rocks' | 'road', params: any };
 
 type PrimitiveData = PrimitiveState & {
     kind: PrimitiveKind;

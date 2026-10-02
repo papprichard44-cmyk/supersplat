@@ -1159,3 +1159,99 @@
         }
     }
 }
+
+// ---- road maker
+#toolkit-road-panel {
+    top: 96px;
+    right: 476px;
+    width: 340px;
+    max-height: calc(100vh - 160px);
+    display: flex;
+    flex-direction: column;
+
+    & > .panel-header {
+        flex-shrink: 0;
+    }
+
+    .toolkit-label {
+        width: 92px;
+    }
+
+    .pcui-button.active {
+        background-color: $clr-hilight;
+        color: $text-primary;
+    }
+}
+
+.toolkit-road-styles {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    padding: 8px 8px 2px;
+}
+
+.toolkit-road-style {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+
+    &:hover {
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
+    }
+
+    &.active {
+        box-shadow: inset 0 0 0 2px $clr-hilight;
+
+        .toolkit-road-style-name {
+            color: $text-primary;
+        }
+    }
+}
+
+.toolkit-road-swatch {
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 3px;
+    display: block;
+}
+
+.toolkit-road-style-name.pcui-label {
+    margin: 0;
+    font-size: 10px;
+    line-height: 12px;
+    text-align: center;
+    color: $text-secondary;
+    white-space: normal;
+}
+
+#toolkit-road-svg {
+    > polyline {
+        fill: none;
+        stroke: $clr-hilight;
+        stroke-width: 2;
+        stroke-dasharray: 6, 4;
+        opacity: 0.9;
+    }
+
+    > g > circle {
+        fill: #fff;
+        stroke: $clr-hilight;
+        stroke-width: 2;
+
+        &.end {
+            fill: $clr-hilight;
+            stroke: #fff;
+        }
+    }
+
+    > circle.ghost {
+        fill: rgba(255, 102, 0, 0.35);
+        stroke: #fff;
+        stroke-width: 1.5;
+    }
+}
