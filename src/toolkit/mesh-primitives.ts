@@ -773,6 +773,7 @@ const init = (ctx: ToolkitContext) => {
             row.append(remove);
             list.append(row);
         });
+        events.fire('toolkit.meshes.changed');
     };
 
     select = (primitive: MeshPrimitive | null) => {
@@ -1277,6 +1278,27 @@ const init = (ctx: ToolkitContext) => {
 
     events.function('toolkit.addGeneratedModel', addGeneratedModel);
     events.function('toolkit.selectedPrimitive', () => selected);
+
+    // quick access for other lists (the scene manager): every mesh, and the
+    // actions of a row of the list above
+    events.function('toolkit.meshes.list', () => primitives().map(primitive => ({
+        primitive,
+        name: primitive.name,
+        glyph: glyphOf(primitive),
+        kind: kindName(primitive),
+        visible: primitive.entity.enabled,
+        selected: primitive === selected
+    })));
+    events.function('toolkit.meshes.select', (primitive: MeshPrimitive | null) => select(primitive));
+    events.function('toolkit.meshes.toggleVisible', (primitive: MeshPrimitive) => {
+        flushPending();
+        const oldState = primitive.getState();
+        events.fire('edit.add', new PrimitiveStateOp(primitive, oldState, { ...oldState, visible: !oldState.visible }));
+    });
+    events.function('toolkit.meshes.remove', (primitive: MeshPrimitive) => {
+        flushPending();
+        events.fire('edit.add', new RemovePrimitiveOp(scene, primitive));
+    });
 
     addModel.on('click', () => modelInput.click());
     modelInput.addEventListener('change', () => {

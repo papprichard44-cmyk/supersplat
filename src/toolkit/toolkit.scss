@@ -1001,3 +1001,95 @@
 .toolkit-lighting-body > .toolkit-group:first-of-type {
     margin-top: 6px;
 }
+
+// ---- scene manager: the meshes under the splat layers
+
+.toolkit-scene-options {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-bottom: 1px solid $bcg-darker;
+
+    & > .pcui-boolean-input {
+        margin: 0;
+        flex-shrink: 0;
+    }
+}
+
+.toolkit-scene-options-label.pcui-label {
+    margin: 0;
+    flex-grow: 1;
+    font-size: 12px;
+    color: $text-secondary;
+    cursor: pointer;
+
+    &:hover {
+        color: $text-primary;
+    }
+}
+
+.toolkit-scene-options-count.pcui-label {
+    margin: 0;
+    font-size: 11px;
+    color: $text-secondary;
+}
+
+#scene-panel .splat-list-container {
+    max-height: 380px;
+}
+
+// with meshes listed, the splat layers don't need their empty space
+#scene-panel.toolkit-has-meshes .splat-list:not(.toolkit-scene-mesh-list) {
+    min-height: 0;
+}
+
+.toolkit-scene-meshes {
+    border-top: 1px solid $bcg-darker;
+}
+
+.toolkit-scene-meshes-title.pcui-label {
+    margin: 6px 8px 0;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: $text-secondary;
+}
+
+.splat-list.toolkit-scene-mesh-list {
+    min-height: 0;
+
+    .splat-item.toolkit-scene-mesh {
+        align-items: center;
+        cursor: pointer;
+
+        &:not(.visible) .splat-item-text {
+            opacity: 0.5;
+        }
+    }
+}
+
+.toolkit-scene-mesh-icon {
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: $text-secondary;
+
+    .selected & {
+        color: $clr-hilight;
+    }
+}
+
+// a mesh is the active object: the splat layer keeps its selection for the
+// splat tools, but only the mesh row reads as selected
+#scene-panel.toolkit-mesh-active .splat-list:not(.toolkit-scene-mesh-list) > .splat-item.selected {
+    background-color: transparent;
+
+    .splat-item-text {
+        color: $text-secondary;
+    }
+}
