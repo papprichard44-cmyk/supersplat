@@ -4,7 +4,8 @@ import { traceRims, buildExtrudeGeometry } from './image-extrude';
 import { SampleBuffer, srgbToLinear, SurfaceMaterial } from './lighting/samples';
 import { DEFAULT_METALNESS, DEFAULT_ROUGHNESS, MeshPrimitive, loadImage } from './mesh-primitive';
 import { modelWorldMesh } from './model-to-splat';
-import { isShapeKind, shapeGeometry } from './shapes';
+import { boxFaces, Face, isShapeKind, planeFaces, shapeGeometry } from './shapes';
+import { coverageOpacity, createPaint, PaintPixels, paintAlphaUsesObjectSpace, paintHasAlpha } from './surface-paint';
 import { MeshData, sampleMeshSurface, triangleArea } from '../mesh-to-splat';
 import { grassSamples } from './vegetation/grass';
 
@@ -28,6 +29,8 @@ const FLATNESS = 0.1;       // thickness of a gaussian relative to its smaller i
 const WALL_SHADE = 0.85;    // unlit side walls a touch darker so the form still reads once it is a splat
 
 type Rgb = [number, number, number];
+// display-space rgb, optionally with an opacity
+type Color = Rgb | [number, number, number, number];
 
 const basis = new Mat4();
 const worldU = new Vec3();
@@ -58,7 +61,7 @@ const surfaceOf = (primitive: MeshPrimitive, twoSided: boolean): SurfaceMaterial
     twoSided
 });
 
-const addSample = (out: SampleBuffer, position: Vec3, color: Rgb, alpha: number, n: Vec3,
+const addSample = (out: SampleBuffer, position: Vec3, color: Color, alpha: number, n: Vec3,
     sx: number, sy: number, sz: number, material: SurfaceMaterial, shade = 1) => {
     out.add(
         position.x, position.y, position.z,
@@ -82,7 +85,7 @@ const sampleFace = (
     axisV: Vec3,
     cell: number,
     material: SurfaceMaterial,
-    colorAt: (s: number, t: number) => Rgb | null
+    colorAt: (s: number, t: number) => Color | null
 ) => {
     transform.transformVector(axisU, worldU);
     transform.transformVector(axisV, worldV);
@@ -106,28 +109,32 @@ const sampleFace = (
             const t = (j + 0.5) / nv;
             const color = colorAt(s, t);
             if (!color) continue;
+            // see-through paint: less opacity per gaussian, as they overlap
+            let alpha = color.length > 3 ? color[3] : 1;
+            if (alpha < 0.004) continue;
+            if (alpha < 1) alpha = coverageOpacity(alpha, SIGMA);
             local.set(
                 origin.x + axisU.x * s + axisV.x * t,
                 origin.y + axisU.y * s + axisV.y * t,
                 origin.z + axisU.z * s + axisV.z * t
             );
             transform.transformPoint(local, world);
-            addSample(out, world, color, 1, n, su, sv, Math.min(su, sv) * FLATNESS, material);
+            addSample(out, world, color, alpha, n, su, sv, Math.min(su, sv) * FLATNESS, material);
         }
     }
 };
 
-const boxFaces: [Vec3, Vec3, Vec3][] = [
-    [new Vec3(-0.5, 0.5, -0.5), new Vec3(1, 0, 0), new Vec3(0, 0, 1)],
-    [new Vec3(-0.5, -0.5, -0.5), new Vec3(1, 0, 0), new Vec3(0, 0, 1)],
-    [new Vec3(0.5, -0.5, -0.5), new Vec3(0, 1, 0), new Vec3(0, 0, 1)],
-    [new Vec3(-0.5, -0.5, -0.5), new Vec3(0, 1, 0), new Vec3(0, 0, 1)],
-    [new Vec3(-0.5, -0.5, 0.5), new Vec3(1, 0, 0), new Vec3(0, 1, 0)],
-    [new Vec3(-0.5, -0.5, -0.5), new Vec3(1, 0, 0), new Vec3(0, 1, 0)]
-];
+// the faces of planes and boxes, as sampleFace takes them
+const faceVectors = (faces: Face[]) => faces.map(f => ({
+    origin: new Vec3(f.origin[0], f.origin[1], f.origin[2]),
+    u: new Vec3(f.u[0], f.u[1], f.u[2]),
+    v: new Vec3(f.v[0], f.v[1], f.v[2])
+}));
+const planeFaceVectors = faceVectors(planeFaces);
+const boxFaceVectors = faceVectors(boxFaces);
 
-// a curved shape as a world-space triangle mesh
-const shapeWorldMesh = (primitive: MeshPrimitive): MeshData => {
+// a curved shape as a world-space triangle mesh, with its paint
+const shapeWorldMesh = (primitive: MeshPrimitive, pixels: PaintPixels | null): MeshData => {
     const geometry = shapeGeometry(primitive.kind as any);
     const m = primitive.entity.getWorldTransform();
     const positions = new Float32Array(geometry.positions.length);
@@ -140,7 +147,6 @@ const shapeWorldMesh = (primitive: MeshPrimitive): MeshData => {
         normalMatrix.transformVector(v.set(geometry.normals[i], geometry.normals[i + 1], geometry.normals[i + 2]), v).normalize();
         normals[i] = v.x; normals[i + 1] = v.y; normals[i + 2] = v.z;
     }
-    const c = primitive.color;
     let surfaceArea = 0;
     for (let t = 0; t < geometry.indices.length; t += 3) {
         surfaceArea += triangleArea(positions, geometry.indices[t], geometry.indices[t + 1], geometry.indices[t + 2]);
@@ -149,19 +155,24 @@ const shapeWorldMesh = (primitive: MeshPrimitive): MeshData => {
         batches: [{
             positions,
             normals,
-            uvs: null,
+            uvs: geometry.uvs,
             mrUvs: null,
             colors: null,
             indices: geometry.indices,
+            local: geometry.positions,
             material: {
-                baseColor: [srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2]), 1],
+                // the paint brings the colour
+                baseColor: [1, 1, 1, 1],
                 texture: null,
-                alphaMode: 'OPAQUE',
+                alphaMode: 'BLEND',
                 alphaCutoff: 0.5,
                 roughness: primitive.roughness ?? DEFAULT_ROUGHNESS,
                 metalness: primitive.metalness ?? DEFAULT_METALNESS,
                 mrTexture: null,
-                doubleSided: geometry.twoSided
+                doubleSided: geometry.twoSided,
+                paint: createPaint(primitive.paint, geometry.half, pixels),
+                // mesh samples are spread ~1 spacing apart, 0.85 spacing wide
+                coverage: (alpha: number) => coverageOpacity(alpha, 0.85)
             }
         }],
         numTriangles: geometry.indices.length / 3,
@@ -188,7 +199,7 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
     if (primitive.kind === 'model' || isShapeKind(primitive.kind)) {
         let mesh = meshes?.get(primitive);
         if (!mesh) {
-            mesh = primitive.kind === 'model' ? await modelWorldMesh(primitive) : shapeWorldMesh(primitive);
+            mesh = primitive.kind === 'model' ? await modelWorldMesh(primitive) : shapeWorldMesh(primitive, await primitive.paintPixels());
             meshes?.set(primitive, mesh);
         }
         const target = Math.round(mesh.surfaceArea / (cell * cell));
@@ -203,14 +214,21 @@ const samplePrimitive = async (primitive: MeshPrimitive, cell: number, out: Samp
         return out.count - start;
     }
 
-    if (primitive.kind === 'plane') {
-        sampleFace(out, transform, center, new Vec3(-0.5, 0, -0.5), new Vec3(1, 0, 0), new Vec3(0, 0, 1), cell, surfaceOf(primitive, true), () => tint);
-        return out.count - start;
-    }
-
-    if (primitive.kind === 'box') {
-        const material = surfaceOf(primitive, false);
-        boxFaces.forEach(([origin, axisU, axisV]) => sampleFace(out, transform, center, origin, axisU, axisV, cell, material, () => tint));
+    if (primitive.kind === 'plane' || primitive.kind === 'box') {
+        const plane = primitive.kind === 'plane';
+        const material = surfaceOf(primitive, plane);
+        const paint = createPaint(primitive.paint, primitive.geometry.half, await primitive.paintPixels());
+        const rgba = new Float32Array(4);
+        (plane ? planeFaceVectors : boxFaceVectors).forEach(({ origin, u, v }) => {
+            sampleFace(out, transform, center, origin, u, v, cell, material, (s, t) => {
+                paint(s, t,
+                    origin.x + u.x * s + v.x * t,
+                    origin.y + u.y * s + v.y * t,
+                    origin.z + u.z * s + v.z * t,
+                    rgba);
+                return [rgba[0], rgba[1], rgba[2], rgba[3]];
+            });
+        });
         return out.count - start;
     }
 
@@ -338,27 +356,85 @@ const trianglesOf = (positions: ArrayLike<number>, indices: ArrayLike<number>, t
     return out;
 };
 
-const quadPositions = [-0.5, 0, -0.5, 0.5, 0, -0.5, 0.5, 0, 0.5, -0.5, 0, 0.5];
-const quadIndices = [0, 1, 2, 0, 2, 3];
-const boxPositions = [
-    -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
-    -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5
-];
-const boxIndices = [
-    0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1,
-    3, 2, 6, 3, 6, 7, 0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2
-];
+const PAINT_MASK = 128;     // shadow mask resolution of see-through paint
+
+// the triangles a plane, box or shape casts shadows with: see-through parts
+// of its paint (opacity, gradient, picture) let the light through
+const paintedOccluder = async (primitive: MeshPrimitive): Promise<Occluder> => {
+    const transform = primitive.entity.getWorldTransform();
+    const geometry = primitive.geometry;
+    const pixels = await primitive.paintPixels();
+    const paintState = primitive.paint;
+    const all = trianglesOf(geometry.positions, geometry.indices, transform);
+    if (!paintHasAlpha(paintState, pixels)) {
+        return { positions: all, uvs: null, maskIndex: null, masks: [], convex: geometry.convex };
+    }
+    const paint = createPaint(paintState, geometry.half, pixels);
+    const rgba = new Float32Array(4);
+    const { indices, uvs: vuv, positions: lp } = geometry;
+    const triangles = indices.length / 3;
+    const flat = primitive.kind === 'plane' || primitive.kind === 'box';
+
+    // object-space opacity on a curved shape: keep the triangles that are
+    // mostly opaque at their centre (the shapes are finely tessellated)
+    if (!flat && paintAlphaUsesObjectSpace(paintState)) {
+        const kept: number[] = [];
+        for (let t = 0; t < triangles; ++t) {
+            let u = 0, v = 0, x = 0, y = 0, z = 0;
+            for (let k = 0; k < 3; ++k) {
+                const i = indices[t * 3 + k];
+                u += vuv[i * 2] / 3; v += vuv[i * 2 + 1] / 3;
+                x += lp[i * 3] / 3; y += lp[i * 3 + 1] / 3; z += lp[i * 3 + 2] / 3;
+            }
+            paint(u, v, x, y, z, rgba);
+            if (rgba[3] >= 0.5) kept.push(t);
+        }
+        const positions = new Float32Array(kept.length * 9);
+        kept.forEach((t, i) => positions.set(all.subarray(t * 9, t * 9 + 9), i * 9));
+        return { positions, uvs: null, maskIndex: null, masks: [], convex: geometry.convex };
+    }
+
+    // otherwise a mask over uv space: one for a shape, one per face of a
+    // plane or box (their local position follows from uv on each face)
+    const faces = primitive.kind === 'plane' ? planeFaces : primitive.kind === 'box' ? boxFaces : null;
+    const masks: OccluderMask[] = (faces ?? [null]).map((face) => {
+        const alpha = new Float32Array(PAINT_MASK * PAINT_MASK);
+        for (let j = 0; j < PAINT_MASK; ++j) {
+            for (let i = 0; i < PAINT_MASK; ++i) {
+                const s = (i + 0.5) / PAINT_MASK;
+                const t = (j + 0.5) / PAINT_MASK;
+                if (face) {
+                    const { origin: o, u, v } = face;
+                    paint(s, t, o[0] + u[0] * s + v[0] * t, o[1] + u[1] * s + v[1] * t, o[2] + u[2] * s + v[2] * t, rgba);
+                } else {
+                    paint(s, t, 0, 0, 0, rgba);
+                }
+                alpha[j * PAINT_MASK + i] = rgba[3];
+            }
+        }
+        return { width: PAINT_MASK, height: PAINT_MASK, alpha, cutoff: 0.5 };
+    });
+    const uvs = new Float32Array(triangles * 6);
+    const maskIndex = new Int32Array(triangles);
+    for (let t = 0; t < triangles; ++t) {
+        for (let k = 0; k < 3; ++k) {
+            const i = indices[t * 3 + k];
+            uvs[t * 6 + k * 2] = vuv[i * 2];
+            uvs[t * 6 + k * 2 + 1] = vuv[i * 2 + 1];
+        }
+        // planes and boxes: 2 triangles per face
+        maskIndex[t] = faces ? Math.floor(t / 2) : 0;
+    }
+    return { positions: all, uvs, maskIndex, masks, convex: geometry.convex };
+};
 
 // the triangles a primitive casts shadows with
 const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrimitive, MeshData>): Promise<Occluder | null> => {
     const transform = primitive.entity.getWorldTransform();
     const base = { uvs: null as Float32Array | null, maskIndex: null as Int32Array | null, masks: [] as OccluderMask[] };
 
-    if (primitive.kind === 'plane') {
-        return { ...base, positions: trianglesOf(quadPositions, quadIndices, transform), convex: true };
-    }
-    if (primitive.kind === 'box') {
-        return { ...base, positions: trianglesOf(boxPositions, boxIndices, transform), convex: true };
+    if (primitive.paintable) {
+        return paintedOccluder(primitive);
     }
     if (primitive.kind === 'image') {
         if (!primitive.alphaGrid) return null;
@@ -388,7 +464,7 @@ const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrim
 
     let mesh = meshes?.get(primitive);
     if (!mesh) {
-        mesh = primitive.kind === 'model' ? await modelWorldMesh(primitive) : shapeWorldMesh(primitive);
+        mesh = await modelWorldMesh(primitive);
         meshes?.set(primitive, mesh);
     }
     const parts = mesh.batches.map(batch => trianglesOf(batch.positions, batch.indices, null));
@@ -418,8 +494,7 @@ const primitiveOccluder = async (primitive: MeshPrimitive, meshes?: Map<MeshPrim
         }
         t += count;
     });
-    const convex = isShapeKind(primitive.kind) && shapeGeometry(primitive.kind).convex;
-    return { ...base, positions, uvs, maskIndex, masks, convex };
+    return { ...base, positions, uvs, maskIndex, masks, convex: false };
 };
 
 // splats along the longest side -> spacing between samples

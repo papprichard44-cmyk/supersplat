@@ -54,6 +54,11 @@ type Material = {
     // metallic-roughness texture: roughness in G, metalness in B (linear)
     mrTexture: Texture | null;
     doubleSided: boolean;
+    // toolkit: procedural surface paint (display-space rgb, straight alpha) of
+    // a point given its uv and its position in the object's own space
+    paint?: ((u: number, v: number, lx: number, ly: number, lz: number, out: Float32Array) => void) | null;
+    // toolkit: maps the paint's coverage to a per-gaussian opacity
+    coverage?: ((alpha: number) => number) | null;
 };
 
 // one primitive's triangles, with positions already in world space
@@ -65,6 +70,8 @@ type Batch = {
     colors: Float32Array | null;    // linear rgba per vertex
     indices: Uint32Array;           // 3 per triangle
     material: Material;
+    // toolkit: vertex positions in the object's own space, for material.paint
+    local?: Float32Array | null;
 };
 
 type MeshData = {
@@ -614,10 +621,12 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
     });
 
     const texel = new Float32Array(4);
+    const painted = new Float32Array(4);
     const surface = { roughness: 1, metalness: 0, twoSided: false };
 
     batches.forEach((batch, bi) => {
-        const { positions: p, normals: vn, uvs, mrUvs, colors, indices, material } = batch;
+        const { positions: p, normals: vn, uvs, mrUvs, colors, indices, material, local } = batch;
+        const paint = material.paint ?? null;
         const batchCounts = counts[bi];
         const [fr, fg, fb, fa] = material.baseColor;
         const texture = uvs ? material.texture : null;
@@ -678,6 +687,18 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                     b *= texel[2];
                     a *= texel[3];
                 }
+                if (paint) {
+                    const u = uvs ? uvs[ia * 2] * w0 + uvs[ib * 2] * r1 + uvs[ic * 2] * r2 : 0;
+                    const v = uvs ? uvs[ia * 2 + 1] * w0 + uvs[ib * 2 + 1] * r1 + uvs[ic * 2 + 1] * r2 : 0;
+                    const lx = local ? local[ia * 3] * w0 + local[ib * 3] * r1 + local[ic * 3] * r2 : 0;
+                    const ly = local ? local[ia * 3 + 1] * w0 + local[ib * 3 + 1] * r1 + local[ic * 3 + 1] * r2 : 0;
+                    const lz = local ? local[ia * 3 + 2] * w0 + local[ib * 3 + 2] * r1 + local[ic * 3 + 2] * r2 : 0;
+                    paint(u, v, lx, ly, lz, painted);
+                    r *= srgbToLinear(Math.max(0, painted[0]));
+                    g *= srgbToLinear(Math.max(0, painted[1]));
+                    b *= srgbToLinear(Math.max(0, painted[2]));
+                    a *= painted[3];
+                }
 
                 if (material.alphaMode === 'OPAQUE') {
                     a = 1;
@@ -686,6 +707,8 @@ const sampleMeshSurface = (mesh: MeshData, targetCount: number, out: SampleBuffe
                     a = 1;
                 } else if (a < 1 / 255) {
                     continue;
+                } else if (material.coverage && a < 1) {
+                    a = material.coverage(a);
                 }
 
                 // surface response

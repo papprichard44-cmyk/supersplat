@@ -136,4 +136,60 @@ const shapeGeometry = (kind: ShapeKind): ShapeGeometry => {
 
 const isShapeKind = (kind: string): kind is ShapeKind => (shapeKinds as string[]).includes(kind);
 
-export { ShapeKind, ShapeGeometry, shapeKinds, shapeGeometry, isShapeKind };
+// ---- planes and boxes
+//
+// Built from faces: origin + s * u + t * v for s, t in 0..1, with uv = (s, t).
+// Seen from outside, u runs to the right and v downwards on every face, so a
+// picture mapped on them is upright and never mirrored. The splat conversion
+// samples the very same faces, so pictures and gradients line up exactly.
+
+type Face = { origin: [number, number, number], u: [number, number, number], v: [number, number, number] };
+
+const planeFaces: Face[] = [
+    { origin: [-0.5, 0, -0.5], u: [1, 0, 0], v: [0, 0, 1] }
+];
+
+const boxFaces: Face[] = [
+    { origin: [-0.5, 0.5, 0.5], u: [1, 0, 0], v: [0, -1, 0] },      // +z
+    { origin: [0.5, 0.5, -0.5], u: [-1, 0, 0], v: [0, -1, 0] },     // -z
+    { origin: [0.5, 0.5, 0.5], u: [0, 0, -1], v: [0, -1, 0] },      // +x
+    { origin: [-0.5, 0.5, -0.5], u: [0, 0, 1], v: [0, -1, 0] },     // -x
+    { origin: [-0.5, 0.5, -0.5], u: [1, 0, 0], v: [0, 0, 1] },      // +y
+    { origin: [-0.5, -0.5, 0.5], u: [1, 0, 0], v: [0, 0, -1] }      // -y
+];
+
+const flatCache = new Map<string, ShapeGeometry>();
+
+const flatGeometry = (kind: 'plane' | 'box'): ShapeGeometry => {
+    let result = flatCache.get(kind);
+    if (result) return result;
+    const faces = kind === 'plane' ? planeFaces : boxFaces;
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const uvs: number[] = [];
+    const indices: number[] = [];
+    faces.forEach(({ origin: o, u, v }) => {
+        // outward normal: u x v points inwards (see above)
+        const n = [-(u[1] * v[2] - u[2] * v[1]), -(u[2] * v[0] - u[0] * v[2]), -(u[0] * v[1] - u[1] * v[0])];
+        const base = positions.length / 3;
+        [[0, 0], [1, 0], [1, 1], [0, 1]].forEach(([s, t]) => {
+            positions.push(o[0] + u[0] * s + v[0] * t, o[1] + u[1] * s + v[1] * t, o[2] + u[2] * s + v[2] * t);
+            normals.push(kind === 'plane' ? 0 : n[0], kind === 'plane' ? 1 : n[1], kind === 'plane' ? 0 : n[2]);
+            uvs.push(s, t);
+        });
+        indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    });
+    result = {
+        positions: new Float32Array(positions),
+        normals: new Float32Array(normals),
+        uvs: new Float32Array(uvs),
+        indices: new Uint32Array(indices),
+        half: kind === 'plane' ? [0.5, 0.002, 0.5] : [0.5, 0.5, 0.5],
+        twoSided: kind === 'plane',
+        convex: true
+    };
+    flatCache.set(kind, result);
+    return result;
+};
+
+export { ShapeKind, ShapeGeometry, Face, shapeKinds, shapeGeometry, isShapeKind, planeFaces, boxFaces, flatGeometry };

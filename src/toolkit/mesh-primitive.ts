@@ -1,5 +1,7 @@
 import {
     ADDRESS_CLAMP_TO_EDGE,
+    ADDRESS_REPEAT,
+    BLEND_NORMAL,
     CULLFACE_NONE,
     FILTER_LINEAR,
     FILTER_LINEAR_MIPMAP_LINEAR,
@@ -14,6 +16,7 @@ import {
     Mesh,
     MeshInstance,
     ShaderMaterial,
+    GraphicsDevice,
     Texture,
     Vec3
 } from 'playcanvas';
@@ -22,7 +25,8 @@ import { Element, ElementType } from '../element';
 import { Serializer } from '../serializer';
 import { AlphaGrid, buildExtrudeGeometry, makeAlphaGrid } from './image-extrude';
 import { litChunkWGSL } from './lighting/shading';
-import { isShapeKind, shapeGeometry, ShapeKind } from './shapes';
+import { flatGeometry, isShapeKind, shapeGeometry, ShapeGeometry, ShapeKind } from './shapes';
+import { PaintGradient, PaintPixels, PaintState, PaintTexture, paintChunkWGSL, paintUniforms } from './surface-paint';
 
 // Opaque, depth-writing mesh drawn in the world layer. The world pass and the
 // splat passes share one depth buffer and the splat material depth-tests, so a
@@ -62,6 +66,11 @@ type PrimitiveState = {
     // keeps the model's own materials
     roughness?: number;
     metalness?: number;
+    // paint of planes, boxes and shapes (see surface-paint.ts): opacity of the
+    // colour, a second gradient stop, a picture on top
+    opacity?: number;
+    gradient?: PaintGradient | null;
+    texture?: PaintTexture | null;
 };
 
 // what generated a model (vegetation panel), kept so it can be regenerated or
@@ -203,6 +212,109 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
 }
 `;
 
+// planes, boxes and shapes: colour, gradient and picture (surface-paint.ts).
+// Drawn twice: the opaque parts with depth writes like any solid, the
+// see-through parts blended on top without them. Both draw before the
+// splats, so splats in front of a see-through part stay sharp over it;
+// splats right behind one show through it unfiltered until it is converted to
+// splats (as splats, transparency sorts and blends properly).
+const paintVertexShader = /* wgsl */`
+attribute vertex_position: vec3f;
+attribute vertex_normal: vec3f;
+attribute vertex_texCoord0: vec2f;
+uniform matrix_model: mat4x4f;
+uniform matrix_viewProjection: mat4x4f;
+uniform matrix_normal: mat3x3f;
+varying vUv: vec2f;
+varying vLocal: vec3f;
+varying vWorldPos: vec3f;
+varying vNormal: vec3f;
+
+@vertex
+fn vertexMain(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    let world = uniform.matrix_model * vec4f(input.vertex_position, 1.0);
+    output.position = uniform.matrix_viewProjection * world;
+    output.vUv = input.vertex_texCoord0;
+    output.vLocal = input.vertex_position;
+    output.vWorldPos = world.xyz;
+    output.vNormal = uniform.matrix_normal * input.vertex_normal;
+    return output;
+}
+`;
+
+const paintFragmentShader = /* wgsl */`
+uniform view_position: vec3f;
+uniform primColor: vec3f;
+// 0: opaque parts (depth write), 1: see-through parts (blended)
+uniform primPass: f32;
+varying vUv: vec2f;
+varying vLocal: vec3f;
+varying vWorldPos: vec3f;
+varying vNormal: vec3f;
+${litChunkWGSL}
+${paintChunkWGSL}
+
+@fragment
+fn fragmentMain(input: FragmentInput) -> FragmentOutput {
+    var output: FragmentOutput;
+    let paint = paintColor(input.vUv, input.vLocal);
+    if (uniform.primPass < 0.5) {
+        if (paint.a < 0.998) {
+            discard;
+        }
+    } else if (paint.a >= 0.998 || paint.a < 0.002) {
+        discard;
+    }
+    let n = normalize(input.vNormal);
+    let v = normalize(uniform.view_position - input.vWorldPos);
+    let shade = 0.6 + 0.4 * abs(dot(n, v));
+    let color = studioShade(paint.rgb, n, input.vWorldPos, uniform.view_position, paint.rgb * shade);
+    output.color = vec4f(color, select(1.0, paint.a, uniform.primPass > 0.5));
+    return output;
+}
+`;
+
+// a 1x1 white picture bound while a primitive has none
+const whiteTextures = new WeakMap<GraphicsDevice, Texture>();
+const whiteTexture = (device: GraphicsDevice) => {
+    let texture = whiteTextures.get(device);
+    if (!texture) {
+        texture = new Texture(device, {
+            name: 'toolkitWhite',
+            width: 1,
+            height: 1,
+            format: PIXELFORMAT_RGBA8,
+            mipmaps: false,
+            levels: [new Uint8Array([255, 255, 255, 255])]
+        });
+        whiteTextures.set(device, texture);
+    }
+    return texture;
+};
+
+const MAX_PAINT_TEXTURE = 4096;     // gpu
+const MAX_PAINT_PIXELS = 2048;      // cpu copy for the splat conversion
+
+// decode a picture into straight-alpha rgba pixels, at most `max` on a side
+const imagePixels = async (url: string, max: number): Promise<PaintPixels> => {
+    const source = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error('toolkit: image failed to load'));
+        image.src = url;
+    });
+    const scale = Math.min(1, max / Math.max(source.naturalWidth, source.naturalHeight));
+    const width = Math.max(1, Math.round(source.naturalWidth * scale));
+    const height = Math.max(1, Math.round(source.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(source, 0, 0, width, height);
+    return { width, height, data: context.getImageData(0, 0, width, height).data };
+};
+
 const loadImage = (url: string) => {
     return new Promise<HTMLImageElement>((resolve, reject) => {
         const image = new Image();
@@ -264,6 +376,16 @@ class MeshPrimitive extends Element {
     metalness: number | null = DEFAULT_METALNESS;
     private bound = new BoundingBox();
     private localBound = new BoundingBox();
+    // surface paint (planes, boxes, shapes)
+    opacity = 1;
+    gradient: PaintGradient | null = null;
+    paintTexture: PaintTexture | null = null;
+    private paintGpu: Texture | null = null;
+    private paintGpuUrl: string | null = null;
+    private paintLoading: string | null = null;
+    private paintCpu: { url: string, pixels: Promise<PaintPixels> } | null = null;
+    private blendMaterial: ShaderMaterial | null = null;
+    private paintRevision = 0;
 
     constructor(data: PrimitiveData) {
         super(ElementType.model);
@@ -281,8 +403,7 @@ class MeshPrimitive extends Element {
             this.localHalf.set(half[0], half[1], half[2]);
         }
         if (data.kind !== 'model') {
-            const generated = data.kind === 'image' || isShapeKind(data.kind);
-            this.entity.addComponent('render', { type: generated ? 'asset' : data.kind });
+            this.entity.addComponent('render', { type: 'asset' });
         }
         this.setState(data);
     }
@@ -398,46 +519,46 @@ class MeshPrimitive extends Element {
             });
         }
 
-        const material = isImage ? new ShaderMaterial({
-            uniqueName: 'toolkitImageCutout',
-            attributes: {
-                vertex_position: SEMANTIC_POSITION,
-                vertex_normal: SEMANTIC_NORMAL,
-                vertex_texCoord0: SEMANTIC_TEXCOORD0
-            },
-            vertexWGSL: imageVertexShader,
-            fragmentWGSL: imageFragmentShader
-        }) : new ShaderMaterial({
-            uniqueName: 'toolkitMeshPrimitive',
-            attributes: {
-                vertex_position: SEMANTIC_POSITION,
-                vertex_normal: SEMANTIC_NORMAL
-            },
-            vertexWGSL: vertexShader,
-            fragmentWGSL: fragmentShader
-        });
-        material.cull = CULLFACE_NONE;
-        material.depthWrite = true;
-        material.depthTest = true;
-        material.update();
-        this.material = material;
-
         if (isImage) {
+            const material = new ShaderMaterial({
+                uniqueName: 'toolkitImageCutout',
+                attributes: {
+                    vertex_position: SEMANTIC_POSITION,
+                    vertex_normal: SEMANTIC_NORMAL,
+                    vertex_texCoord0: SEMANTIC_TEXCOORD0
+                },
+                vertexWGSL: imageVertexShader,
+                fragmentWGSL: imageFragmentShader
+            });
+            material.cull = CULLFACE_NONE;
+            material.depthWrite = true;
+            material.depthTest = true;
+            material.update();
+            this.material = material;
             this.rebuildMesh();
-        } else if (isShapeKind(this.kind)) {
-            const geometry = shapeGeometry(this.kind);
+        } else {
+            // the opaque parts, and the see-through ones blended without depth writes
+            this.material = makeMaterial('toolkitPaintedPrimitive', paintVertexShader, paintFragmentShader, true);
+            const blend = makeMaterial('toolkitPaintedPrimitive', paintVertexShader, paintFragmentShader, true);
+            blend.blendType = BLEND_NORMAL;
+            blend.depthWrite = false;
+            blend.update();
+            this.blendMaterial = blend;
+
+            const geometry = this.geometry;
             const mesh = new Mesh(this.scene.graphicsDevice);
             mesh.setPositions(geometry.positions);
             mesh.setNormals(geometry.normals);
             mesh.setUvs(0, geometry.uvs);
             mesh.setIndices(geometry.indices);
             mesh.update(PRIMITIVE_TRIANGLES);
-            const meshInstance = new MeshInstance(mesh, material);
-            meshInstance.castShadow = false;
-            this.entity.render.meshInstances = [meshInstance];
+            const opaque = new MeshInstance(mesh, this.material);
+            const seeThrough = new MeshInstance(mesh, blend);
+            opaque.castShadow = false;
+            seeThrough.castShadow = false;
+            this.entity.render.meshInstances = [opaque, seeThrough];
             this.mesh = mesh;
-        } else {
-            this.entity.render.meshInstances[0].material = material;
+            this.updatePaintTexture();
         }
         this.entity.render.layers = [this.scene.worldLayer.id];
         this.entity.render.castShadows = false;
@@ -451,8 +572,14 @@ class MeshPrimitive extends Element {
         this.scene.boundDirty = true;
         this.material?.destroy();
         this.material = null;
+        this.blendMaterial?.destroy();
+        this.blendMaterial = null;
         this.texture?.destroy();
         this.texture = null;
+        this.paintGpu?.destroy();
+        this.paintGpu = null;
+        this.paintGpuUrl = null;
+        this.paintLoading = null;
         if (this.mesh) {
             this.entity.render.meshInstances = [];
             this.mesh.destroy();
@@ -477,7 +604,78 @@ class MeshPrimitive extends Element {
     serialize(serializer: Serializer) {
         serializer.packa(this.entity.getWorldTransform().data);
         serializer.packa(this.color);
-        serializer.pack(this.entity.enabled, this.alphaCutoff, this.roughness ?? -1, this.metalness ?? -1);
+        serializer.pack(this.entity.enabled, this.alphaCutoff, this.roughness ?? -1, this.metalness ?? -1, this.paintRevision);
+    }
+
+    // planes, boxes and shapes take colour gradients and pictures
+    get paintable() {
+        return this.kind === 'plane' || this.kind === 'box' || isShapeKind(this.kind);
+    }
+
+    // the triangles of a plane, box or shape, in its own space
+    get geometry(): ShapeGeometry {
+        return this.kind === 'plane' || this.kind === 'box' ? flatGeometry(this.kind) : shapeGeometry(this.kind as ShapeKind);
+    }
+
+    get paint(): PaintState {
+        return {
+            color: this.color,
+            opacity: this.paintable ? this.opacity : 1,
+            gradient: this.paintable ? this.gradient : null,
+            texture: this.paintable ? this.paintTexture : null
+        };
+    }
+
+    // the picture's pixels, for the splat conversion
+    paintPixels(): Promise<PaintPixels | null> {
+        const url = this.paintable ? this.paintTexture?.image : null;
+        if (!url) return Promise.resolve(null);
+        if (this.paintCpu?.url !== url) {
+            this.paintCpu = { url, pixels: imagePixels(url, MAX_PAINT_PIXELS) };
+        }
+        return this.paintCpu.pixels;
+    }
+
+    // load the picture onto the gpu when it changed
+    private updatePaintTexture() {
+        const url = this.paintable ? this.paintTexture?.image ?? null : null;
+        if (url === this.paintGpuUrl || url === this.paintLoading || !this.scene) {
+            return;
+        }
+        if (!url) {
+            this.paintGpu?.destroy();
+            this.paintGpu = null;
+            this.paintGpuUrl = null;
+            this.paintLoading = null;
+            this.applyColor();
+            return;
+        }
+        this.paintLoading = url;
+        imagePixels(url, MAX_PAINT_TEXTURE).then((pixels) => {
+            if (this.paintLoading !== url || !this.scene) return;
+            this.paintLoading = null;
+            this.paintGpu?.destroy();
+            this.paintGpu = new Texture(this.scene.graphicsDevice, {
+                name: `toolkitPaint:${this.name}`,
+                width: pixels.width,
+                height: pixels.height,
+                format: PIXELFORMAT_RGBA8,
+                mipmaps: true,
+                minFilter: FILTER_LINEAR_MIPMAP_LINEAR,
+                magFilter: FILTER_LINEAR,
+                addressU: ADDRESS_REPEAT,
+                addressV: ADDRESS_REPEAT,
+                anisotropy: 8,
+                levels: [new Uint8Array(pixels.data.buffer)]
+            });
+            this.paintGpuUrl = url;
+            this.paintRevision++;
+            this.applyColor();
+            this.scene.forceRender = true;
+        }).catch((e) => {
+            console.warn(e);
+            if (this.paintLoading === url) this.paintLoading = null;
+        });
     }
 
     // (re)build the extruded picture mesh for the current alpha cutoff
@@ -530,6 +728,22 @@ class MeshPrimitive extends Element {
             });
             return;
         }
+        if (this.paintable) {
+            const instances = this.entity.render?.meshInstances ?? [];
+            if (!instances.length || !this.scene) return;
+            const uniforms = paintUniforms(this.paint, this.geometry.half, !!this.paintGpu);
+            const texture = this.paintGpu ?? whiteTexture(this.scene.graphicsDevice);
+            instances.forEach((meshInstance, pass) => {
+                meshInstance.setParameter('primColor', this.color);
+                meshInstance.setParameter('primPass', pass);
+                meshInstance.setParameter('primRoughness', this.roughness ?? DEFAULT_ROUGHNESS);
+                meshInstance.setParameter('primMetalness', this.metalness ?? DEFAULT_METALNESS);
+                meshInstance.setParameter('primStudioMask', this.studioMask);
+                meshInstance.setParameter('primPaintTex', texture);
+                Object.entries(uniforms).forEach(([name, value]) => meshInstance.setParameter(name, value as any));
+            });
+            return;
+        }
         const meshInstance = this.entity.render?.meshInstances[0];
         if (!meshInstance) return;
         meshInstance.setParameter('primColor', this.color);
@@ -554,7 +768,16 @@ class MeshPrimitive extends Element {
             visible: this.entity.enabled,
             alphaCutoff: this.alphaCutoff,
             ...(this.roughness !== null ? { roughness: this.roughness } : {}),
-            ...(this.metalness !== null ? { metalness: this.metalness } : {})
+            ...(this.metalness !== null ? { metalness: this.metalness } : {}),
+            ...(this.paintable ? {
+                opacity: this.opacity,
+                gradient: this.gradient ? { ...this.gradient, color: [...this.gradient.color] as [number, number, number] } : null,
+                texture: this.paintTexture ? {
+                    ...this.paintTexture,
+                    tiling: [...this.paintTexture.tiling] as [number, number],
+                    offset: [...this.paintTexture.offset] as [number, number]
+                } : null
+            } : {})
         };
     }
 
@@ -568,6 +791,17 @@ class MeshPrimitive extends Element {
         const ownMaterials = this.kind === 'model';
         this.roughness = state.roughness ?? (ownMaterials ? null : DEFAULT_ROUGHNESS);
         this.metalness = state.metalness ?? (ownMaterials ? null : DEFAULT_METALNESS);
+        this.opacity = state.opacity ?? 1;
+        this.gradient = state.gradient ? { ...state.gradient, color: [...state.gradient.color] as [number, number, number] } : null;
+        this.paintTexture = state.texture ? {
+            ...state.texture,
+            tiling: [...state.texture.tiling] as [number, number],
+            offset: [...state.texture.offset] as [number, number]
+        } : null;
+        this.paintRevision++;
+        if (this.paintable && this.scene) {
+            this.updatePaintTexture();
+        }
         if (this.kind === 'image' && this.scene) {
             this.rebuildMesh();
         }
@@ -589,8 +823,23 @@ class MeshPrimitive extends Element {
     }
 }
 
+// pictures are long data urls: compare those by identity, not text
+const stateKey = (state: PrimitiveState) => {
+    const images: string[] = [];
+    const text = JSON.stringify(state, (key, value) => {
+        if (key === 'image' && typeof value === 'string') {
+            images.push(value);
+            return images.length;
+        }
+        return value;
+    });
+    return { text, images };
+};
+
 const statesEqual = (a: PrimitiveState, b: PrimitiveState) => {
-    return JSON.stringify(a) === JSON.stringify(b);
+    const ka = stateKey(a);
+    const kb = stateKey(b);
+    return ka.text === kb.text && ka.images.every((image, i) => image === kb.images[i]);
 };
 
 export { MeshPrimitive, loadImage, PrimitiveKind, PrimitiveState, PrimitiveData, PrimitiveGenerator, statesEqual, DEFAULT_ROUGHNESS, DEFAULT_METALNESS };

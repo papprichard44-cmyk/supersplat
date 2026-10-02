@@ -1,4 +1,4 @@
-import { Button, ColorPicker, Container, Label, SelectInput, SliderInput, VectorInput } from '@playcanvas/pcui';
+import { BooleanInput, Button, ColorPicker, Container, Label, SelectInput, SliderInput, VectorInput } from '@playcanvas/pcui';
 import { OrientedBox, Ray, Vec3 } from 'playcanvas';
 
 import { MultiOp } from '../edit-ops';
@@ -9,6 +9,7 @@ import { headerIcon, registerPanel } from './panels';
 import { AddPrimitiveOp, PrimitiveStateOp, RemovePrimitiveOp } from './primitive-ops';
 import { cellForDensity } from './primitive-to-splat';
 import { ShapeKind } from './shapes';
+import { defaultGradient, defaultTexture, gradientCss, PaintGradient, PaintTexture, PaintWrap } from './surface-paint';
 import { readGlb } from '../mesh-to-splat';
 import { ShapeGizmoMode, ShapeTransformGizmo } from '../tools/shape-transform-gizmo';
 import deleteSvg from '../ui/svg/delete.svg';
@@ -39,7 +40,23 @@ const tips = {
     translate: 'Move the selected primitive with the gizmo (shortcut: 1).',
     rotate: 'Rotate the selected primitive with the gizmo (shortcut: 2).',
     scale: 'Resize the selected primitive with the gizmo (shortcut: 3). On a picture, drag the Y handle to extrude it.',
-    color: 'Surface colour of the selected primitive. On a picture it tints the image (white = unchanged).',
+    color: 'Surface colour of the selected primitive (with a gradient: its start colour). On a picture or model it tints it (white = unchanged).',
+    opacity: 'Opacity of the colour: 1 = solid, 0 = invisible. See-through parts let the light through and become see-through splats.',
+    gradient: 'Blend the colour into a second colour across the surface. Each end has its own opacity, so a colour can fade out into nothing.',
+    gradientEnd: 'End colour of the gradient and its opacity. With opacity 0 its colour does not matter: the start colour simply fades out.',
+    gradientType: 'Linear: a straight blend in one direction. Radial: from the centre outwards.',
+    gradientSpace: 'Along the surface: follows the surface layout (on a box, every face on its own; on a backdrop, from its front edge up the wall). In object space: across the whole object, angle 0 = bottom to top.',
+    angle: 'Direction of the blend in degrees.',
+    from: 'Where the blend starts: before this point the surface has the start colour.',
+    to: 'Where the blend ends: after this point the surface has the end colour. Set it below "From" to reverse the gradient.',
+    balance: 'Where between From and To the colours meet half way: lower values let the end colour take over sooner, higher values later.',
+    smooth: 'Ease the blend in and out instead of a straight line: softer, more natural transitions.',
+    swap: 'Swap the two ends of the gradient.',
+    picture: 'Put a picture (PNG / JPEG / WebP) from your computer on the surface. It is multiplied with the colour (white = the picture as it is) and its transparency is kept.',
+    tiling: 'How many times the picture repeats across the surface, horizontally and vertically.',
+    offset: 'Shift the picture across the surface, in picture widths and heights.',
+    turn: 'Turn the picture on the surface, in degrees.',
+    wrap: 'Beyond its edges the picture repeats, repeats mirrored, stretches its edge pixels, or (decal) is laid once over the colour - with its transparent parts showing the colour underneath.',
     position: 'Position of the primitive centre in world units (X, Y, Z).',
     rotation: 'Rotation in degrees around the X, Y and Z axes.',
     size: 'Size along the primitive\'s own X, Y and Z axes. A plane ignores Y. On a picture Y is the thickness: raise it to extrude the cutout into a solid. On a model the three values scale its longest side.'
@@ -146,6 +163,133 @@ const init = (ctx: ToolkitContext) => {
     const position = vectorRow('Position', 3);
     const rotation = vectorRow('Rotation', 2);
     const size = vectorRow('Size', 3, 0.001);
+
+    // ---- paint: opacity, gradient, picture (planes, boxes and shapes)
+    const paintBox = new Container({ class: 'toolkit-paint' });
+    editor.append(paintBox);
+    const paintRow = (text: string, tip: string) => {
+        const row = new Container({ class: 'toolkit-row' });
+        const label = new Label({ text, class: 'toolkit-label' });
+        row.append(label);
+        tooltips.register(label, tip, 'right');
+        return row;
+    };
+    const paintSlider = (row: Container, tip: string, args: { min: number, max: number, precision: number, value: number, step?: number }) => {
+        const slider = new SliderInput({ class: 'toolkit-slider', ...args });
+        row.append(slider);
+        tooltips.register(slider, tip, 'bottom');
+        return slider;
+    };
+
+    const opacityRow = paintRow('Opacity', tips.opacity);
+    const opacity = paintSlider(opacityRow, tips.opacity, { min: 0, max: 1, precision: 2, step: 0.01, value: 1 });
+    paintBox.append(opacityRow);
+
+    const gradientRow = paintRow('Gradient', tips.gradient);
+    const gradientToggle = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: false });
+    const gradientPreview = new Container({ class: 'toolkit-gradient-preview' });
+    const swapButton = new Button({ text: '⇄', class: 'toolkit-convert' });
+    gradientRow.append(gradientToggle);
+    gradientRow.append(gradientPreview);
+    gradientRow.append(swapButton);
+    tooltips.register(gradientToggle, tips.gradient, 'bottom');
+    tooltips.register(gradientPreview, tips.gradient, 'bottom');
+    tooltips.register(swapButton, tips.swap, 'bottom');
+    paintBox.append(gradientRow);
+
+    const gradientBox = new Container({ class: 'toolkit-paint-sub', hidden: true });
+    paintBox.append(gradientBox);
+    const endRow = paintRow('End', tips.gradientEnd);
+    const endColor = new ColorPicker({ class: 'toolkit-color-small', value: [1, 1, 1] });
+    endRow.append(endColor);
+    tooltips.register(endColor, tips.gradientEnd, 'bottom');
+    const endOpacity = paintSlider(endRow, tips.gradientEnd, { min: 0, max: 1, precision: 2, step: 0.01, value: 0 });
+    gradientBox.append(endRow);
+
+    const typeRow = paintRow('Type', tips.gradientType);
+    const gradientType = new SelectInput({
+        class: 'toolkit-select-small',
+        type: 'string',
+        options: [{ v: 'linear', t: 'Linear' }, { v: 'radial', t: 'Radial' }],
+        value: 'linear'
+    });
+    const gradientSpace = new SelectInput({
+        class: 'toolkit-select',
+        type: 'string',
+        options: [{ v: 'surface', t: 'Along the surface' }, { v: 'object', t: 'In object space' }],
+        value: 'surface'
+    });
+    typeRow.append(gradientType);
+    typeRow.append(gradientSpace);
+    tooltips.register(gradientType, tips.gradientType, 'bottom');
+    tooltips.register(gradientSpace, tips.gradientSpace, 'bottom');
+    gradientBox.append(typeRow);
+
+    const angleRow = paintRow('Angle', tips.angle);
+    const angle = paintSlider(angleRow, tips.angle, { min: 0, max: 360, precision: 0, step: 1, value: 90 });
+    gradientBox.append(angleRow);
+    const fromRow = paintRow('From', tips.from);
+    const from = paintSlider(fromRow, tips.from, { min: 0, max: 1, precision: 2, step: 0.01, value: 0 });
+    gradientBox.append(fromRow);
+    const toRow = paintRow('To', tips.to);
+    const to = paintSlider(toRow, tips.to, { min: 0, max: 1, precision: 2, step: 0.01, value: 1 });
+    gradientBox.append(toRow);
+    const balanceRow = paintRow('Balance', tips.balance);
+    const balance = paintSlider(balanceRow, tips.balance, { min: 0.05, max: 0.95, precision: 2, step: 0.01, value: 0.5 });
+    gradientBox.append(balanceRow);
+    const smoothRow = paintRow('Smooth', tips.smooth);
+    const smoothToggle = new BooleanInput({ type: 'toggle', class: 'toolkit-toggle', value: false });
+    smoothRow.append(smoothToggle);
+    tooltips.register(smoothToggle, tips.smooth, 'bottom');
+    gradientBox.append(smoothRow);
+
+    const pictureRow = paintRow('Picture', tips.picture);
+    const pictureName = new Label({ text: 'None', class: ['toolkit-check-name', 'toolkit-picture-name'] });
+    const pictureLoad = new Button({ text: 'Load…', class: 'toolkit-convert' });
+    const pictureRemove = new Button({ text: '✕', class: 'toolkit-convert', hidden: true });
+    pictureRow.append(pictureName);
+    pictureRow.append(pictureLoad);
+    pictureRow.append(pictureRemove);
+    tooltips.register(pictureLoad, tips.picture, 'bottom');
+    tooltips.register(pictureRemove, 'Take the picture off the surface', 'bottom');
+    paintBox.append(pictureRow);
+
+    const pictureBox = new Container({ class: 'toolkit-paint-sub', hidden: true });
+    paintBox.append(pictureBox);
+    const vector2 = (text: string, tip: string, precision: number, step: number) => {
+        const row = paintRow(text, tip);
+        const input = new VectorInput({ class: 'toolkit-vector', dimensions: 2, precision, step, placeholder: ['U', 'V'], value: [0, 0] });
+        row.append(input);
+        tooltips.register(input, tip, 'bottom');
+        pictureBox.append(row);
+        return input;
+    };
+    const tiling = vector2('Tiling', tips.tiling, 2, 0.5);
+    const offset = vector2('Offset', tips.offset, 3, 0.1);
+    const turnRow = paintRow('Turn', tips.turn);
+    const turn = paintSlider(turnRow, tips.turn, { min: -180, max: 180, precision: 0, step: 1, value: 0 });
+    pictureBox.append(turnRow);
+    const wrapRow = paintRow('Edges', tips.wrap);
+    const wrap = new SelectInput({
+        class: 'toolkit-select',
+        type: 'string',
+        options: [
+            { v: 'repeat', t: 'Repeat' },
+            { v: 'mirror', t: 'Repeat mirrored' },
+            { v: 'clamp', t: 'Stretch the edge' },
+            { v: 'decal', t: 'Once, over the colour (decal)' }
+        ],
+        value: 'repeat'
+    });
+    wrapRow.append(wrap);
+    tooltips.register(wrap, tips.wrap, 'bottom');
+    pictureBox.append(wrapRow);
+
+    const pictureInput = document.createElement('input');
+    pictureInput.type = 'file';
+    pictureInput.accept = 'image/png,image/webp,image/jpeg';
+    pictureInput.style.display = 'none';
+    panel.dom.appendChild(pictureInput);
 
     const cutoffRow = new Container({ class: 'toolkit-row', hidden: true });
     const cutoffLabel = new Label({ text: 'Cutoff', class: 'toolkit-label' });
@@ -292,6 +436,37 @@ const init = (ctx: ToolkitContext) => {
         metalRow.hidden = fromModel;
         shine.value = 1 - r;
         metal.value = m;
+
+        paintBox.hidden = !selected.paintable;
+        const g = state.gradient ?? null;
+        const pic = state.texture ?? null;
+        opacity.value = state.opacity ?? 1;
+        gradientToggle.value = !!g;
+        gradientBox.hidden = !g;
+        swapButton.hidden = !g;
+        const shown = g ?? defaultGradient();
+        endColor.value = shown.color;
+        endOpacity.value = shown.opacity;
+        gradientType.value = shown.type;
+        gradientSpace.value = shown.space;
+        angleRow.hidden = shown.type === 'radial';
+        angle.value = shown.angle;
+        from.value = shown.start;
+        to.value = shown.end;
+        balance.value = shown.balance;
+        smoothToggle.value = shown.smooth;
+        const css = gradientCss({ color: state.color, opacity: state.opacity ?? 1, gradient: g, texture: null });
+        const layer = g ? css : `linear-gradient(${css}, ${css})`;
+        gradientPreview.dom.style.background = `${layer}, repeating-conic-gradient(#7a7a7a 0% 25%, #b4b4b4 0% 50%) 50% / 10px 10px`;
+        pictureName.text = pic ? pic.name : 'None';
+        pictureRemove.hidden = !pic;
+        pictureBox.hidden = !pic;
+        if (pic) {
+            tiling.value = pic.tiling;
+            offset.value = pic.offset;
+            turn.value = pic.rotation;
+            wrap.value = pic.wrap;
+        }
         uiUpdating = false;
     };
 
@@ -450,7 +625,9 @@ const init = (ctx: ToolkitContext) => {
         if (!uiUpdating && selected) edit(selected, { scale: [value[0], value[1], value[2]] });
     });
     colorPicker.on('change', (value: number[]) => {
-        if (!uiUpdating && selected) edit(selected, { color: [value[0], value[1], value[2]] });
+        if (uiUpdating || !selected) return;
+        edit(selected, { color: [value[0], value[1], value[2]] });
+        updateEditor();
     });
 
     cutoff.on('change', (value: number) => {
@@ -478,6 +655,89 @@ const init = (ctx: ToolkitContext) => {
     });
     metal.on('change', (value: number) => {
         if (!uiUpdating && selected) edit(selected, { metalness: value, roughness: selected.roughness ?? DEFAULT_ROUGHNESS });
+    });
+
+    // ---- paint
+
+    const editGradient = (change: Partial<PaintGradient>) => {
+        if (uiUpdating || !selected) return;
+        const current = selected.gradient ?? defaultGradient();
+        edit(selected, { gradient: { ...current, ...change } });
+        updateEditor();
+    };
+    const editTexture = (change: Partial<PaintTexture>) => {
+        if (uiUpdating || !selected || !selected.paintTexture) return;
+        edit(selected, { texture: { ...selected.paintTexture, ...change } });
+        updateEditor();
+    };
+
+    opacity.on('change', (value: number) => {
+        if (uiUpdating || !selected) return;
+        edit(selected, { opacity: value });
+        updateEditor();
+    });
+    gradientToggle.on('change', (value: boolean) => {
+        if (uiUpdating || !selected) return;
+        // the first gradient fades the colour out: same colour, no opacity
+        const gradient = value ? { ...defaultGradient(), color: [...selected.color] as [number, number, number] } : null;
+        edit(selected, { gradient });
+        updateEditor();
+    });
+    swapButton.on('click', () => {
+        if (!selected?.gradient) return;
+        const g = selected.gradient;
+        edit(selected, {
+            color: [...g.color] as [number, number, number],
+            opacity: g.opacity,
+            gradient: { ...g, color: [...selected.color] as [number, number, number], opacity: selected.opacity }
+        });
+        updateEditor();
+    });
+    endColor.on('change', (value: number[]) => editGradient({ color: [value[0], value[1], value[2]] }));
+    endOpacity.on('change', (value: number) => editGradient({ opacity: value }));
+    gradientType.on('change', (value: string) => editGradient({ type: value as PaintGradient['type'] }));
+    gradientSpace.on('change', (value: string) => editGradient({ space: value as PaintGradient['space'] }));
+    angle.on('change', (value: number) => editGradient({ angle: value }));
+    from.on('change', (value: number) => editGradient({ start: value }));
+    to.on('change', (value: number) => editGradient({ end: value }));
+    balance.on('change', (value: number) => editGradient({ balance: value }));
+    smoothToggle.on('change', (value: boolean) => editGradient({ smooth: value }));
+
+    pictureLoad.on('click', () => pictureInput.click());
+    pictureInput.addEventListener('change', () => {
+        const file = pictureInput.files?.[0];
+        pictureInput.value = '';
+        const target = selected;
+        if (!file || !target) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            if (!target.scene) return;
+            const name = file.name.replace(/\.[^.]+$/, '');
+            const previous = target.paintTexture;
+            // a new picture keeps the placement of the one it replaces
+            const texture = previous ? { ...previous, image: reader.result as string, name } : defaultTexture(reader.result as string, name);
+            flushPending();
+            events.fire('edit.add', new PrimitiveStateOp(target, target.getState(), { ...target.getState(), texture }));
+            if (target === selected) updateEditor();
+        };
+        reader.readAsDataURL(file);
+    });
+    pictureRemove.on('click', () => {
+        if (!selected) return;
+        flushPending();
+        events.fire('edit.add', new PrimitiveStateOp(selected, selected.getState(), { ...selected.getState(), texture: null }));
+        updateEditor();
+    });
+    tiling.on('change', (value: number[]) => editTexture({ tiling: [value[0], value[1]] }));
+    offset.on('change', (value: number[]) => editTexture({ offset: [value[0], value[1]] }));
+    turn.on('change', (value: number) => editTexture({ rotation: value }));
+    wrap.on('change', (value: string) => editTexture({ wrap: value as PaintWrap }));
+
+    // scripted access (and tests)
+    events.function('toolkit.primitivePaint', (primitive: MeshPrimitive, change: Partial<PrimitiveState>) => {
+        flushPending();
+        events.fire('edit.add', new PrimitiveStateOp(primitive, primitive.getState(), { ...primitive.getState(), ...change }));
+        if (primitive === selected) updateEditor();
     });
 
     // ---- conversion to a gaussian splat layer
