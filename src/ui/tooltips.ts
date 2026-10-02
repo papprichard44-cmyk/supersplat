@@ -1,11 +1,44 @@
 import { Container, Element, Label } from '@playcanvas/pcui';
 
+// Kept for callers: tooltips used to open beside their target in this
+// direction. They now all appear in one place (the top right corner), so
+// they never cover the controls being used and are never hidden behind a
+// panel or dialog.
 type Direction = 'left' | 'right' | 'top' | 'bottom';
 
 // Tooltip text may be a static string or a resolver. A resolver is evaluated
 // each time the tooltip is shown, so localized tooltips always reflect the
 // current language without any language-change listener.
 type TooltipText = string | (() => string);
+
+// hover this long before a tooltip appears; once one is showing, moving to
+// another control swaps it straight away
+const SHOW_DELAY = 300;
+// how long it lingers after the pointer leaves (so moving between controls
+// doesn't make it flicker)
+const HIDE_DELAY = 350;
+
+// a short heading for the card: the control's own caption, or the label of
+// the row it sits in
+const headingOf = (dom: HTMLElement, text: string) => {
+    let heading = '';
+    const own = dom.textContent?.trim() ?? '';
+    if (own && own.length <= 28 && !own.includes('\n')) {
+        heading = own;
+    } else {
+        const row = dom.closest('.toolkit-row');
+        const label = row?.querySelector('.toolkit-label');
+        heading = label?.textContent?.trim() ?? '';
+    }
+    heading = heading.replace(/[…:.]+$/, '');
+    // no heading when it would be all there is to read
+    if (!heading || heading.length > 28 || text.length <= heading.length + 12) {
+        return '';
+    }
+    return heading;
+};
+
+const overlaps = (a: DOMRect, b: DOMRect) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 
 class Tooltips extends Container {
     register: (target: Element, text: TooltipText, direction?: Direction) => void;
@@ -15,101 +48,82 @@ class Tooltips extends Container {
     constructor(args: any = {}) {
         args = {
             ...args,
-            class: 'tooltips',
-            hidden: true
+            class: 'tooltips'
         };
 
         super(args);
 
-        const text = new Label({
-            class: 'tooltips-content'
-        });
-
+        const heading = new Label({ class: 'tooltips-heading' });
+        const text = new Label({ class: 'tooltips-content' });
+        this.append(heading);
         this.append(text);
 
+        const dom = this.dom;
         const targets = new Map<Element, any>();
-        const style = this.dom.style;
-        let timer: number = 0;
+        let timer = -1;
+        let current: Element | null = null;
+
+        const cancelTimer = () => {
+            if (timer >= 0) {
+                clearTimeout(timer);
+                timer = -1;
+            }
+        };
+
+        const hide = () => {
+            cancelTimer();
+            current = null;
+            dom.classList.remove('visible');
+        };
+
+        const show = (target: Element, textString: TooltipText) => {
+            // the target may have been destroyed or hidden while the timer ran
+            if (!target.dom || !target.dom.isConnected) {
+                return;
+            }
+            const value = typeof textString === 'function' ? textString() : textString;
+            if (!value) {
+                return;
+            }
+            current = target;
+            heading.text = headingOf(target.dom, value);
+            heading.hidden = !heading.text;
+            text.text = value;
+
+            // top right, unless that is where the control itself is: then
+            // bottom right
+            dom.classList.remove('lower');
+            const card = dom.getBoundingClientRect();
+            if (overlaps(card, target.dom.getBoundingClientRect())) {
+                dom.classList.add('lower');
+            }
+
+            // restart the entrance when a new tooltip replaces a showing one
+            if (dom.classList.contains('visible')) {
+                dom.classList.remove('swap');
+                dom.getBoundingClientRect(); // restart the animation
+                dom.classList.add('swap');
+            }
+            dom.classList.add('visible');
+        };
 
         this.register = (target: Element, textString: TooltipText, direction: Direction = 'bottom') => {
-
-            const activate = () => {
-                // the target may have been destroyed while the show timer ran
-                if (!target.dom) {
-                    return;
-                }
-                const rect = target.dom.getBoundingClientRect();
-                const midx = Math.floor((rect.left + rect.right) * 0.5);
-                const midy = Math.floor((rect.top + rect.bottom) * 0.5);
-
-                switch (direction) {
-                    case 'left':
-                        style.left = `${rect.left}px`;
-                        style.top = `${midy}px`;
-                        style.transform = 'translate(calc(-100% - 10px), -50%)';
-                        break;
-                    case 'right':
-                        style.left = `${rect.right}px`;
-                        style.top = `${midy}px`;
-                        style.transform = 'translate(10px, -50%)';
-                        break;
-                    case 'top':
-                        style.left = `${midx}px`;
-                        style.top = `${rect.top}px`;
-                        style.transform = 'translate(-50%, calc(-100% - 10px))';
-                        break;
-                    case 'bottom':
-                        style.left = `${midx}px`;
-                        style.top = `${rect.bottom}px`;
-                        style.transform = 'translate(-50%, 10px)';
-                        break;
-                }
-
-                text.text = typeof textString === 'function' ? textString() : textString;
-                // inline-block so max-width / wrapping in SCSS apply (inline
-                // would stay one long line).
-                style.display = 'inline-block';
-
-                // clamp to viewport so tooltip doesn't go off-screen
-                const tooltipRect = this.dom.getBoundingClientRect();
-                if (tooltipRect.left < 0) {
-                    style.left = `${parseFloat(style.left) - tooltipRect.left}px`;
-                } else if (tooltipRect.right > window.innerWidth) {
-                    style.left = `${parseFloat(style.left) - (tooltipRect.right - window.innerWidth)}px`;
-                }
-            };
-
-            const startTimer = (fn: () => void) => {
-                timer = window.setTimeout(() => {
-                    fn();
-                    timer = -1;
-                }, 250);
-            };
-
-            const cancelTimer = () => {
-                if (timer >= 0) {
-                    clearTimeout(timer);
-                    timer = -1;
-                }
-            };
-
             const enter = () => {
                 cancelTimer();
-
-                if (style.display === 'inline-block') {
-                    activate();
+                if (dom.classList.contains('visible')) {
+                    show(target, textString);
                 } else {
-                    startTimer(() => activate());
+                    timer = window.setTimeout(() => {
+                        timer = -1;
+                        show(target, textString);
+                    }, SHOW_DELAY);
                 }
             };
 
             const leave = () => {
                 cancelTimer();
-
-                if (style.display === 'inline-block') {
-                    startTimer(() => {
-                        style.display = 'none';
-                    });
+                if (dom.classList.contains('visible')) {
+                    timer = window.setTimeout(hide, HIDE_DELAY);
                 }
             };
 
@@ -131,6 +145,9 @@ class Tooltips extends Container {
                 value.dom.removeEventListener('pointerenter', value.enter);
                 value.dom.removeEventListener('pointerleave', value.leave);
                 targets.delete(target);
+            }
+            if (current === target) {
+                hide();
             }
         };
 
