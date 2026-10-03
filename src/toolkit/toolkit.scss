@@ -1255,3 +1255,14 @@
         stroke-width: 1.5;
     }
 }
+
+// ---- snap to surface
+#toolkit-snap-panel {
+    top: 140px;
+    right: 470px;
+    width: 320px;
+}
+
+.collapsed #toolkit-snap-panel {
+    display: none;
+}

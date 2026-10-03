@@ -11,6 +11,7 @@ import { meshPrimitivesModule } from './mesh-primitives';
 import { roadsModule } from './roads/roads';
 import { sceneMeshesModule } from './scene-meshes';
 import { skyModule } from './sky/sky';
+import { snapToolModule } from './snap-tool';
 import { splatInspectorModule } from './splat-inspector';
 import { stampBrushModule } from './stamp-brush';
 import { vegetationModule } from './vegetation/vegetation';
@@ -53,7 +54,8 @@ const modules: ToolkitModule[] = [
     generatorsModule,
     generatedLayersModule,
     exportCompareModule,
-    stampBrushModule
+    stampBrushModule,
+    snapToolModule
 ];
 
 const initToolkit = (ctx: ToolkitContext) => {
