@@ -9,12 +9,13 @@ import { BASE } from './stamp-math';
 // onto it instead of being deleted - deleting them leaves holes, because they
 // carry part of the surface's colour.
 //
-// For each selected gaussian the nearest well-formed (opaque, not selected)
-// gaussian of the same layer is found; the surface there is the plane through
-// its neighbourhood (opacity-weighted PCA). The gaussian is moved onto that
-// plane and its shape is squashed onto it (covariance A·Σ·Aᵀ with A projecting
-// along the normal), so it becomes a flat disc on the surface covering the
-// same footprint it covered from the front.
+// For each selected gaussian the nearest well-formed gaussian (opaque, not a
+// big blob, not selected; of any visible layer) is found; the surface there is
+// the plane through its neighbourhood (opacity-weighted PCA, refitted without
+// outliers). The gaussian is moved onto that plane and its shape is squashed
+// onto it (covariance A·Σ·Aᵀ with A projecting along the normal), so it
+// becomes a flat disc on the surface covering the footprint it covered from
+// the front.
 //
 // Everything works in PLY space, the space the exporter writes, so the rows of
 // the selected gaussians come straight from the exporter and the result loads
@@ -26,6 +27,7 @@ type SnapOptions = {
     limitSize: boolean;     // no wider than a few of the surface's own gaussians
     colorBlend: number;     // 0..1 towards the surface's colour
     calmSH: boolean;        // tone down view-dependent colour
+    deleteRest: boolean;    // drop those with no surface within reach
 };
 
 type Neighbours = {
@@ -37,29 +39,123 @@ type Neighbours = {
     dc: Float32Array | null;
 };
 
+type Progress = (fraction: number) => void;
+
 // a neighbour must be at least this opaque to count as surface
 const MIN_OPACITY = 0.25;
+// ... and no wider than this many times the typical gaussian (big blobs are
+// floaters themselves, not surface)
+const MAX_BLOB = 8;
 // gaussians in a surface patch
-const PATCH = 24;
+const PATCH = 32;
 // a snapped gaussian may be this many times wider than the surface's own
 const SIZE_LIMIT = 3;
 // view-dependent colour is kept at this share when calmed
 const CALM_SH = 0.25;
+// gaussians snapped between breaks for the UI
+const BATCH = 20000;
 
 const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
+const nextFrame = () => new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+});
 
-// ---- reading the layer's other gaussians
+// ---- where to look: the cells around the selected gaussians
 
-// the layer's gaussians that are not selected (and not deleted), within the
-// box, in PLY space
-const readNeighbours = async (splat: Splat, min: number[], max: number[], withColor: boolean): Promise<Neighbours> => {
+type CellFilter = { cell: number, keys: Set<number> };
+
+const cellKey = (x: number, y: number, z: number, cell: number) => {
+    const ix = Math.floor(x / cell) & 1023;
+    const iy = Math.floor(y / cell) & 1023;
+    const iz = Math.floor(z / cell) & 1023;
+    // wrapping keys can collide, which only lets a few extra neighbours in
+    return (ix << 20) | (iy << 10) | iz;
+};
+
+// the cells (at least `reach` wide) holding a selected gaussian, and the ones
+// around them: only gaussians there can be the surface for one of them
+const selectionCells = (sets: { rows: Float32Array, rest: number }[], reach: number): CellFilter => {
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    for (const { rows, rest } of sets) {
+        const stride = BASE + rest;
+        for (let o = 0; o < rows.length; o += stride) {
+            for (let a = 0; a < 3; ++a) {
+                if (rows[o + a] < min[a]) min[a] = rows[o + a];
+                if (rows[o + a] > max[a]) max[a] = rows[o + a];
+            }
+        }
+    }
+    const extent = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2], 1e-9);
+    const cell = Math.max(reach, extent / 512);
+    const occupied = new Set<number>();
+    const centres: number[] = [];
+    for (const { rows, rest } of sets) {
+        const stride = BASE + rest;
+        for (let o = 0; o < rows.length; o += stride) {
+            const key = cellKey(rows[o], rows[o + 1], rows[o + 2], cell);
+            if (!occupied.has(key)) {
+                occupied.add(key);
+                centres.push(rows[o], rows[o + 1], rows[o + 2]);
+            }
+        }
+    }
+    // grow by one cell (and a bit more when the cells are about the reach,
+    // so the patch around a surface point at the edge of the reach is there)
+    const ring = cell > reach * 2 ? 1 : 2;
+    const keys = new Set<number>();
+    for (let i = 0; i < centres.length; i += 3) {
+        for (let dz = -ring; dz <= ring; ++dz) {
+            for (let dy = -ring; dy <= ring; ++dy) {
+                for (let dx = -ring; dx <= ring; ++dx) {
+                    keys.add(cellKey(centres[i] + dx * cell, centres[i + 1] + dy * cell, centres[i + 2] + dz * cell, cell));
+                }
+            }
+        }
+    }
+    return { cell, keys };
+};
+
+// ---- reading the surface: the other gaussians of the visible layers
+
+class NeighbourBuffer {
+    capacity = 1 << 16;
+    count = 0;
+    pos = new Float32Array(this.capacity * 3);
+    weight = new Float32Array(this.capacity);
+    sigmaMin = new Float32Array(this.capacity);
+    sigmaMax = new Float32Array(this.capacity);
+    dc: Float32Array | null;
+
+    constructor(withColor: boolean) {
+        this.dc = withColor ? new Float32Array(this.capacity * 3) : null;
+    }
+
+    reserve() {
+        if (this.count < this.capacity) return;
+        this.capacity *= 2;
+        const g = (a: Float32Array, n: number) => {
+            const b = new Float32Array(this.capacity * n);
+            b.set(a);
+            return b;
+        };
+        this.pos = g(this.pos, 3);
+        this.weight = g(this.weight, 1);
+        this.sigmaMin = g(this.sigmaMin, 1);
+        this.sigmaMax = g(this.sigmaMax, 1);
+        if (this.dc) this.dc = g(this.dc, 3);
+    }
+}
+
+// one layer's gaussians that are not selected (and not deleted) and lie in
+// the filter's cells, in PLY space
+const readLayer = async (splat: Splat, filter: CellFilter, out: NeighbourBuffer, progress: (done: number) => void) => {
     const { resource, instances } = splat;
     const source = resource.source;
     const meta = source.meta;
-    const numRows = resource.numRows;
 
     // transform palette index per static row (-1: no live, unselected instance)
-    const rowTransform = new Int32Array(numRows).fill(-1);
+    const rowTransform = new Int32Array(resource.numRows).fill(-1);
     for (let i = 0; i < instances.count; ++i) {
         if (instances.flags[i] !== State.selected) {
             rowTransform[instances.sourceRow[i]] = instances.transformIndex(i);
@@ -88,27 +184,8 @@ const readNeighbours = async (splat: Splat, min: number[], max: number[], withCo
         return entry;
     };
 
-    let capacity = 1 << 16;
-    let count = 0;
-    let pos = new Float32Array(capacity * 3);
-    let weight = new Float32Array(capacity);
-    let sigmaMin = new Float32Array(capacity);
-    let sigmaMax = new Float32Array(capacity);
-    let dc = withColor ? new Float32Array(capacity * 3) : null;
-    const grow = () => {
-        capacity *= 2;
-        const g = (a: Float32Array, n: number) => {
-            const b = new Float32Array(capacity * n);
-            b.set(a);
-            return b;
-        };
-        pos = g(pos, 3);
-        weight = g(weight, 1);
-        sigmaMin = g(sigmaMin, 1);
-        sigmaMax = g(sigmaMax, 1);
-        if (dc) dc = g(dc, 3);
-    };
-
+    const { cell, keys } = filter;
+    const withColor = !!out.dc;
     const layers: ('position' | 'geometric' | 'color')[] = withColor ? ['position', 'geometric', 'color'] : ['position', 'geometric'];
     const pool = resource.sourcePool;
     const numChunks = meta.numChunks[0];
@@ -137,29 +214,60 @@ const readNeighbours = async (splat: Splat, min: number[], max: number[], withCo
                 const x = m[0] * x0 + m[4] * y0 + m[8] * z0 + m[12];
                 const y = m[1] * x0 + m[5] * y0 + m[9] * z0 + m[13];
                 const z = m[2] * x0 + m[6] * y0 + m[10] * z0 + m[14];
-                if (x < min[0] || y < min[1] || z < min[2] || x > max[0] || y > max[1] || z > max[2]) continue;
-                if (count === capacity) grow();
-                pos[count * 3] = x;
-                pos[count * 3 + 1] = y;
-                pos[count * 3 + 2] = z;
-                weight[count] = opacity;
+                if (!keys.has(cellKey(x, y, z, cell))) continue;
+                out.reserve();
+                const k = out.count++;
+                out.pos[k * 3] = x;
+                out.pos[k * 3 + 1] = y;
+                out.pos[k * 3 + 2] = z;
+                out.weight[k] = opacity;
                 const s0 = Math.exp(geometric[i * 8 + 4]);
                 const s1 = Math.exp(geometric[i * 8 + 5]);
                 const s2 = Math.exp(geometric[i * 8 + 6]);
-                sigmaMin[count] = Math.min(s0, s1, s2) * scale;
-                sigmaMax[count] = Math.max(s0, s1, s2) * scale;
-                if (dc && color) {
-                    dc[count * 3] = color[i * colorStride];
-                    dc[count * 3 + 1] = color[i * colorStride + 1];
-                    dc[count * 3 + 2] = color[i * colorStride + 2];
+                out.sigmaMin[k] = Math.min(s0, s1, s2) * scale;
+                out.sigmaMax[k] = Math.max(s0, s1, s2) * scale;
+                if (out.dc && color) {
+                    out.dc[k * 3] = color[i * colorStride];
+                    out.dc[k * 3 + 1] = color[i * colorStride + 1];
+                    out.dc[k * 3 + 2] = color[i * colorStride + 2];
                 }
-                count++;
             }
         } finally {
             Object.values(chunks).forEach(chunk => chunk.release());
         }
+        progress(n);
     }
-    return { count, pos, weight, sigmaMin, sigmaMax, dc };
+};
+
+// the surface candidates around the selection, from every given layer
+const readNeighbours = async (splats: Splat[], filter: CellFilter, withColor: boolean, progress?: Progress): Promise<Neighbours> => {
+    const out = new NeighbourBuffer(withColor);
+    const total = splats.reduce((sum, s) => sum + s.resource.numRows, 0) || 1;
+    const read = { rows: 0 };
+    const advance = (n: number) => {
+        read.rows += n;
+        progress?.(read.rows / total);
+    };
+    for (const splat of splats) {
+        await readLayer(splat, filter, out, advance);
+    }
+    return { count: out.count, pos: out.pos, weight: out.weight, sigmaMin: out.sigmaMin, sigmaMax: out.sigmaMax, dc: out.dc };
+};
+
+// the neighbours that can be surface: not much bigger than the typical one
+const surfaceIndices = (nb: Neighbours) => {
+    if (nb.count === 0) return new Uint32Array(0);
+    const step = Math.max(1, Math.floor(nb.count / 20000));
+    const sample: number[] = [];
+    for (let i = 0; i < nb.count; i += step) sample.push(nb.sigmaMax[i]);
+    sample.sort((a, b) => a - b);
+    const limit = sample[Math.floor(sample.length / 2)] * MAX_BLOB;
+    const result = new Uint32Array(nb.count);
+    let n = 0;
+    for (let i = 0; i < nb.count; ++i) {
+        if (nb.sigmaMax[i] <= limit) result[n++] = i;
+    }
+    return result.slice(0, n);
 };
 
 // ---- k-d tree over the neighbours
@@ -174,10 +282,11 @@ class KdTree {
     private heapDist: Float64Array;
     private size = 0;
 
-    constructor(pos: Float32Array, count: number) {
+    // over the points `indices` of `pos` (xyz per point)
+    constructor(pos: Float32Array, indices: Uint32Array) {
         this.pos = pos;
-        this.idx = new Uint32Array(count);
-        for (let i = 0; i < count; ++i) this.idx[i] = i;
+        this.idx = indices;
+        const count = indices.length;
         this.axis = new Uint8Array(count);
         this.build(0, count);
         this.heapIdx = new Int32Array(PATCH);
@@ -381,53 +490,25 @@ const quatFromMatrix = (m: Float64Array, out: number[]) => {
 // ---- the snap
 
 type SnapResult = {
-    rows: Float32Array;
+    rows: Float32Array;     // the snapped gaussians (without the dropped ones)
     moved: number;          // gaussians put onto a surface
     unmoved: number;        // no surface within reach: left as they were
+    deleted: number;        // no surface within reach: dropped (deleteRest)
     distance: number;       // mean distance moved
 };
 
-const snapRows = (rows: Float32Array, rest: number, nb: Neighbours, options: SnapOptions): SnapResult => {
-    const stride = BASE + rest;
-    const count = rows.length / stride;
-    const out = rows.slice();
-    if (nb.count < 3) {
-        return { rows: out, moved: 0, unmoved: count, distance: 0 };
-    }
-    const tree = new KdTree(nb.pos, nb.count);
-    const near = new Int32Array(PATCH);
-    const cov = new Float64Array(9);
-    const vec = new Float64Array(9);
-    const sig = new Float64Array(9);
-    const rot = new Float64Array(9);
-    const q = [1, 0, 0, 0];
-    const s = Math.max(0, Math.min(1, options.strength));
-    const reach2 = options.reach * options.reach;
+// the surface patch around a surface gaussian: centre, normal, typical
+// thickness and width, colour. Robust: fitted twice, the second time without
+// the gaussians far off the first plane
+type Plane = { cx: number, cy: number, cz: number, nx: number, ny: number, nz: number, thin: number, wide: number, r: number, g: number, b: number };
 
-    let moved = 0;
-    let unmoved = 0;
-    let distance = 0;
-
-    for (let r = 0; r < count; ++r) {
-        const o = r * stride;
-        const px = rows[o], py = rows[o + 1], pz = rows[o + 2];
-
-        // the nearest surface gaussian within reach
-        if (tree.nearest(px, py, pz, 1, reach2, near) === 0) {
-            unmoved++;
-            continue;
-        }
-        const anchor = near[0];
-
-        // the surface patch around it: weighted centre and normal
-        const n = tree.nearest(nb.pos[anchor * 3], nb.pos[anchor * 3 + 1], nb.pos[anchor * 3 + 2], PATCH, Infinity, near);
-        if (n < 3) {
-            unmoved++;
-            continue;
-        }
-        let wsum = 0, cx = 0, cy = 0, cz = 0, thin = 0, wide = 0;
-        let dr = 0, dg = 0, db = 0;
+const planeOf = (nb: Neighbours, near: Int32Array, n: number, cov: Float64Array, vec: Float64Array): Plane | null => {
+    const use = new Uint8Array(n).fill(1);
+    let plane: Plane | null = null;
+    for (let pass = 0; pass < 2; ++pass) {
+        let wsum = 0, cx = 0, cy = 0, cz = 0, thin = 0, wide = 0, r = 0, g = 0, b = 0;
         for (let k = 0; k < n; ++k) {
+            if (!use[k]) continue;
             const i = near[k];
             const w = nb.weight[i];
             wsum += w;
@@ -437,15 +518,16 @@ const snapRows = (rows: Float32Array, rest: number, nb: Neighbours, options: Sna
             thin += nb.sigmaMin[i] * w;
             wide += nb.sigmaMax[i] * w;
             if (nb.dc) {
-                dr += nb.dc[i * 3] * w;
-                dg += nb.dc[i * 3 + 1] * w;
-                db += nb.dc[i * 3 + 2] * w;
+                r += nb.dc[i * 3] * w;
+                g += nb.dc[i * 3 + 1] * w;
+                b += nb.dc[i * 3 + 2] * w;
             }
         }
+        if (wsum <= 0) return plane;
         cx /= wsum; cy /= wsum; cz /= wsum;
-        thin /= wsum; wide /= wsum;
         cov.fill(0);
         for (let k = 0; k < n; ++k) {
+            if (!use[k]) continue;
             const i = near[k];
             const w = nb.weight[i];
             const x = nb.pos[i * 3] - cx;
@@ -459,7 +541,86 @@ const snapRows = (rows: Float32Array, rest: number, nb: Neighbours, options: Sna
         let smallest = 0;
         if (cov[4] < cov[smallest * 4]) smallest = 1;
         if (cov[8] < cov[smallest * 4]) smallest = 2;
-        const nx = vec[smallest], ny = vec[3 + smallest], nz = vec[6 + smallest];
+        plane = {
+            cx,
+            cy,
+            cz,
+            nx: vec[smallest],
+            ny: vec[3 + smallest],
+            nz: vec[6 + smallest],
+            thin: thin / wsum,
+            wide: wide / wsum,
+            r: r / wsum,
+            g: g / wsum,
+            b: b / wsum
+        };
+        if (pass === 1) break;
+
+        // drop the gaussians far off the plane (stray ones in the patch) and fit again
+        let rms = 0;
+        let used = 0;
+        const dist = new Float64Array(n);
+        for (let k = 0; k < n; ++k) {
+            const i = near[k];
+            dist[k] = Math.abs((nb.pos[i * 3] - cx) * plane.nx + (nb.pos[i * 3 + 1] - cy) * plane.ny + (nb.pos[i * 3 + 2] - cz) * plane.nz);
+            rms += dist[k] * dist[k];
+        }
+        rms = Math.sqrt(rms / n);
+        for (let k = 0; k < n; ++k) {
+            use[k] = dist[k] <= rms * 2 + 1e-12 ? 1 : 0;
+            used += use[k];
+        }
+        if (used === n || used < 5) break;
+    }
+    return plane;
+};
+
+const snapRows = async (rows: Float32Array, rest: number, nb: Neighbours, tree: KdTree | null, options: SnapOptions, progress?: Progress): Promise<SnapResult> => {
+    const stride = BASE + rest;
+    const count = rows.length / stride;
+    const out = rows.slice();
+    const kept = new Uint8Array(count).fill(1);
+    const near = new Int32Array(PATCH);
+    const cov = new Float64Array(9);
+    const vec = new Float64Array(9);
+    const sig = new Float64Array(9);
+    const rot = new Float64Array(9);
+    const q = [1, 0, 0, 0];
+    const s = Math.max(0, Math.min(1, options.strength));
+    const reach2 = options.reach * options.reach;
+    // gaussians snapping to the same surface gaussian share its plane
+    const planes = new Map<number, Plane | null>();
+
+    let moved = 0;
+    let unmoved = 0;
+    let distance = 0;
+
+    for (let r = 0; r < count; ++r) {
+        if (r % BATCH === BATCH - 1) {
+            progress?.(r / count);
+            await nextFrame();
+        }
+        const o = r * stride;
+        const px = rows[o], py = rows[o + 1], pz = rows[o + 2];
+
+        // the nearest surface gaussian within reach, and the surface there
+        let plane: Plane | null = null;
+        if (tree && tree.nearest(px, py, pz, 1, reach2, near) > 0) {
+            const anchor = near[0];
+            if (planes.has(anchor)) {
+                plane = planes.get(anchor);
+            } else {
+                const n = tree.nearest(nb.pos[anchor * 3], nb.pos[anchor * 3 + 1], nb.pos[anchor * 3 + 2], PATCH, Infinity, near);
+                plane = n >= 3 ? planeOf(nb, near, n, cov, vec) : null;
+                planes.set(anchor, plane);
+            }
+        }
+        if (!plane) {
+            unmoved++;
+            if (options.deleteRest) kept[r] = 0;
+            continue;
+        }
+        const { cx, cy, cz, nx, ny, nz, thin, wide } = plane;
 
         // onto the plane
         const d = (px - cx) * nx + (py - cy) * ny + (pz - cz) * nz;
@@ -520,31 +681,34 @@ const snapRows = (rows: Float32Array, rest: number, nb: Neighbours, options: Sna
         // colour
         if (nb.dc && options.colorBlend > 0) {
             const k = Math.min(1, options.colorBlend);
-            out[o + 3] += (dr / wsum - out[o + 3]) * k;
-            out[o + 4] += (dg / wsum - out[o + 4]) * k;
-            out[o + 5] += (db / wsum - out[o + 5]) * k;
+            out[o + 3] += (plane.r - out[o + 3]) * k;
+            out[o + 4] += (plane.g - out[o + 4]) * k;
+            out[o + 5] += (plane.b - out[o + 5]) * k;
         }
         if (options.calmSH) {
             for (let k = 0; k < rest; ++k) out[o + BASE + k] *= CALM_SH;
         }
         moved++;
     }
+    progress?.(1);
 
-    return { rows: out, moved, unmoved, distance: moved ? distance / moved : 0 };
-};
-
-// the box the selected rows lie in
-const rowsBound = (rows: Float32Array, rest: number) => {
-    const stride = BASE + rest;
-    const min = [Infinity, Infinity, Infinity];
-    const max = [-Infinity, -Infinity, -Infinity];
-    for (let o = 0; o < rows.length; o += stride) {
-        for (let a = 0; a < 3; ++a) {
-            min[a] = Math.min(min[a], rows[o + a]);
-            max[a] = Math.max(max[a], rows[o + a]);
+    // without the dropped ones
+    let result = out;
+    const deleted = options.deleteRest ? unmoved : 0;
+    if (deleted) {
+        result = new Float32Array((count - deleted) * stride);
+        let w = 0;
+        for (let r = 0; r < count; ++r) {
+            if (kept[r]) result.set(out.subarray(r * stride, (r + 1) * stride), (w++) * stride);
         }
     }
-    return { min, max };
+    return { rows: result, moved, unmoved: unmoved - deleted, deleted, distance: moved ? distance / moved : 0 };
 };
 
-export { readNeighbours, snapRows, rowsBound, KdTree, SnapOptions, SnapResult, Neighbours };
+// a tree over the surface candidates (null when there are too few)
+const surfaceTree = (nb: Neighbours) => {
+    const indices = surfaceIndices(nb);
+    return indices.length >= 3 ? new KdTree(nb.pos, indices) : null;
+};
+
+export { readNeighbours, selectionCells, snapRows, surfaceTree, KdTree, SnapOptions, SnapResult, Neighbours };

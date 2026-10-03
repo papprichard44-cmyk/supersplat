@@ -8,7 +8,7 @@ import { LogSlider } from './log-slider';
 import { MemorySink } from './memory-sink';
 import { headerIcon, registerPanel } from './panels';
 import { parsePly, writePly } from './stamp-math';
-import { readNeighbours, rowsBound, snapRows, SnapOptions } from './surface-snap';
+import { readNeighbours, selectionCells, snapRows, SnapOptions, surfaceTree } from './surface-snap';
 
 import type { ToolkitContext, ToolkitModule } from './index';
 
@@ -23,6 +23,7 @@ const tips = {
     fitSize: 'Keep snapped gaussians no wider than a few of the surface\'s own, so a big blurry floater does not smear over the surface.',
     color: 'Blend their colour towards the surface around them. 0 keeps their own colour.',
     calm: 'Tone down their view-dependent colour (spherical harmonics). Floaters often carry colour seen from one side only, which would flicker on the surface.',
+    deleteRest: 'Delete the selected gaussians that have no surface within reach (stray floaters in the air), instead of leaving them where they are.',
     run: 'Snap the selected gaussians onto the surface. They are replaced by a new layer of snapped gaussians (undo with Ctrl+Z).'
 };
 
@@ -70,6 +71,7 @@ const init = (ctx: ToolkitContext) => {
     const fitSize = toggle('Fit size', tips.fitSize, true);
     const color = slider('Match colour', tips.color, 0);
     const calm = toggle('Calm colour', tips.calm, true);
+    const deleteRest = toggle('Delete the rest', tips.deleteRest, false);
 
     const runRow = new Container({ class: 'toolkit-row' });
     const run = new Button({ text: 'Snap selected', class: 'toolkit-button' });
@@ -135,15 +137,15 @@ const init = (ctx: ToolkitContext) => {
         busy = true;
         run.enabled = false;
         const ops = [];
-        const summary = { moved: 0, unmoved: 0, distance: 0, layers: 0 };
+        const summary = { moved: 0, unmoved: 0, deleted: 0, distance: 0, layers: 0 };
+        const progress = (text: string, value: number) => events.fire('progressUpdate', { text, progress: Math.round(value) });
         events.fire('progressStart', 'Snapping to surface', false);
         try {
+            // the selected gaussians of every layer, as the exporter writes them
+            const sets: { splat: Splat, rows: Float32Array, rest: number }[] = [];
             for (let l = 0; l < layers.length; ++l) {
                 const splat = layers[l];
-                const span = 100 / layers.length;
-                events.fire('progressUpdate', { text: `Reading the selection of ${splat.name}`, progress: span * l });
-
-                // the selected gaussians, as the exporter writes them
+                progress(`Reading the selection of ${splat.name}`, 25 * l / layers.length);
                 const sink = new MemorySink();
                 const written = await events.invoke('scene.write', 'ply', {
                     filename: 'snap.ply',
@@ -152,34 +154,37 @@ const init = (ctx: ToolkitContext) => {
                 }, sink);
                 if (!written) continue;
                 const { rows, rest } = parsePly(await sink.blob().arrayBuffer());
-                if (!rows.length) continue;
+                if (rows.length) sets.push({ splat, rows, rest });
+            }
 
-                // the surface around them
-                events.fire('progressUpdate', { text: `Finding the surface around ${splat.name}`, progress: span * (l + 0.3) });
-                const { min, max } = rowsBound(rows, rest);
-                const margin = options.reach * 1.5;
-                const neighbours = await readNeighbours(
-                    splat,
-                    min.map(v => v - margin),
-                    max.map(v => v + margin),
-                    options.colorBlend > 0
-                );
+            // the surface around them: every visible layer's other gaussians
+            // nearby (a wall may be split over layers, or snapped earlier)
+            const filter = selectionCells(sets, options.reach);
+            const surfaces = splats().filter(s => !s.background);
+            const neighbours = await readNeighbours(surfaces, filter, options.colorBlend > 0, f => progress('Finding the surface', 25 + 45 * f));
+            const tree = surfaceTree(neighbours);
 
-                events.fire('progressUpdate', { text: `Snapping ${splat.name}`, progress: span * (l + 0.7) });
-                const result = snapRows(rows, rest, neighbours, options);
-                if (!result.moved) {
-                    summary.unmoved += result.unmoved;
-                    continue;
-                }
+            for (let l = 0; l < sets.length; ++l) {
+                const { splat, rows, rest } = sets[l];
+                const span = 25 / sets.length;
+                const result = await snapRows(rows, rest, neighbours, tree, options, f => progress(`Snapping ${splat.name}`, 70 + span * (l + f)));
+                summary.unmoved += result.unmoved;
+                if (!result.moved && !result.deleted) continue;
 
                 // replace the selected gaussians with the snapped ones
                 const remove = new RemoveInstancesOp(splat);
-                const created = await importLayer(`${splat.name.replace(/\.[^.]+$/, '').replace(/[^\w\- ]+/g, '_')} snapped.ply`, writePly(result.rows, rest));
-                if (!created) continue;
-                created.name = `${splat.name.replace(/\.[^.]+$/, '')} · snapped`;
-                ops.push(remove, new AddSplatOp(scene, created));
+                const base = splat.name.replace(/\.[^.]+$/, '');
+                if (result.rows.length) {
+                    progress(`Adding the snapped gaussians of ${splat.name}`, 95);
+                    const created = await importLayer(`${base.replace(/[^\w\- ]+/g, '_')} snapped.ply`, writePly(result.rows, rest));
+                    if (!created) continue;
+                    created.name = `${base} · snapped`;
+                    ops.push(remove, new AddSplatOp(scene, created));
+                } else {
+                    ops.push(remove);
+                }
                 summary.moved += result.moved;
-                summary.unmoved += result.unmoved;
+                summary.deleted += result.deleted;
                 summary.distance += result.distance * result.moved;
                 summary.layers++;
             }
@@ -198,12 +203,11 @@ const init = (ctx: ToolkitContext) => {
             events.fire('edit.add', new MultiOp(ops));
         }
         const unit = summary.moved ? summary.distance / summary.moved : 0;
-        const left = summary.unmoved ? `; ${summary.unmoved.toLocaleString()} had no surface within reach and were left as they were.` : '.';
-        if (summary.moved) {
-            status.text = `Snapped ${summary.moved.toLocaleString()} gaussians (moved ${unit.toPrecision(2)} on average)${left}`;
-        } else {
-            status.text = summary.unmoved ? `No surface within reach of the ${summary.unmoved.toLocaleString()} selected gaussians: raise the reach.` : 'Nothing was snapped.';
-        }
+        const parts: string[] = [];
+        if (summary.moved) parts.push(`Snapped ${summary.moved.toLocaleString()} gaussians (moved ${unit.toPrecision(2)} on average).`);
+        if (summary.deleted) parts.push(`Deleted ${summary.deleted.toLocaleString()} with no surface within reach.`);
+        if (summary.unmoved) parts.push(`${summary.unmoved.toLocaleString()} had no surface within reach and were left as they were: raise the reach to snap them too.`);
+        status.text = parts.length ? parts.join(' ') : 'Nothing was snapped.';
         run.enabled = selectedCount() > 0;
         scene.forceRender = true;
         return { ...summary, distance: unit };
@@ -214,7 +218,8 @@ const init = (ctx: ToolkitContext) => {
         strength: strength.value,
         limitSize: fitSize.value,
         colorBlend: color.value,
-        calmSH: calm.value
+        calmSH: calm.value,
+        deleteRest: deleteRest.value
     });
 
     run.on('click', () => {
